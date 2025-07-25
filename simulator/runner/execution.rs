@@ -8,6 +8,7 @@ use crate::generation::{
     plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
     Shadow as _,
 };
+use rand::Rng;
 
 use super::env::{SimConnection, SimulatorEnv};
 
@@ -56,6 +57,37 @@ impl ExecutionResult {
     }
 }
 
+fn select_connection_index(env: &mut SimulatorEnv, tick: usize) -> usize {
+    let active_connections = env
+        .connections
+        .iter()
+        .enumerate()
+        .filter(|(_, conn)| conn.is_connected())
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+
+    if active_connections.is_empty() {
+        env.connect_at_tick(0, Some(tick));
+        return 0;
+    }
+
+    let create_probability = env.opts.connection_create_probability;
+    let should_create_new = env.rng.gen_range(0..100) < create_probability;
+
+    if should_create_new {
+        for i in 0..env.opts.max_connections {
+            if !env.connections[i].is_connected() {
+                tracing::info!("Creating new connection {} at tick {}", i, tick);
+                env.connect_at_tick(i, Some(tick));
+                return i;
+            }
+        }
+    }
+
+    let selected_idx = pick_index(active_connections.len(), &mut env.rng);
+    active_connections[selected_idx]
+}
+
 pub(crate) fn execute_plans(
     env: Arc<Mutex<SimulatorEnv>>,
     plans: &mut [InteractionPlan],
@@ -71,8 +103,7 @@ pub(crate) fn execute_plans(
 
     for _tick in 0..env.opts.ticks {
         tracing::trace!("Executing tick {}", _tick);
-        // Pick the connection to interact with
-        let connection_index = pick_index(env.connections.len(), &mut env.rng);
+        let connection_index = select_connection_index(&mut env, _tick);
         let state = &mut states[connection_index];
 
         history.history.push(Execution::new(
@@ -111,7 +142,6 @@ fn execute_plan(
     plans: &mut [InteractionPlan],
     states: &mut [InteractionPlanState],
 ) -> Result<()> {
-    let connection = &env.connections[connection_index];
     let plan = &mut plans[connection_index];
     let state = &mut states[connection_index];
 
@@ -121,40 +151,29 @@ fn execute_plan(
 
     let interaction = &plan.plan[state.interaction_pointer].interactions()[state.secondary_pointer];
 
-    if let SimConnection::Disconnected = connection {
-        tracing::debug!("connecting {}", connection_index);
-        env.connections[connection_index] =
-            SimConnection::LimboConnection(env.db.connect().unwrap());
-    } else {
-        tracing::debug!("connection {} already connected", connection_index);
-        match execute_interaction(env, connection_index, interaction, &mut state.stack) {
-            Ok(next_execution) => {
-                tracing::debug!("connection {} processed", connection_index);
-                // Move to the next interaction or property
-                match next_execution {
-                    ExecutionContinuation::NextInteraction => {
-                        if state.secondary_pointer + 1
-                            >= plan.plan[state.interaction_pointer].interactions().len()
-                        {
-                            // If we have reached the end of the interactions for this property, move to the next property
-                            state.interaction_pointer += 1;
-                            state.secondary_pointer = 0;
-                        } else {
-                            // Otherwise, move to the next interaction
-                            state.secondary_pointer += 1;
-                        }
-                    }
-                    ExecutionContinuation::NextProperty => {
-                        // Skip to the next property
+    match execute_interaction(env, connection_index, interaction, &mut state.stack) {
+        Ok(next_execution) => {
+            tracing::debug!("connection {} processed", connection_index);
+            match next_execution {
+                ExecutionContinuation::NextInteraction => {
+                    if state.secondary_pointer + 1
+                        >= plan.plan[state.interaction_pointer].interactions().len()
+                    {
                         state.interaction_pointer += 1;
                         state.secondary_pointer = 0;
+                    } else {
+                        state.secondary_pointer += 1;
                     }
                 }
+                ExecutionContinuation::NextProperty => {
+                    state.interaction_pointer += 1;
+                    state.secondary_pointer = 0;
+                }
             }
-            Err(err) => {
-                tracing::error!("error {}", err);
-                return Err(err);
-            }
+        }
+        Err(err) => {
+            tracing::error!("error {}", err);
+            return Err(err);
         }
     }
 
@@ -184,16 +203,17 @@ pub(crate) fn execute_interaction(
     tracing::info!("");
     match interaction {
         Interaction::Query(_) => {
-            let conn = match &mut env.connections[connection_index] {
-                SimConnection::LimboConnection(conn) => conn,
+            let mut conn = match &mut env.connections[connection_index] {
+                SimConnection::LimboConnection(conn) => conn.clone(),
                 SimConnection::SQLiteConnection(_) => unreachable!(),
                 SimConnection::Disconnected => unreachable!(),
             };
             tracing::debug!(?interaction);
-            let results = interaction.execute_query(conn, &env.io);
+            let results = interaction.execute_query(&mut conn, &env.io);
             tracing::debug!(?results);
             stack.push(results);
-            limbo_integrity_check(conn)?;
+            env.increment_query_count(connection_index);
+            limbo_integrity_check(&conn)?;
         }
         Interaction::FsyncQuery(query) => {
             let conn = match &env.connections[connection_index] {
@@ -205,6 +225,7 @@ pub(crate) fn execute_interaction(
             let results = interaction.execute_fsync_query(conn.clone(), env);
             tracing::debug!(?results);
             stack.push(results);
+            env.increment_query_count(connection_index);
 
             let query_interaction = Interaction::Query(query.clone());
 
@@ -236,7 +257,7 @@ pub(crate) fn execute_interaction(
             let results = interaction.execute_faulty_query(&conn, env);
             tracing::debug!(?results);
             stack.push(results);
-            // Reset fault injection
+            env.increment_query_count(connection_index);
             env.io.inject_fault(false);
             limbo_integrity_check(&conn)?;
         }

@@ -282,14 +282,19 @@ fn run_simulator(
 
             tracing::info!("Starting to shrink");
             let (shrunk_plans, shrunk) = if !cli_opts.disable_heuristic_shrinking {
-                let shrunk_plans = plans
-                    .iter()
-                    .map(|plan| {
-                        let shrunk = plan.shrink_interaction_plan(last_execution);
-                        tracing::info!("{}", shrunk.stats());
-                        shrunk
-                    })
-                    .collect::<Vec<_>>();
+                let mut shrunk_plans = plans.clone();
+                let failing_connection = last_execution.connection_index;
+
+                if failing_connection < plans.len() {
+                    let shrunk = plans[failing_connection].shrink_interaction_plan(last_execution);
+                    tracing::info!("{}", shrunk.stats());
+                    shrunk_plans[failing_connection] = shrunk;
+                } else {
+                    tracing::warn!(
+                        "Invalid connection index {} in failing execution",
+                        failing_connection
+                    );
+                }
                 // Write the shrunk plan to a file
                 let shrunk_plan_path = env
                     .paths
@@ -355,12 +360,14 @@ fn run_simulator(
                         let env = Arc::new(Mutex::new(env));
 
                         let final_plans = if cli_opts.enable_brute_force_shrinking {
-                            let brute_shrunk_plans = shrunk_plans
-                                .iter()
-                                .map(|plan| {
-                                    plan.brute_shrink_interaction_plan(&shrunk, env.clone())
-                                })
-                                .collect::<Vec<_>>();
+                            let mut brute_shrunk_plans = shrunk_plans.clone();
+                            let failing_connection = last_execution.connection_index;
+
+                            if failing_connection < shrunk_plans.len() {
+                                brute_shrunk_plans[failing_connection] = shrunk_plans
+                                    [failing_connection]
+                                    .brute_shrink_interaction_plan(&shrunk, env.clone());
+                            }
                             tracing::info!("Brute force shrinking completed");
                             brute_shrunk_plans
                         } else {
@@ -598,6 +605,7 @@ fn run_simulation_default(
 
     let env = env.lock().unwrap();
     env.io.print_stats();
+    env.print_connection_stats();
 
     tracing::info!("Simulation completed");
 

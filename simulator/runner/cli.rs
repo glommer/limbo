@@ -129,6 +129,18 @@ pub struct SimulatorCLI {
     pub experimental_mvcc: bool,
     #[clap(long, help = "Disable experimental indexing feature")]
     pub disable_experimental_indexes: bool,
+    #[clap(
+        long,
+        help = "Maximum number of database connections to use during simulation",
+        default_value_t = 5
+    )]
+    pub max_connections: usize,
+    #[clap(
+        long,
+        help = "Probability (0-100) of creating a new connection instead of reusing existing ones",
+        default_value_t = 15
+    )]
+    pub connection_create_probability: usize,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
@@ -195,6 +207,17 @@ impl SimulatorCLI {
 
         if self.doublecheck && self.differential {
             anyhow::bail!("Cannot run doublecheck and differential testing at the same time");
+        }
+
+        if self.max_connections < 1 {
+            anyhow::bail!("max_connections must be at least 1");
+        }
+
+        if self.connection_create_probability > 100 {
+            anyhow::bail!(
+                "connection_create_probability must be a number between 0 and 100. Got `{}`",
+                self.connection_create_probability
+            );
         }
 
         Ok(())

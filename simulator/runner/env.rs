@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::mem;
 use std::ops::Deref;
@@ -68,6 +69,13 @@ pub(crate) struct SimulatorEnv {
     pub(crate) type_: SimulationType,
     pub(crate) phase: SimulationPhase,
     pub(crate) tables: SimulatorTables,
+    pub(crate) connection_stats: HashMap<usize, ConnectionStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConnectionStats {
+    pub(crate) queries_executed: usize,
+    pub(crate) created_at_tick: Option<usize>,
 }
 
 impl UnwindSafe for SimulatorEnv {}
@@ -86,12 +94,14 @@ impl SimulatorEnv {
             paths: self.paths.clone(),
             type_: self.type_,
             phase: self.phase,
+            connection_stats: HashMap::new(),
         }
     }
 
     pub(crate) fn clear(&mut self) {
         self.tables.clear();
         self.connections.iter_mut().for_each(|c| c.disconnect());
+        self.connection_stats.clear();
         self.rng = ChaCha8Rng::seed_from_u64(self.opts.seed);
 
         let io = Arc::new(
@@ -219,8 +229,7 @@ impl SimulatorEnv {
         let opts = SimulatorOpts {
             seed,
             ticks: rng.gen_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
-            max_connections: 1, // TODO: for now let's use one connection as we didn't implement
-            // correct transactions processing
+            max_connections: cli_opts.max_connections,
             max_tables: rng.gen_range(0..128),
             create_percent,
             create_index_percent,
@@ -249,6 +258,7 @@ impl SimulatorEnv {
             experimental_indexes: !cli_opts.disable_experimental_indexes,
             min_tick: cli_opts.min_tick,
             max_tick: cli_opts.max_tick,
+            connection_create_probability: cli_opts.connection_create_probability,
         };
 
         let io = Arc::new(
@@ -300,18 +310,20 @@ impl SimulatorEnv {
             db,
             type_: simulation_type,
             phase: SimulationPhase::Test,
+            connection_stats: HashMap::new(),
         }
     }
 
     pub(crate) fn connect(&mut self, connection_index: usize) {
+        self.connect_at_tick(connection_index, None);
+    }
+
+    pub(crate) fn connect_at_tick(&mut self, connection_index: usize, tick: Option<usize>) {
         if connection_index >= self.connections.len() {
             panic!("connection index out of bounds");
         }
 
         if self.connections[connection_index].is_connected() {
-            log::trace!(
-                "Connection {connection_index} is already connected, skipping reconnection"
-            );
             return;
         }
 
@@ -330,6 +342,43 @@ impl SimulatorEnv {
                 );
             }
         };
+
+        self.connection_stats.insert(
+            connection_index,
+            ConnectionStats {
+                queries_executed: 0,
+                created_at_tick: tick,
+            },
+        );
+    }
+
+    pub(crate) fn increment_query_count(&mut self, connection_index: usize) {
+        if let Some(stats) = self.connection_stats.get_mut(&connection_index) {
+            stats.queries_executed += 1;
+        }
+    }
+
+    pub(crate) fn print_connection_stats(&self) {
+        let active_count = self.connections.iter().filter(|c| c.is_connected()).count();
+        println!("Connection Statistics:");
+        println!(
+            "  Active connections: {}/{}",
+            active_count, self.opts.max_connections
+        );
+
+        for (index, stats) in &self.connection_stats {
+            if self.connections[*index].is_connected() {
+                let created_info = if let Some(tick) = stats.created_at_tick {
+                    format!(" (created at tick {tick})")
+                } else {
+                    " (initial connection)".to_string()
+                };
+                println!(
+                    "  Connection {}: {} queries executed{}",
+                    index, stats.queries_executed, created_info
+                );
+            }
+        }
     }
 }
 
@@ -421,6 +470,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) experimental_indexes: bool,
     pub min_tick: u64,
     pub max_tick: u64,
+    pub(crate) connection_create_probability: usize,
 }
 
 #[derive(Debug, Clone)]
