@@ -89,10 +89,14 @@ impl VirtualTable {
         #[cfg(feature = "cli_only")]
         vtables.push(Self::dbpage_virtual_table());
 
-        // Add PostgreSQL system catalog virtual tables
-        vtables.extend(crate::pg_catalog::pg_catalog_virtual_tables());
+        // Note: PostgreSQL catalog tables are registered separately
+        // and only visible in PostgreSQL dialect mode
 
         vtables
+    }
+
+    pub(crate) fn postgres_catalog_tables() -> Vec<Arc<VirtualTable>> {
+        crate::pg_catalog::pg_catalog_virtual_tables()
     }
 
     #[cfg(feature = "json")]

@@ -274,6 +274,9 @@ pub struct Schema {
     /// In MVCC mode, when a table is dropped, the btree pages are not freed until checkpoint.
     /// integrity_check needs to know about these pages to avoid false positives about "page never used".
     pub dropped_root_pages: HashSet<i64>,
+
+    /// PostgreSQL catalog tables (only visible in PostgreSQL dialect)
+    pub postgres_catalog_tables: HashMap<String, Arc<Table>>,
 }
 
 impl Default for Schema {
@@ -292,12 +295,18 @@ impl Schema {
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
+        // Register SQLite builtin functions
         for function in VirtualTable::builtin_functions() {
             tables.insert(
                 function.name.to_owned(),
                 Arc::new(Table::Virtual(Arc::new((*function).clone()))),
             );
         }
+        // PostgreSQL catalog tables are registered separately
+        let postgres_catalog_tables: HashMap<String, Arc<Table>> = VirtualTable::postgres_catalog_tables()
+            .into_iter()
+            .map(|vtab| (vtab.name.clone(), Arc::new(Table::Virtual(vtab))))
+            .collect();
         let materialized_view_names = HashSet::default();
         let materialized_view_sql = HashMap::default();
         let incremental_views = HashMap::default();
@@ -319,6 +328,7 @@ impl Schema {
             table_to_materialized_views,
             incompatible_views,
             dropped_root_pages: HashSet::default(),
+            postgres_catalog_tables,
         }
     }
 
@@ -537,13 +547,27 @@ impl Schema {
     }
 
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
+        self.get_table_with_dialect(name, crate::SqlDialect::Sqlite)
+    }
+
+    pub fn get_table_with_dialect(&self, name: &str, dialect: crate::SqlDialect) -> Option<Arc<Table>> {
         let name = normalize_ident(name);
         let name = if name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT) {
             SCHEMA_TABLE_NAME
         } else {
             &name
         };
-        self.tables.get(name).cloned()
+
+        // First check regular tables (available in all dialects)
+        if let Some(table) = self.tables.get(name) {
+            return Some(table.clone());
+        }
+
+        // Then check dialect-specific tables
+        match dialect {
+            crate::SqlDialect::Postgres => self.postgres_catalog_tables.get(name).cloned(),
+            crate::SqlDialect::Sqlite => None,
+        }
     }
 
     pub fn remove_table(&mut self, table_name: &str) {
@@ -1568,6 +1592,7 @@ impl Clone for Schema {
             table_to_materialized_views: self.table_to_materialized_views.clone(),
             incompatible_views,
             dropped_root_pages: self.dropped_root_pages.clone(),
+            postgres_catalog_tables: self.postgres_catalog_tables.clone(),
         }
     }
 }
