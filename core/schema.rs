@@ -558,16 +558,31 @@ impl Schema {
             &name
         };
 
-        // First check regular tables (available in all dialects)
-        if let Some(table) = self.tables.get(name) {
-            return Some(table.clone());
+        // Check if this is a SQLite-specific system table or builtin function
+        if self.is_sqlite_specific_table(name) {
+            match dialect {
+                crate::SqlDialect::Sqlite => self.tables.get(name).cloned(),
+                crate::SqlDialect::Postgres => None, // Hide SQLite-specific tables in PostgreSQL mode
+            }
+        } else if let Some(table) = self.tables.get(name) {
+            // Regular user tables and dialect-agnostic builtin functions (available in all dialects)
+            Some(table.clone())
+        } else {
+            // Check dialect-specific catalog tables
+            match dialect {
+                crate::SqlDialect::Postgres => self.postgres_catalog_tables.get(name).cloned(),
+                crate::SqlDialect::Sqlite => None,
+            }
         }
+    }
 
-        // Then check dialect-specific tables
-        match dialect {
-            crate::SqlDialect::Postgres => self.postgres_catalog_tables.get(name).cloned(),
-            crate::SqlDialect::Sqlite => None,
-        }
+    /// Check if a table name is SQLite-specific and should be hidden in other dialects
+    fn is_sqlite_specific_table(&self, name: &str) -> bool {
+        name == SCHEMA_TABLE_NAME
+            || name == SCHEMA_TABLE_NAME_ALT
+            || name.starts_with("pragma_")
+            || name.starts_with("json_")
+            || name == "sqlite_dbpage"
     }
 
     pub fn remove_table(&mut self, table_name: &str) {
