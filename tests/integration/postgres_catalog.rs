@@ -9,20 +9,20 @@ fn test_postgres_pg_namespace(db: TempDatabase) {
     conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
     // Query pg_namespace virtual table
-    let mut rows = conn.query("SELECT * FROM pg_namespace").unwrap().unwrap();
+    let mut stmt = conn.prepare("SELECT * FROM pg_namespace").unwrap();
 
     // Should have at least pg_catalog and public namespaces
     let mut found_pg_catalog = false;
     let mut found_public = false;
 
     loop {
-        match rows.step().unwrap() {
+        match stmt.step().unwrap() {
             StepResult::Row => {
-                let row = rows.row().unwrap();
+                let row = stmt.row().unwrap();
                 if let Value::Text(nspname) = row.get_value(1) {
-                    if nspname.value == "pg_catalog" {
+                    if nspname == "pg_catalog" {
                         found_pg_catalog = true;
-                    } else if nspname.value == "public" {
+                    } else if nspname == "public" {
                         found_public = true;
                     }
                 }
@@ -47,17 +47,17 @@ fn test_postgres_pg_class(db: TempDatabase) {
     conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
     // Query pg_class virtual table
-    let mut rows = conn.query("SELECT relname, relkind FROM pg_class WHERE relkind = 'r'").unwrap().unwrap();
+    let mut stmt = conn.prepare("SELECT relname, relkind FROM pg_class WHERE relkind = 'r'").unwrap();
 
     // Should see our users table (once we implement the mapping)
     let mut found_users_table = false;
     loop {
-        match rows.step().unwrap() {
+        match stmt.step().unwrap() {
             StepResult::Row => {
-                let row = rows.row().unwrap();
+                let row = stmt.row().unwrap();
                 if let (Value::Text(relname), Value::Text(relkind)) =
                     (row.get_value(0), row.get_value(1)) {
-                    if relname.value == "users" && relkind.value == "r" {
+                    if relname == "users" && relkind == "r" {
                         found_users_table = true;
                     }
                 }
@@ -80,11 +80,11 @@ fn test_postgres_pg_attribute(db: TempDatabase) {
     conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
     // Query pg_attribute virtual table
-    let mut rows = conn.query("SELECT COUNT(*) FROM pg_attribute").unwrap().unwrap();
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM pg_attribute").unwrap();
 
-    match rows.step().unwrap() {
+    match stmt.step().unwrap() {
         StepResult::Row => {
-            let row = rows.row().unwrap();
+            let row = stmt.row().unwrap();
             if let Value::Integer(count) = row.get_value(0) {
                 // For now should be 0 since we haven't implemented the mapping yet
                 assert_eq!(*count, 0);

@@ -1,0 +1,624 @@
+diff --git a/core/incremental/operator.rs b/core/incremental/operator.rs
+index b56bc1467..ddc9dacf3 100644
+--- a/core/incremental/operator.rs
++++ b/core/incremental/operator.rs
+@@ -149,6 +149,20 @@ pub enum AggregateEvalState {
+     },
+ }
+ 
++// State for scanning join rows from BTree
++#[derive(Debug)]
++enum JoinScanState {
++    FetchKey {
++        last_read: Option<i64>, // Last element_id we read
++    },
++}
++
++impl JoinScanState {
++    fn new() -> Self {
++        JoinScanState::FetchKey { last_read: None }
++    }
++}
++
+ // Join-specific eval states
+ #[derive(Debug)]
+ pub enum JoinEvalState {
+@@ -160,11 +174,13 @@ pub enum JoinEvalState {
+         deltas: DeltaPair,
+         output: Delta,
+         current_idx: usize,
++        scan_state: JoinScanState,
+     },
+     ProcessRightJoin {
+         deltas: DeltaPair,
+         output: Delta,
+         current_idx: usize,
++        scan_state: JoinScanState,
+     },
+     Done {
+         output: Delta,
+@@ -2263,64 +2279,6 @@ impl IncrementalOperator for AggregateOperator {
+     }
+ }
+ 
+-// Join operator support structures
+-
+-/// Storage for join state - stores rows by join key
+-/// Mirrors the on-disk DBSP table structure
+-#[derive(Debug)]
+-struct JoinStateStorage {
+-    /// Maps storage_id to (join_key -> (row -> weight))
+-    /// storage_id differentiates between left/right tables and operators
+-    data: HashMap<i64, HashMap<HashableRow, HashMap<HashableRow, isize>>>,
+-}
+-
+-impl JoinStateStorage {
+-    fn new() -> Self {
+-        Self {
+-            data: HashMap::new(),
+-        }
+-    }
+-
+-    /// Add or update a row for a given storage_id and join key
+-    fn write(&mut self, storage_id: i64, join_key: HashableRow, row: HashableRow, weight: isize) {
+-        let join_keys = self.data.entry(storage_id).or_insert_with(HashMap::new);
+-        let entries = join_keys
+-            .entry(join_key.clone())
+-            .or_insert_with(HashMap::new);
+-
+-        match entries.entry(row) {
+-            std::collections::hash_map::Entry::Occupied(mut e) => {
+-                *e.get_mut() += weight;
+-                if *e.get() == 0 {
+-                    e.remove();
+-                }
+-            }
+-            std::collections::hash_map::Entry::Vacant(e) => {
+-                if weight != 0 {
+-                    e.insert(weight);
+-                }
+-            }
+-        }
+-
+-        // Remove empty entries
+-        if entries.is_empty() {
+-            join_keys.remove(&join_key);
+-            if join_keys.is_empty() {
+-                self.data.remove(&storage_id);
+-            }
+-        }
+-    }
+-
+-    /// Read all rows for a given storage_id and join key
+-    fn read(&self, storage_id: i64, join_key: &HashableRow) -> Vec<(HashableRow, isize)> {
+-        self.data
+-            .get(&storage_id)
+-            .and_then(|join_keys| join_keys.get(join_key))
+-            .map(|m| m.iter().map(|(k, &v)| (k.clone(), v)).collect())
+-            .unwrap_or_default()
+-    }
+-}
+-
+ #[derive(Debug)]
+ enum JoinCommitState {
+     Idle,
+@@ -2362,9 +2320,6 @@ pub struct JoinOperator {
+     tracker: Option<Arc<Mutex<ComputationTracker>>>,
+ 
+     commit_state: JoinCommitState,
+-
+-    /// Unified in-memory storage for join state (mirrors on-disk structure)
+-    state_storage: JoinStateStorage,
+ }
+ 
+ impl JoinOperator {
+@@ -2410,7 +2365,6 @@ impl JoinOperator {
+             right_columns,
+             tracker: None,
+             commit_state: JoinCommitState::Idle,
+-            state_storage: JoinStateStorage::new(),
+         })
+     }
+ 
+@@ -2427,13 +2381,13 @@ impl JoinOperator {
+     /// Generate storage ID for left table
+     fn left_storage_id(&self) -> i64 {
+         // Use column_index=0 for left side
+-        generate_storage_id(self.operator_id, 0, AGG_TYPE_REGULAR)
++        generate_storage_id(self.operator_id, 0, 0)
+     }
+ 
+     /// Generate storage ID for right table
+     fn right_storage_id(&self) -> i64 {
+         // Use column_index=1 for right side
+-        generate_storage_id(self.operator_id, 1, AGG_TYPE_REGULAR)
++        generate_storage_id(self.operator_id, 1, 0)
+     }
+ 
+     /// SQL-compliant comparison for join keys
+@@ -2461,7 +2415,7 @@ impl JoinOperator {
+     fn process_join_state(
+         &mut self,
+         state: &mut EvalState,
+-        _cursors: &mut DbspStateCursors,
++        cursors: &mut DbspStateCursors,
+     ) -> Result<IOResult<Delta>> {
+         // Get the join state out of the enum
+         let join_state = match state {
+@@ -2478,61 +2432,88 @@ impl JoinOperator {
+             );
+             match current_state {
+                 JoinEvalState::ProcessDeltaJoin { deltas, output } => {
++                    let left_changes: Vec<_> = deltas.left.changes.iter().collect();
++                    let right_changes: Vec<_> = deltas.right.changes.iter().collect();
+                     // Move to ProcessLeftJoin
+                     **join_state = JoinEvalState::ProcessLeftJoin {
+-                        deltas,
++                        left_changes,
++                        right_changes,
+                         output,
+                         current_idx: 0,
++                        scan_state: JoinScanState::new(),
+                     };
+                 }
+                 JoinEvalState::ProcessLeftJoin {
+-                    deltas,
++                    left_changes,
++                    right_changes,
+                     mut output,
+                     current_idx,
++                    mut scan_state,
+                 } => {
+-                    let left_changes: Vec<_> = deltas.left.changes.iter().collect();
+                     if current_idx >= left_changes.len() {
+                         **join_state = JoinEvalState::ProcessRightJoin {
+-                            deltas,
++                            right_changes,
+                             output,
+                             current_idx: 0,
++                            scan_state: JoinScanState::new(),
+                         };
+                     } else {
+                         let (left_row, left_weight) = left_changes[current_idx];
+                         let left_key =
+                             self.extract_join_key(&left_row.values, &self.left_key_indices);
+ 
+-                        // Read all matching rows from right side of storage
+-                        let matching_right_rows =
+-                            self.state_storage.read(self.right_storage_id(), &left_key);
+-
+-                        // Join with ALL matching right rows
+-                        for (right_row, right_weight) in &matching_right_rows {
+-                            // Combine the rows: left values + right values
+-                            let mut combined_values = left_row.values.clone();
+-                            combined_values.extend(right_row.values.clone());
+-
+-                            // Create the joined row with a simple rowid
+-                            let joined_row = HashableRow::new(0, combined_values);
+-
+-                            // Add to output with combined weight
+-                            let combined_weight = left_weight * right_weight;
+-                            output.changes.push((joined_row, combined_weight));
++                        // Try to scan for matching right rows
++                        match scan_state {
++                            JoinScanState::FetchKey { last_read } => {
++                                // Read the next matching row from storage
++                                let next_row = return_if_io!(read_next_join_row(
++                                    self.right_storage_id(),
++                                    &left_key,
++                                    last_read,
++                                    cursors
++                                ));
++
++                                match next_row {
++                                    Some((element_id, right_row, right_weight)) => {
++                                        // Combine the rows
++                                        let mut combined_values = left_row.values.clone();
++                                        combined_values.extend(right_row.values.clone());
++                                        let joined_row = HashableRow::new(0, combined_values);
++
++                                        // Add to output with combined weight
++                                        let combined_weight = left_weight * right_weight;
++                                        output.changes.push((joined_row, combined_weight));
++
++                                        // Continue scanning with this left row
++                                        **join_state = JoinEvalState::ProcessLeftJoin {
++                                            left_changes,
++                                            right_changes,
++                                            output,
++                                            current_idx,
++                                            scan_state: JoinScanState::FetchKey { last_read: Some(element_id) },
++                                        };
++                                    }
++                                    None => {
++                                        // No more matches for this left row, move to next
++                                        **join_state = JoinEvalState::ProcessLeftJoin {
++                                            left_changes,
++                                            right_changes,
++                                            output,
++                                            current_idx: current_idx + 1,
++                                            scan_state: JoinScanState::new(),
++                                        };
++                                    }
++                                }
++                            }
+                         }
+-
+-                        **join_state = JoinEvalState::ProcessLeftJoin {
+-                            deltas,
+-                            output,
+-                            current_idx: current_idx + 1,
+-                        };
+                     }
+                 }
+                 JoinEvalState::ProcessRightJoin {
+-                    deltas,
++                    right_changes,
+                     mut output,
+                     current_idx,
++                    mut scan_state,
+                 } => {
+-                    let right_changes: Vec<_> = deltas.right.changes.iter().collect();
+                     if current_idx >= right_changes.len() {
+                         **join_state = JoinEvalState::Done { output };
+                     } else {
+@@ -2540,29 +2521,48 @@ impl JoinOperator {
+                         let right_key =
+                             self.extract_join_key(&right_row.values, &self.right_key_indices);
+ 
+-                        // Read all matching rows from left side of storage
+-                        let matching_left_rows =
+-                            self.state_storage.read(self.left_storage_id(), &right_key);
+-
+-                        // Join with ALL matching left rows
+-                        for (left_row, left_weight) in &matching_left_rows {
+-                            // Combine the rows: left values + right values
+-                            let mut combined_values = left_row.values.clone();
+-                            combined_values.extend(right_row.values.clone());
+-
+-                            // Create the joined row with a simple rowid
+-                            let joined_row = HashableRow::new(0, combined_values);
+-
+-                            // Add to output with combined weight
+-                            let combined_weight = left_weight * right_weight;
+-                            output.changes.push((joined_row, combined_weight));
++                        // Try to scan for matching left rows
++                        match scan_state {
++                            JoinScanState::FetchKey { last_read } => {
++                                // Read the next matching row from storage
++                                let next_row = return_if_io!(read_next_join_row(
++                                    self.left_storage_id(),
++                                    &right_key,
++                                    last_read,
++                                    cursors
++                                ));
++
++                                match next_row {
++                                    Some((element_id, left_row, left_weight)) => {
++                                        // Combine the rows
++                                        let mut combined_values = left_row.values.clone();
++                                        combined_values.extend(right_row.values.clone());
++                                        let joined_row = HashableRow::new(0, combined_values);
++
++                                        // Add to output with combined weight
++                                        let combined_weight = left_weight * right_weight;
++                                        output.changes.push((joined_row, combined_weight));
++
++                                        // Continue scanning with this right row
++                                        **join_state = JoinEvalState::ProcessRightJoin {
++                                            right_changes,
++                                            output,
++                                            current_idx,
++                                            scan_state: JoinScanState::FetchKey { last_read: Some(element_id) },
++                                        };
++                                    }
++                                    None => {
++                                        // No more matches for this right row, move to next
++                                        **join_state = JoinEvalState::ProcessRightJoin {
++                                            right_changes,
++                                            output,
++                                            current_idx: current_idx + 1,
++                                            scan_state: JoinScanState::new(),
++                                        };
++                                    }
++                                }
++                            }
+                         }
+-
+-                        **join_state = JoinEvalState::ProcessRightJoin {
+-                            deltas,
+-                            output,
+-                            current_idx: current_idx + 1,
+-                        };
+                     }
+                 }
+                 JoinEvalState::Done { output } => {
+@@ -2576,7 +2576,7 @@ impl JoinOperator {
+     fn eval_internal(
+         &mut self,
+         state: &mut EvalState,
+-        _cursors: &mut DbspStateCursors,
++        cursors: &mut DbspStateCursors,
+     ) -> Result<IOResult<Delta>> {
+         loop {
+             let loop_state = std::mem::replace(state, EvalState::Uninitialized);
+@@ -2622,7 +2622,8 @@ impl JoinOperator {
+                 }
+                 EvalState::Join(join_state) => {
+                     *state = EvalState::Join(join_state);
+-                    return self.process_join_state(state, _cursors);
++                    let output =  return_if_io!(self.process_join_state(state, cursors));
++                    return output;
+                 }
+                 EvalState::Done => {
+                     return Ok(IOResult::Done(Delta::new()));
+@@ -2635,6 +2636,136 @@ impl JoinOperator {
+     }
+ }
+ 
++
++// Helper function to read the next row from the BTree for joins
++fn read_next_join_row(
++    storage_id: i64,
++    join_key: &HashableRow,
++    last_element_id: Option<i64>,
++    cursors: &mut DbspStateCursors,
++) -> Result<IOResult<Option<(i64, HashableRow, isize)>>> {
++    // Build the index key: (storage_id, zset_id, element_id)
++    // zset_id is the hash of the join key
++    let zset_id = join_key.cached_hash() as i64;
++
++    // If we have a last_element_id, seek to the next one
++    // Otherwise, seek to the beginning of this zset
++    let seek_element_id = last_element_id.map(|id| id + 1).unwrap_or(0);
++
++    let index_key_values = vec![
++        Value::Integer(storage_id),
++        Value::Integer(zset_id),
++        Value::Integer(seek_element_id),
++    ];
++
++    let index_record = ImmutableRecord::from_values(&index_key_values, index_key_values.len());
++    let seek_result = return_if_io!(cursors.index_cursor.seek(
++        SeekKey::IndexKey(&index_record),
++        SeekOp::GE { eq_only: false }
++    ));
++
++    if !matches!(seek_result, SeekResult::Found) {
++        return Ok(IOResult::Done(None));
++    }
++
++    // Check if we're still in the same (storage_id, zset_id) range
++    let current_record = return_if_io!(cursors.index_cursor.record());
++    if let Some(rec) = current_record {
++        let values = rec.get_values();
++        if values.len() >= 3 {
++            let found_storage_id = match &values[0].to_owned() {
++                Value::Integer(id) => *id,
++                _ => return Ok(IOResult::Done(None)),
++            };
++            let found_zset_id = match &values[1].to_owned() {
++                Value::Integer(id) => *id,
++                _ => return Ok(IOResult::Done(None)),
++            };
++
++            // If we've moved to a different storage_id or zset_id, we're done
++            if found_storage_id != storage_id || found_zset_id != zset_id {
++                return Ok(IOResult::Done(None));
++            }
++
++            // Get the element_id from the index
++            let element_id = match &values[2].to_owned() {
++                Value::Integer(id) => *id,
++                _ => return Ok(IOResult::Done(None)),
++            };
++
++            // Now get the actual row from the table using the rowid from the index
++            let rowid = return_if_io!(cursors.index_cursor.rowid());
++            if let Some(rowid) = rowid {
++                return_if_io!(cursors.table_cursor.seek(
++                    SeekKey::TableRowId(rowid),
++                    SeekOp::GE { eq_only: true }
++                ));
++
++                let table_record = return_if_io!(cursors.table_cursor.record());
++                if let Some(rec) = table_record {
++                    let table_values = rec.get_values();
++                    // Table format: [storage_id, zset_id, element_id, value_blob, weight]
++                    if table_values.len() >= 5 {
++                        // Deserialize the row from the blob
++                        let blob = match &table_values[3].to_owned() {
++                            Value::Blob(b) => b,
++                            _ => return Ok(IOResult::Done(None)),
++                        };
++
++                        // The blob contains the serialized HashableRow
++                        // For now, let's deserialize it simply
++                        let row = deserialize_hashable_row(blob)?;
++
++                        let weight = match &table_values[4].to_owned() {
++                            Value::Integer(w) => *w as isize,
++                            _ => return Ok(IOResult::Done(None)),
++                        };
++
++                        return Ok(IOResult::Done(Some((element_id, row, weight))));
++                    }
++                }
++            }
++        }
++    }
++
++    Ok(IOResult::Done(None))
++}
++
++// Helper to deserialize a HashableRow from a blob
++fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
++    // Simple deserialization - this needs to match how we serialize in commit
++    // Format: [rowid:8 bytes][num_values:4 bytes][values...]
++    if blob.len() < 12 {
++        return Err(crate::LimboError::InternalError("Invalid blob size".to_string()));
++    }
++
++    let rowid = i64::from_le_bytes(blob[0..8].try_into().unwrap());
++    let num_values = u32::from_le_bytes(blob[8..12].try_into().unwrap()) as usize;
++
++    // For simplicity, let's store the values as a bincode or similar
++    // For now, we'll just create an empty row
++    // This needs proper implementation based on your serialization format
++    let values = Vec::new(); // TODO: Deserialize actual values
++
++    Ok(HashableRow::new(rowid, values))
++}
++
++// Helper to serialize a HashableRow to a blob
++fn serialize_hashable_row(row: &HashableRow) -> Vec<u8> {
++    let mut blob = Vec::new();
++
++    // Write rowid
++    blob.extend_from_slice(&row.rowid.to_le_bytes());
++
++    // Write number of values
++    blob.extend_from_slice(&(row.values.len() as u32).to_le_bytes());
++
++    // TODO: Write actual values - needs proper serialization
++    // For now, this is a placeholder
++
++    blob
++}
++
+ impl IncrementalOperator for JoinOperator {
+     fn eval(
+         &mut self,
+@@ -2674,53 +2805,99 @@ impl IncrementalOperator for JoinOperator {
+                 JoinCommitState::CommitLeftDelta {
+                     deltas,
+                     output,
+-                    current_idx: _,
+-                    write_row: _,
++                    current_idx,
++                    mut write_row,
+                 } => {
+-                    // Process all left delta rows
+-                    for (row, weight) in &deltas.left.changes {
+-                        // Extract join key from the left row
+-                        let join_key = self.extract_join_key(&row.values, &self.left_key_indices);
+-
+-                        // Update in-memory storage for left side
+-                        self.state_storage.write(
+-                            self.left_storage_id(),
+-                            join_key,
+-                            row.clone(),
+-                            *weight,
+-                        );
++                    if *current_idx >= deltas.left.changes.len() {
++                        self.commit_state = JoinCommitState::CommitRightDelta {
++                            deltas: deltas.clone(),
++                            output: output.clone(),
++                            current_idx: 0,
++                            write_row: WriteRow::new(),
++                        };
++                        continue;
+                     }
+ 
+-                    self.commit_state = JoinCommitState::CommitRightDelta {
++                    let (row, weight) = &deltas.left.changes[*current_idx];
++                    // Extract join key from the left row
++                    let join_key = self.extract_join_key(&row.values, &self.left_key_indices);
++
++                    // The index key: (storage_id, zset_id, element_id)
++                    // zset_id is the hash of the join key, element_id is hash of the row
++                    let index_key = vec![
++                        Value::Integer(self.left_storage_id()),
++                        Value::Integer(join_key.cached_hash() as i64),
++                        Value::Integer(row.cached_hash() as i64),
++                    ];
++
++                    // The record values: we'll store the serialized row as a blob
++                    let row_blob = serialize_hashable_row(row);
++                    let record_values = vec![
++                        Value::Integer(self.left_storage_id()),
++                        Value::Integer(join_key.cached_hash() as i64),
++                        Value::Integer(row.cached_hash() as i64),
++                        Value::Blob(row_blob),
++                    ];
++
++                    // Use return_and_restore_if_io to handle I/O properly
++                    return_and_restore_if_io!(
++                        &mut self.commit_state,
++                        state,
++                        write_row.write_row(cursors, index_key, record_values, *weight)
++                    );
++
++                    self.commit_state = JoinCommitState::CommitLeftDelta {
+                         deltas: deltas.clone(),
+                         output: output.clone(),
+-                        current_idx: 0,
++                        current_idx: current_idx + 1,
+                         write_row: WriteRow::new(),
+                     };
+                 }
+                 JoinCommitState::CommitRightDelta {
+                     deltas,
+                     output,
+-                    current_idx: _,
+-                    write_row: _,
++                    current_idx,
++                    mut write_row,
+                 } => {
+-                    // Process all right delta rows
+-                    for (row, weight) in &deltas.right.changes {
+-                        // Extract join key from the right row
+-                        let join_key = self.extract_join_key(&row.values, &self.right_key_indices);
+-
+-                        // Update in-memory storage for right side
+-                        self.state_storage.write(
+-                            self.right_storage_id(),
+-                            join_key,
+-                            row.clone(),
+-                            *weight,
+-                        );
++                    if *current_idx >= deltas.right.changes.len() {
++                        // Reset to Idle state for next commit
++                        self.commit_state = JoinCommitState::Idle;
++                        return Ok(IOResult::Done(output.clone()));
+                     }
+ 
+-                    // Reset to Idle state for next commit
+-                    self.commit_state = JoinCommitState::Idle;
+-                    return Ok(IOResult::Done(output.clone()));
++                    let (row, weight) = &deltas.right.changes[*current_idx];
++                    // Extract join key from the right row
++                    let join_key = self.extract_join_key(&row.values, &self.right_key_indices);
++
++                    // The index key: (storage_id, zset_id, element_id)
++                    let index_key = vec![
++                        Value::Integer(self.right_storage_id()),
++                        Value::Integer(join_key.cached_hash() as i64),
++                        Value::Integer(row.cached_hash() as i64),
++                    ];
++
++                    // The record values: we'll store the serialized row as a blob
++                    let row_blob = serialize_hashable_row(row);
++                    let record_values = vec![
++                        Value::Integer(self.right_storage_id()),
++                        Value::Integer(join_key.cached_hash() as i64),
++                        Value::Integer(row.cached_hash() as i64),
++                        Value::Blob(row_blob),
++                    ];
++
++                    // Use return_and_restore_if_io to handle I/O properly
++                    return_and_restore_if_io!(
++                        &mut self.commit_state,
++                        state,
++                        write_row.write_row(cursors, index_key, record_values, *weight)
++                    );
++
++                    self.commit_state = JoinCommitState::CommitRightDelta {
++                        deltas: deltas.clone(),
++                        output: output.clone(),
++                        current_idx: current_idx + 1,
++                        write_row: WriteRow::new(),
++                    };
+                 }
+                 JoinCommitState::Invalid => {
+                     panic!("Invalid join commit state");

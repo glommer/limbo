@@ -1,0 +1,54 @@
+diff --git a/core/vdbe/execute.rs b/core/vdbe/execute.rs
+index current..fixed 100644
+--- a/core/vdbe/execute.rs
++++ b/core/vdbe/execute.rs
+@@ -1948,9 +1948,14 @@ pub fn halt(
+             )));
+         }
+     }
+-    program
+-        .commit_txn(pager.clone(), state, mv_store, false)
+-        .map(Into::into)
++    
++    // Only commit if in auto-commit mode
++    let auto_commit = program.connection.auto_commit.get();
++    if auto_commit {
++        program.commit_txn(pager.clone(), state, mv_store, false).map(Into::into)
++    } else {
++        Ok(InsnFunctionStepResult::Done)
++    }
+ }
+ 
+ pub fn op_halt(
+@@ -1972,17 +1977,9 @@ pub fn op_halt(
+     let auto_commit = program.connection.auto_commit.get();
+     tracing::trace!("op_halt(auto_commit={})", auto_commit);
+ 
+-    // For non-autocommit mode with successful normal halt (not RAISE),
+-    // just return Done without committing
+-    if !auto_commit && *err_code == 0 && *on_error == OnError::None {
+-        return Ok(InsnFunctionStepResult::Done);
+-    }
+-
+-    // Delegate all logic (including RAISE handling) to halt()
+-    let result = halt(
++    // Delegate all logic to halt() - it now handles auto_commit correctly
++    halt(
+         program,
+         state,
+         pager,
+@@ -1990,13 +1987,7 @@ pub fn op_halt(
+         *err_code,
+         *on_error,
+         description,
+-    )?;
+-
+-    // In non-autocommit mode, if halt() returned successfully (would normally commit),
+-    // we need to return Done instead
+-    if !auto_commit && matches!(result, InsnFunctionStepResult::Done) {
+-        Ok(InsnFunctionStepResult::Done)
+-    } else {
+-        Ok(result)
+-    }
++    )
+ }

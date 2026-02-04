@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>libSQL Browser Test</title>
+</head>
+<body>
+    <h2>libSQL Browser Test</h2>
+    <div id="status">Initializing database...</div>
+    
+    <div style="margin-top: 20px">
+        <textarea id="sqlInput" rows="4" cols="50">SELECT 1;</textarea>
+        <br>
+        <button onclick="runQuery()">Run Query</button>
+    </div>
+    
+    <pre id="results"></pre>
+
+    <script>
+	let worker = new Worker('worker.js', { type: 'module' });
+        
+        worker.onmessage = function(e) {
+            const data = e.data;
+            document.getElementById('status').textContent = data.message;
+            
+            if (data.results) {
+                document.getElementById('results').textContent = 
+                    JSON.stringify(data.results, null, 2);
+            }
+        };
+
+        function runQuery() {
+            const sql = document.getElementById('sqlInput').value;
+            document.getElementById('results').textContent = 'Running query...';
+            
+            worker.postMessage({
+                command: 'runQuery',
+                sql: sql
+            });
+        }
+    </script>
+</body>
+</html>

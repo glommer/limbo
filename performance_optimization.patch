@@ -1,0 +1,215 @@
+diff --git a/core/vdbe/execute.rs b/core/vdbe/execute.rs
+index current..optimized 100644
+--- a/core/vdbe/execute.rs
++++ b/core/vdbe/execute.rs
+@@ -6400,6 +6400,16 @@ pub fn op_program(
+ ) -> Result<InsnFunctionStepResult> {
+     use crate::vdbe::VdbeFrame;
+ 
++    // Fast path: Check if we're resuming from I/O without loading instruction
++    if !state.frame_stack.is_empty() {
++        let last_frame = state.frame_stack.last().unwrap();
++        // If we have a frame with PC > 0 and matching parent PC, we're resuming
++        if last_frame.pc > 0 && last_frame.parent_saved_pc == state.pc {
++            // Continue execution without reloading - jump to execution loop
++            return resume_subprogram_execution(program, state, pager, mv_store);
++        }
++    }
++
+     // First, load the instruction to get the subprogram
+     load_insn!(
+         Program {
+@@ -6440,10 +6450,11 @@ pub fn op_program(
+         }
+ 
+         // Create a new frame with its own register space
+-        let mut frame_registers = vec![Register::Value(Value::Null); subprogram.register_count];
++        // Use with_capacity for better memory allocation
++        let mut frame_registers = Vec::with_capacity(subprogram.register_count);
++        frame_registers.resize(subprogram.register_count, Register::Value(Value::Null));
+ 
+         // Copy input registers from parent if specified
+         if let Some(ref mapping) = input_registers {
+             // Validate that source registers exist in parent
+             let source_end = mapping.source_start + mapping.count;
+@@ -6457,35 +6468,29 @@ pub fn op_program(
+                 )));
+             }
+             
+-            // Copy the registers (destination bounds already ensured by frame_registers size)
++            // Use slice copy for better performance
++            let copy_count = mapping.count.min(frame_registers.len());
+             for i in 0..mapping.count {
+-                if i < frame_registers.len() {
+-                    frame_registers[i] = state.registers[mapping.source_start + i].clone();
+-                }
++                frame_registers[i] = state.registers[mapping.source_start + i].clone();
+             }
+         }
+ 
+         VdbeFrame {
+-            subprogram: subprogram.clone(),
++            subprogram: subprogram.clone(), // Arc clone is cheap
+             pc: 0,
+             parent_saved_pc: state.pc,
+             registers: frame_registers,
+             base_reg: *base_reg,
+-            ignore_jump: ignore_jump.clone(),
++            ignore_jump: *ignore_jump, // Copy instead of clone for simple enum
+             token: subprogram.token,
+-            input_registers: input_registers.clone(),
+-            return_registers: return_registers.clone(),
++            input_registers: *input_registers, // Copy Option<small struct>
++            return_registers: *return_registers, // Copy Option<small struct>
+         }
+     };
+ 
+-    // Execute the subprogram instructions
+-
+-    // Push the current frame onto the stack so nested Program instructions can check for recursion
+-    state.frame_stack.push(frame);
+-
+-    // Pop the frame back off to work with it
+-    let mut frame = state.frame_stack.pop().unwrap();
+-
++    // Swap registers ONCE at the beginning
++    // Store parent registers in the frame temporarily
++    let mut frame_with_parent_regs = frame;
++    frame_with_parent_regs.registers = std::mem::take(&mut state.registers);
++    state.registers = std::mem::take(&mut frame.registers);
++    
+     // Save parent's registers and swap in frame's registers
+-    let saved_parent_registers = std::mem::replace(&mut state.registers, frame.registers);
++    let saved_parent_registers = frame_with_parent_regs.registers;
+     let saved_parent_pc = state.pc;
+ 
+-    // Push frame back onto stack for recursion checking during execution
++    // Push a lightweight frame for recursion checking
++    // We don't need to store registers here since they're in state
+     state.frame_stack.push(VdbeFrame {
+-        subprogram: frame.subprogram.clone(),
++        subprogram: frame.subprogram.clone(), // Arc clone is cheap
+         pc: frame.pc,
+         parent_saved_pc: frame.parent_saved_pc,
+-        registers: vec![], // Temporary placeholder - registers are in state now
++        registers: Vec::new(), // Empty vec is cheap
+         base_reg: frame.base_reg,
+-        ignore_jump: frame.ignore_jump.clone(),
++        ignore_jump: frame.ignore_jump,
+         token: frame.token,
+-        input_registers: frame.input_registers.clone(),
+-        return_registers: frame.return_registers.clone(),
++        input_registers: frame.input_registers,
++        return_registers: frame.return_registers,
+     });
+ 
++    execute_subprogram_loop(
++        program,
++        state,
++        pager,
++        mv_store,
++        frame,
++        saved_parent_registers,
++        saved_parent_pc,
++    )
++}
++
++// Extract execution loop to separate function for better optimization
++#[inline(never)] // Prevent inlining of large function
++fn execute_subprogram_loop(
++    program: &Program,
++    state: &mut ProgramState,
++    pager: &Rc<Pager>,
++    mv_store: Option<&Arc<MvStore>>,
++    mut frame: VdbeFrame,
++    saved_parent_registers: Vec<Register>,
++    saved_parent_pc: u32,
++) -> Result<InsnFunctionStepResult> {
+     // Execute subprogram instructions using the normal instruction execution
+     while frame.pc < frame.subprogram.instructions.len() {
+         let sub_insn = &frame.subprogram.instructions[frame.pc];
+@@ -6523,7 +6574,7 @@ pub fn op_program(
+             }
+             Ok(InsnFunctionStepResult::IO(io)) => {
+                 // Need to save frame state and restore parent state for I/O
+-                frame.registers = std::mem::replace(&mut state.registers, saved_parent_registers);
++                frame.registers = std::mem::replace(&mut state.registers, saved_parent_registers.clone());
+                 frame.pc = state.pc as usize;
+                 state.pc = saved_parent_pc;
+ 
+@@ -6537,35 +6588,11 @@ pub fn op_program(
+                 return Ok(InsnFunctionStepResult::IO(io));
+             }
+-            Ok(InsnFunctionStepResult::Interrupt) => {
+-                // Save frame state and restore parent state
+-                frame.registers = std::mem::replace(&mut state.registers, saved_parent_registers);
+-                frame.pc = state.pc as usize;
+-                state.pc = saved_parent_pc;
+-
+-                // Update the frame on the stack with current state
+-                if let Some(stack_frame) = state.frame_stack.last_mut() {
+-                    stack_frame.pc = frame.pc;
+-                    stack_frame.registers = frame.registers;
+-                }
+-                return Ok(InsnFunctionStepResult::Interrupt);
+-            }
+-            Ok(InsnFunctionStepResult::Busy) => {
+-                // Save frame state and restore parent state
+-                frame.registers = std::mem::replace(&mut state.registers, saved_parent_registers);
+-                frame.pc = state.pc as usize;
+-                state.pc = saved_parent_pc;
+-
+-                // Update the frame on the stack with current state
+-                if let Some(stack_frame) = state.frame_stack.last_mut() {
+-                    stack_frame.pc = frame.pc;
+-                    stack_frame.registers = frame.registers;
+-                }
+-                return Ok(InsnFunctionStepResult::Busy);
+-            }
++            Ok(result @ (InsnFunctionStepResult::Interrupt | InsnFunctionStepResult::Busy)) => {
++                return handle_subprogram_suspension(state, frame, saved_parent_registers, saved_parent_pc, result);
++            }
+             Err(err) => {
+                 // Restore parent state on error
+                 state.registers = saved_parent_registers;
+@@ -6630,6 +6657,43 @@ pub fn op_program(
+     Ok(InsnFunctionStepResult::Step)
+ }
+ 
++// Helper function to handle suspension cases (Interrupt, Busy)
++#[inline]
++fn handle_subprogram_suspension(
++    state: &mut ProgramState,
++    mut frame: VdbeFrame,
++    saved_parent_registers: Vec<Register>,
++    saved_parent_pc: u32,
++    result: InsnFunctionStepResult,
++) -> Result<InsnFunctionStepResult> {
++    // Save frame state and restore parent state
++    frame.registers = std::mem::replace(&mut state.registers, saved_parent_registers);
++    frame.pc = state.pc as usize;
++    state.pc = saved_parent_pc;
++
++    // Update the frame on the stack with current state
++    if let Some(stack_frame) = state.frame_stack.last_mut() {
++        stack_frame.pc = frame.pc;
++        stack_frame.registers = frame.registers;
++    }
++    
++    Ok(result)
++}
++
++// Helper to resume execution after I/O
++fn resume_subprogram_execution(
++    program: &Program,
++    state: &mut ProgramState,
++    pager: &Rc<Pager>,
++    mv_store: Option<&Arc<MvStore>>,
++) -> Result<InsnFunctionStepResult> {
++    // Pop the frame and continue execution
++    let frame = state.frame_stack.pop().unwrap();
++    let saved_parent_pc = frame.parent_saved_pc;
++    
++    // The registers are already in state, just need saved parent info
++    execute_subprogram_loop(program, state, pager, mv_store, frame, Vec::new(), saved_parent_pc)
++}

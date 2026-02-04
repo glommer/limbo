@@ -1,0 +1,53 @@
+diff --git a/core/vdbe/execute.rs b/core/vdbe/execute.rs
+index 3217de18..4d0dd5ea 100644
+--- a/core/vdbe/execute.rs
++++ b/core/vdbe/execute.rs
+@@ -6444,9 +6444,21 @@ pub fn op_program(
+ 
+         // Copy input registers from parent if specified
+         if let Some(ref mapping) = input_registers {
++            // Validate that source registers exist in parent
++            let source_end = mapping.source_start + mapping.count;
++            if source_end > state.registers.len() {
++                return Err(LimboError::InternalError(format!(
++                    "Subprogram '{}' tried to read from registers {}-{}, but parent only has {} registers",
++                    subprogram.name,
++                    mapping.source_start,
++                    source_end - 1,
++                    state.registers.len()
++                )));
++            }
++            
++            // Copy the registers (destination bounds already ensured by frame_registers size)
+             for i in 0..mapping.count {
+-                if mapping.source_start + i < state.registers.len() && i < frame_registers.len() {
+-                    frame_registers[i] = state.registers[mapping.source_start + i].clone();
++                if i < frame_registers.len() {
++                    frame_registers[i] = state.registers[mapping.source_start + i].clone();
+                 }
+             }
+         }
+@@ -6595,10 +6607,22 @@ pub fn op_program(
+ 
+     // If return_registers is specified, copy subprogram's registers to parent
+     if let Some(ref mapping) = frame.return_registers {
++        // Validate that destination registers exist in parent
++        let dest_end = mapping.dest_start + mapping.count;
++        if dest_end > state.registers.len() {
++            return Err(LimboError::InternalError(format!(
++                "Subprogram '{}' tried to write results to registers {}-{}, but parent only has {} registers",
++                frame.subprogram.name,
++                mapping.dest_start,
++                dest_end - 1,
++                state.registers.len()
++            )));
++        }
++        
+         // Copy subprogram's registers [0..count) to parent's [dest_start..dest_start+count)
+         for i in 0..mapping.count {
+             if i < frame.registers.len() {
+-                state.registers[mapping.dest_start + i] = frame.registers[i].clone();
++                state.registers[mapping.dest_start + i] = frame.registers[i].clone();
+             }
+         }
+     }

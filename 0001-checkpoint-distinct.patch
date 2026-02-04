@@ -1,0 +1,971 @@
+From b87a110ca4569015face9c11fdaaeabfa639e6ee Mon Sep 17 00:00:00 2001
+From: Glauber Costa <glauber@turso.tech>
+Date: Mon, 6 Oct 2025 20:54:38 -0500
+Subject: [PATCH 1/2] checkpoint distinct
+
+---
+ core/incremental/aggregate_operator.rs |  98 ++++++--
+ core/incremental/compiler.rs           |  48 +++-
+ core/incremental/operator.rs           | 287 +++++++++++++++++++++++
+ core/util.rs                           |  34 ++-
+ testing/materialized_views.test        | 305 +++++++++++++++++++++++++
+ 5 files changed, 747 insertions(+), 25 deletions(-)
+
+diff --git a/core/incremental/aggregate_operator.rs b/core/incremental/aggregate_operator.rs
+index e24b930a9..1f85a4cd2 100644
+--- a/core/incremental/aggregate_operator.rs
++++ b/core/incremental/aggregate_operator.rs
+@@ -23,6 +23,7 @@ const AGG_FUNC_SUM: i64 = 1;
+ const AGG_FUNC_AVG: i64 = 2;
+ const AGG_FUNC_MIN: i64 = 3;
+ const AGG_FUNC_MAX: i64 = 4;
++const AGG_FUNC_DISTINCT: i64 = 5;
+ 
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum AggregateFunction {
+@@ -31,6 +32,9 @@ pub enum AggregateFunction {
+     Avg(usize), // Column index
+     Min(usize), // Column index
+     Max(usize), // Column index
++    /// DISTINCT - special aggregate that just tracks existence
++    /// Used when GROUP BY contains all selected columns
++    Distinct,
+ }
+ 
+ impl Display for AggregateFunction {
+@@ -41,6 +45,7 @@ impl Display for AggregateFunction {
+             AggregateFunction::Avg(idx) => write!(f, "AVG(col{idx})"),
+             AggregateFunction::Min(idx) => write!(f, "MIN(col{idx})"),
+             AggregateFunction::Max(idx) => write!(f, "MAX(col{idx})"),
++            AggregateFunction::Distinct => write!(f, "DISTINCT"),
+         }
+     }
+ }
+@@ -69,6 +74,7 @@ impl AggregateFunction {
+             AggregateFunction::Max(idx) => {
+                 vec![Value::Integer(AGG_FUNC_MAX), Value::Integer(*idx as i64)]
+             }
++            AggregateFunction::Distinct => vec![Value::Integer(AGG_FUNC_DISTINCT)],
+         }
+     }
+ 
+@@ -140,6 +146,10 @@ impl AggregateFunction {
+                     )));
+                 }
+             }
++            Value::Integer(AGG_FUNC_DISTINCT) => {
++                *cursor += 1;
++                AggregateFunction::Distinct
++            }
+             _ => {
+                 return Err(LimboError::InternalError(format!(
+                     "Unknown aggregate type code: {type_code:?}"
+@@ -483,6 +493,10 @@ impl AggregateState {
+                         values.push(Value::Integer(0)); // No value
+                     }
+                 }
++                AggregateFunction::Distinct => {
++                    // For DISTINCT, count is the only state we need
++                    // It's already stored at the beginning
++                }
+             }
+         }
+ 
+@@ -617,6 +631,10 @@ impl AggregateState {
+                         )));
+                     }
+                 }
++                AggregateFunction::Distinct => {
++                    // For DISTINCT, count is the only state we need
++                    // It's already stored at the beginning
++                }
+             }
+         }
+ 
+@@ -720,6 +738,11 @@ impl AggregateState {
+                         *count += weight as i64;
+                     }
+                 }
++                AggregateFunction::Distinct => {
++                    // For DISTINCT, count already tracks the integral weight
++                    // The output will be 1 if count > 0, else 0
++                    // This is handled in to_values()
++                }
+                 AggregateFunction::Min(_col_name) | AggregateFunction::Max(_col_name) => {
+                     // MIN/MAX cannot be handled incrementally in apply_delta because:
+                     //
+@@ -779,6 +802,11 @@ impl AggregateState {
+                         result.push(Value::Null);
+                     }
+                 }
++                AggregateFunction::Distinct => {
++                    // For DISTINCT, we don't output an aggregate value
++                    // The group itself is the output when count > 0
++                    // We don't add anything to result here
++                }
+                 AggregateFunction::Min(col_idx) => {
+                     // Return the MIN value from our state
+                     result.push(self.mins.get(col_idx).cloned().unwrap_or(Value::Null));
+@@ -927,6 +955,19 @@ impl AggregateOperator {
+         let mut output_delta = Delta::new();
+         let mut temp_keys: HashMap<String, Vec<Value>> = HashMap::new();
+ 
++        // Check if this is a DISTINCT-only aggregate
++        let is_distinct_only =
++            self.aggregates.len() == 1 && matches!(self.aggregates[0], AggregateFunction::Distinct);
++
++        // For DISTINCT, track the old count for each group before applying deltas
++        let mut old_counts: HashMap<String, i64> = HashMap::new();
++        if is_distinct_only {
++            // Get initial state from existing_groups (includes groups with count=0)
++            for (group_key_str, state) in existing_groups.iter() {
++                old_counts.insert(group_key_str.clone(), state.count);
++            }
++        }
++
+         // Process each change in the delta
+         for (row, weight) in &delta.changes {
+             if let Some(tracker) = &self.tracker {
+@@ -954,28 +995,57 @@ impl AggregateOperator {
+         let mut final_states = HashMap::new();
+ 
+         for (group_key_str, state) in existing_groups {
+-            let group_key = temp_keys.get(group_key_str).cloned().unwrap_or_default();
++            let group_key = if let Some(key) = temp_keys.get(group_key_str) {
++                key.clone()
++            } else if let Some(old_row) = old_values.get(group_key_str) {
++                // Extract group key from old row (first N columns where N = group_by.len())
++                old_row[0..self.group_by.len()].to_vec()
++            } else {
++                vec![]
++            };
+ 
+             // Generate synthetic rowid for this group
+             let result_key = self.generate_group_rowid(group_key_str);
+ 
+-            if let Some(old_row_values) = old_values.get(group_key_str) {
+-                let old_row = HashableRow::new(result_key, old_row_values.clone());
+-                output_delta.changes.push((old_row, -1));
+-            }
+-
+             // Always store the state for persistence (even if count=0, we need to delete it)
+             final_states.insert(group_key_str.clone(), (group_key.clone(), state.clone()));
+ 
+-            // Only include groups with count > 0 in the output delta
+-            if state.count > 0 {
+-                // Build output row: group_by columns + aggregate values
+-                let mut output_values = group_key.clone();
+-                let aggregate_values = state.to_values(&self.aggregates);
+-                output_values.extend(aggregate_values);
++            if is_distinct_only {
++                // For DISTINCT, only output changes when crossing the zero boundary
++                let old_count = old_counts.get(group_key_str).copied().unwrap_or(0);
++                let new_count = state.count;
++
++                if old_count > 0 && new_count == 0 {
++                    // Transition from positive to zero: output deletion
++                    if let Some(old_row_values) = old_values.get(group_key_str) {
++                        let old_row = HashableRow::new(result_key, old_row_values.clone());
++                        output_delta.changes.push((old_row, -1));
++                    }
++                } else if old_count == 0 && new_count > 0 {
++                    // Transition from zero to positive: output insertion
++                    let output_values = group_key.clone();
++                    // DISTINCT doesn't add aggregate values
++                    let output_row = HashableRow::new(result_key, output_values.clone());
++                    output_delta.changes.push((output_row, 1));
++                }
++                // No output if staying positive or staying at zero
++            } else {
++                // Normal aggregates: output deletions and insertions as before
++                if let Some(old_row_values) = old_values.get(group_key_str) {
++                    let old_row = HashableRow::new(result_key, old_row_values.clone());
++                    output_delta.changes.push((old_row, -1));
++                }
++
++                // Only include groups with count > 0 in the output delta
++                if state.count > 0 {
++                    // Build output row: group_by columns + aggregate values
++                    let mut output_values = group_key.clone();
++                    let aggregate_values = state.to_values(&self.aggregates);
++                    output_values.extend(aggregate_values);
+ 
+-                let output_row = HashableRow::new(result_key, output_values.clone());
+-                output_delta.changes.push((output_row, 1));
++                    let output_row = HashableRow::new(result_key, output_values.clone());
++                    output_delta.changes.push((output_row, 1));
++                }
+             }
+         }
+         (output_delta, final_states)
+diff --git a/core/incremental/compiler.rs b/core/incremental/compiler.rs
+index f87792e1a..f9d358023 100644
+--- a/core/incremental/compiler.rs
++++ b/core/incremental/compiler.rs
+@@ -5,6 +5,7 @@
+ //!
+ //! Based on the DBSP paper: "DBSP: Automatic Incremental View Maintenance for Rich Query Languages"
+ 
++use crate::incremental::aggregate_operator::{AggregateFunction, AggregateOperator};
+ use crate::incremental::dbsp::{Delta, DeltaPair};
+ use crate::incremental::expr_compiler::CompiledExpression;
+ use crate::incremental::operator::{
+@@ -300,6 +301,8 @@ pub enum DbspOperator {
+     Input { name: String, schema: SchemaRef },
+     /// Merge operator for combining streams (used in recursive CTEs and UNION)
+     Merge { schema: SchemaRef },
++    /// Distinct operator - removes duplicates
++    Distinct { schema: SchemaRef },
+ }
+ 
+ /// Represents an expression in DBSP
+@@ -820,6 +823,13 @@ impl DbspCircuit {
+                         schema.columns.len()
+                     )?;
+                 }
++                DbspOperator::Distinct { schema } => {
++                    writeln!(
++                        f,
++                        "{indent}Distinct[{node_id}]: (schema: {} columns)",
++                        schema.columns.len()
++                    )?;
++                }
+             }
+ 
+             for input_id in &node.inputs {
+@@ -1366,14 +1376,48 @@ impl DbspCompiler {
+                 // Handle UNION and UNION ALL
+                 self.compile_union(union)
+             }
++            LogicalPlan::Distinct(distinct) => {
++                // DISTINCT is implemented as GROUP BY all columns with a special aggregate
++                let input_id = self.compile_plan(&distinct.input)?;
++                let input_schema = distinct.input.schema();
++
++                // Create GROUP BY indices for all columns
++                let group_by: Vec<usize> = (0..input_schema.columns.len()).collect();
++
++                // Column names for the operator
++                let input_column_names: Vec<String> = input_schema.columns.iter()
++                    .map(|col| col.name.clone())
++                    .collect();
++
++                // Create the aggregate operator with DISTINCT mode
++                let operator_id = self.circuit.next_id;
++                let executable: Box<dyn IncrementalOperator> = Box::new(
++                    AggregateOperator::new(
++                        operator_id,
++                        group_by,
++                        vec![AggregateFunction::Distinct], // Special DISTINCT aggregate
++                        input_column_names,
++                    ),
++                );
++
++                // Add the node to the circuit
++                let node_id = self.circuit.add_node(
++                    DbspOperator::Distinct {
++                        schema: input_schema.clone(),
++                    },
++                    vec![input_id],
++                    executable,
++                );
++
++                Ok(node_id)
++            }
+             _ => Err(LimboError::ParseError(
+                 format!("Unsupported operator in DBSP compiler: only Filter, Projection, Join, Aggregate, and Union are supported, got: {:?}",
+                     match plan {
+                         LogicalPlan::Sort(_) => "Sort",
+                         LogicalPlan::Limit(_) => "Limit",
+                         LogicalPlan::Union(_) => "Union",
+-                        LogicalPlan::Distinct(_) => "Distinct",
+-                        LogicalPlan::EmptyRelation(_) => "EmptyRelation",
++                                    LogicalPlan::EmptyRelation(_) => "EmptyRelation",
+                         LogicalPlan::Values(_) => "Values",
+                         LogicalPlan::WithCTE(_) => "WithCTE",
+                         LogicalPlan::CTERef(_) => "CTERef",
+diff --git a/core/incremental/operator.rs b/core/incremental/operator.rs
+index f4598e1fb..128fb3c47 100644
+--- a/core/incremental/operator.rs
++++ b/core/incremental/operator.rs
+@@ -4124,4 +4124,291 @@ mod tests {
+             "MIN(col1) should be 20 (new data only)"
+         );
+     }
++
++    #[test]
++    fn test_distinct_removes_duplicates() {
++        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
++        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
++        let index_def = create_dbsp_state_index(index_root_page_id);
++        let index_cursor =
++            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
++        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
++
++        // Create a DISTINCT operator that groups by all columns
++        let mut operator = AggregateOperator::new(
++            0,       // operator_id
++            vec![0], // group by column 0 (value)
++            vec![AggregateFunction::Distinct],
++            vec!["value".to_string()],
++        );
++
++        // Create input with duplicates
++        let mut input = Delta::new();
++        input.insert(1, vec![Value::Integer(100)]); // First 100
++        input.insert(2, vec![Value::Integer(200)]); // First 200
++        input.insert(3, vec![Value::Integer(100)]); // Duplicate 100
++        input.insert(4, vec![Value::Integer(300)]); // First 300
++        input.insert(5, vec![Value::Integer(200)]); // Duplicate 200
++        input.insert(6, vec![Value::Integer(100)]); // Another duplicate 100
++
++        // Execute commit (for materialized views) instead of eval
++        let result = pager
++            .io
++            .block(|| operator.commit((&input).into(), &mut cursors))
++            .unwrap();
++
++        // Should have exactly 3 distinct values (100, 200, 300)
++        let distinct_values: std::collections::HashSet<i64> = result
++            .changes
++            .iter()
++            .map(|(row, _weight)| match &row.values[0] {
++                Value::Integer(i) => *i,
++                _ => panic!("Expected integer value"),
++            })
++            .collect();
++
++        assert_eq!(
++            distinct_values.len(),
++            3,
++            "Should have exactly 3 distinct values"
++        );
++        assert!(distinct_values.contains(&100));
++        assert!(distinct_values.contains(&200));
++        assert!(distinct_values.contains(&300));
++
++        // All weights should be 1 (distinct normalizes weights)
++        for (_row, weight) in &result.changes {
++            assert_eq!(*weight, 1, "DISTINCT should output weight 1 for all groups");
++        }
++    }
++
++    #[test]
++    fn test_distinct_incremental_updates() {
++        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
++        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
++        let index_def = create_dbsp_state_index(index_root_page_id);
++        let index_cursor =
++            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
++        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
++
++        let mut operator = AggregateOperator::new(
++            0,
++            vec![0, 1], // group by both columns
++            vec![AggregateFunction::Distinct],
++            vec!["category".to_string(), "value".to_string()],
++        );
++
++        // First batch: insert some values
++        let mut delta1 = Delta::new();
++        delta1.insert(1, vec![Value::Text("A".into()), Value::Integer(100)]);
++        delta1.insert(2, vec![Value::Text("B".into()), Value::Integer(200)]);
++        delta1.insert(3, vec![Value::Text("A".into()), Value::Integer(100)]); // Duplicate
++
++        // Commit first batch
++        let result1 = pager
++            .io
++            .block(|| operator.commit((&delta1).into(), &mut cursors))
++            .unwrap();
++
++        // Should have 2 distinct groups: (A,100) and (B,200)
++        assert_eq!(
++            result1.changes.len(),
++            2,
++            "First commit should output 2 distinct groups"
++        );
++
++        // Verify each group appears with weight +1
++        for (_row, weight) in &result1.changes {
++            assert_eq!(*weight, 1, "New groups should have weight +1");
++        }
++
++        // Second batch: delete one instance of (A,100) and add new group
++        let mut delta2 = Delta::new();
++        delta2.delete(1, vec![Value::Text("A".into()), Value::Integer(100)]);
++        delta2.insert(4, vec![Value::Text("C".into()), Value::Integer(300)]);
++
++        let result2 = pager
++            .io
++            .block(|| operator.commit((&delta2).into(), &mut cursors))
++            .unwrap();
++
++        // Should only output the new group (C,300) with weight +1
++        // (A,100) still exists (weight went from 2 to 1), so no output for it
++        assert_eq!(
++            result2.changes.len(),
++            1,
++            "Second commit should only output new group"
++        );
++
++        let (row, weight) = &result2.changes[0];
++        assert_eq!(*weight, 1);
++        assert_eq!(row.values[0], Value::Text("C".into()));
++        assert_eq!(row.values[1], Value::Integer(300));
++
++        // Third batch: delete last instance of (A,100)
++        let mut delta3 = Delta::new();
++        delta3.delete(3, vec![Value::Text("A".into()), Value::Integer(100)]);
++
++        let result3 = pager
++            .io
++            .block(|| operator.commit((&delta3).into(), &mut cursors))
++            .unwrap();
++
++        // Should output (A,100) with weight -1 (group disappeared)
++        assert_eq!(
++            result3.changes.len(),
++            1,
++            "Third commit should output disappeared group"
++        );
++
++        let (row, weight) = &result3.changes[0];
++        assert_eq!(*weight, -1, "Disappeared group should have weight -1");
++        assert_eq!(row.values[0], Value::Text("A".into()));
++        assert_eq!(row.values[1], Value::Integer(100))
++    }
++
++    #[test]
++    fn test_distinct_state_transitions() {
++        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
++        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
++        let index_def = create_dbsp_state_index(index_root_page_id);
++        let index_cursor =
++            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
++        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
++
++        // Test that DISTINCT correctly tracks state transitions (0 ↔ positive)
++        let mut operator = AggregateOperator::new(
++            0,
++            vec![0],
++            vec![AggregateFunction::Distinct],
++            vec!["value".to_string()],
++        );
++
++        // Insert value with weight 3
++        let mut delta1 = Delta::new();
++        for i in 1..=3 {
++            delta1.insert(i, vec![Value::Integer(100)]);
++        }
++
++        let result1 = pager
++            .io
++            .block(|| operator.commit((&delta1).into(), &mut cursors))
++            .unwrap();
++
++        assert_eq!(result1.changes.len(), 1);
++        assert_eq!(result1.changes[0].1, 1, "First appearance should output +1");
++
++        // Remove 2 instances (weight goes from 3 to 1, still positive)
++        let mut delta2 = Delta::new();
++        for i in 1..=2 {
++            delta2.delete(i, vec![Value::Integer(100)]);
++        }
++
++        let result2 = pager
++            .io
++            .block(|| operator.commit((&delta2).into(), &mut cursors))
++            .unwrap();
++
++        assert_eq!(result2.changes.len(), 0, "No transition, no output");
++
++        // Remove last instance (weight goes from 1 to 0)
++        let mut delta3 = Delta::new();
++        delta3.delete(3, vec![Value::Integer(100)]);
++
++        let result3 = pager
++            .io
++            .block(|| operator.commit((&delta3).into(), &mut cursors))
++            .unwrap();
++
++        assert_eq!(result3.changes.len(), 1);
++        assert_eq!(result3.changes[0].1, -1, "Disappearance should output -1");
++
++        // Re-add the value (weight goes from 0 to 1)
++        let mut delta4 = Delta::new();
++        delta4.insert(4, vec![Value::Integer(100)]);
++
++        let result4 = pager
++            .io
++            .block(|| operator.commit((&delta4).into(), &mut cursors))
++            .unwrap();
++
++        assert_eq!(result4.changes.len(), 1);
++        assert_eq!(result4.changes[0].1, 1, "Reappearance should output +1")
++    }
++
++    #[test]
++    fn test_distinct_persistence() {
++        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
++        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
++        let index_def = create_dbsp_state_index(index_root_page_id);
++        let index_cursor =
++            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
++        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
++
++        // First operator instance
++        let mut operator1 = AggregateOperator::new(
++            0,
++            vec![0],
++            vec![AggregateFunction::Distinct],
++            vec!["value".to_string()],
++        );
++
++        // Insert some values
++        let mut delta1 = Delta::new();
++        delta1.insert(1, vec![Value::Integer(100)]);
++        delta1.insert(2, vec![Value::Integer(100)]); // Duplicate
++        delta1.insert(3, vec![Value::Integer(200)]);
++
++        let result1 = pager
++            .io
++            .block(|| operator1.commit((&delta1).into(), &mut cursors))
++            .unwrap();
++
++        // Should have 2 distinct values
++        assert_eq!(result1.changes.len(), 2, "Should output 2 distinct values");
++
++        // Create new operator instance with same ID (simulates restart)
++        // Create new cursors for the second operator
++        let table_cursor2 = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
++        let index_cursor2 =
++            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
++        let mut cursors2 = DbspStateCursors::new(table_cursor2, index_cursor2);
++
++        let mut operator2 = AggregateOperator::new(
++            0, // Same operator_id
++            vec![0],
++            vec![AggregateFunction::Distinct],
++            vec!["value".to_string()],
++        );
++
++        // Add new value and delete existing (100 has weight 2, so it stays)
++        let mut delta2 = Delta::new();
++        delta2.insert(4, vec![Value::Integer(300)]);
++        delta2.delete(1, vec![Value::Integer(100)]); // Remove one of the 100s
++
++        let result2 = pager
++            .io
++            .block(|| operator2.commit((&delta2).into(), &mut cursors2))
++            .unwrap();
++
++        // Should only output the new value (300)
++        // 100 still exists (went from weight 2 to 1)
++        assert_eq!(result2.changes.len(), 1, "Should only output new value");
++        assert_eq!(result2.changes[0].1, 1, "Should be insertion");
++        assert_eq!(result2.changes[0].0.values[0], Value::Integer(300));
++
++        // Now delete the last instance of 100
++        let mut delta3 = Delta::new();
++        delta3.delete(2, vec![Value::Integer(100)]);
++
++        let result3 = pager
++            .io
++            .block(|| operator2.commit((&delta3).into(), &mut cursors2))
++            .unwrap();
++
++        // Should output deletion of 100
++        assert_eq!(result3.changes.len(), 1, "Should output deletion");
++        assert_eq!(result3.changes[0].1, -1, "Should be deletion");
++        assert_eq!(result3.changes[0].0.values[0], Value::Integer(100));
++    }
+ }
+diff --git a/core/util.rs b/core/util.rs
+index 04f91945b..c39ea6413 100644
+--- a/core/util.rs
++++ b/core/util.rs
+@@ -1160,11 +1160,15 @@ pub fn extract_view_columns(
+                         });
+ 
+                         // Extract USING columns for this join
+-                        let using_cols = if let Some(ast::JoinConstraint::Using(ref names)) = join.constraint {
+-                            names.iter().map(|name| normalize_ident(name.as_str())).collect()
+-                        } else {
+-                            Vec::new()
+-                        };
++                        let using_cols =
++                            if let Some(ast::JoinConstraint::Using(ref names)) = join.constraint {
++                                names
++                                    .iter()
++                                    .map(|name| normalize_ident(name.as_str()))
++                                    .collect()
++                            } else {
++                                Vec::new()
++                            };
+                         table_using_columns.push(using_cols);
+                     }
+                     _ => {
+@@ -1236,7 +1240,10 @@ pub fn extract_view_columns(
+                     for (table_idx, table) in tables.iter().enumerate() {
+                         if let Some(table_obj) = schema.get_table(&table.name) {
+                             // Get the USING columns for this table (if it's part of a JOIN USING)
+-                            let using_cols = table_using_columns.get(table_idx).map(|v| v.as_slice()).unwrap_or(&[]);
++                            let using_cols = table_using_columns
++                                .get(table_idx)
++                                .map(|v| v.as_slice())
++                                .unwrap_or(&[]);
+ 
+                             for table_column in table_obj.columns() {
+                                 let col_name =
+@@ -1244,7 +1251,10 @@ pub fn extract_view_columns(
+ 
+                                 // Skip columns that are in the USING clause for this table
+                                 // (they should only appear once, from the left table)
+-                                if using_cols.iter().any(|using_col| using_col.eq_ignore_ascii_case(&col_name)) {
++                                if using_cols
++                                    .iter()
++                                    .any(|using_col| using_col.eq_ignore_ascii_case(&col_name))
++                                {
+                                     continue;
+                                 }
+ 
+@@ -1302,7 +1312,10 @@ pub fn extract_view_columns(
+                     if let Some(table_idx) = find_table_index(&table_name_str) {
+                         if let Some(table) = schema.get_table(&tables[table_idx].name) {
+                             // Get the USING columns for this table (if it's part of a JOIN USING)
+-                            let using_cols = table_using_columns.get(table_idx).map(|v| v.as_slice()).unwrap_or(&[]);
++                            let using_cols = table_using_columns
++                                .get(table_idx)
++                                .map(|v| v.as_slice())
++                                .unwrap_or(&[]);
+ 
+                             for table_column in table.columns() {
+                                 let col_name =
+@@ -1310,7 +1323,10 @@ pub fn extract_view_columns(
+ 
+                                 // Skip columns that are in the USING clause for this table
+                                 // (they should only appear once, from the left table)
+-                                if using_cols.iter().any(|using_col| using_col.eq_ignore_ascii_case(&col_name)) {
++                                if using_cols
++                                    .iter()
++                                    .any(|using_col| using_col.eq_ignore_ascii_case(&col_name))
++                                {
+                                     continue;
+                                 }
+ 
+diff --git a/testing/materialized_views.test b/testing/materialized_views.test
+index a2a8eb5c4..25fbc0952 100755
+--- a/testing/materialized_views.test
++++ b/testing/materialized_views.test
+@@ -1720,3 +1720,308 @@ do_execsql_test_on_specific_db {:memory:} matview-groupby-join-position {
+     SELECT * FROM tujoingroup ORDER BY a;
+ } {1|2
+ 2|1}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-basic {
++    CREATE TABLE items(id INTEGER, category TEXT, value INTEGER);
++    INSERT INTO items VALUES
++        (1, 'A', 100),
++        (2, 'B', 200),
++        (3, 'A', 100),  -- duplicate of row 1
++        (4, 'C', 300),
++        (5, 'B', 200),  -- duplicate of row 2
++        (6, 'A', 100);  -- another duplicate of row 1
++
++    CREATE MATERIALIZED VIEW distinct_items AS
++        SELECT DISTINCT category, value FROM items;
++
++    SELECT category, value FROM distinct_items ORDER BY category, value;
++} {A|100
++B|200
++C|300}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-single-column {
++    CREATE TABLE numbers(n INTEGER);
++    INSERT INTO numbers VALUES (1), (2), (1), (3), (2), (1), (4), (3);
++
++    CREATE MATERIALIZED VIEW distinct_numbers AS
++        SELECT DISTINCT n FROM numbers;
++
++    SELECT n FROM distinct_numbers ORDER BY n;
++} {1
++2
++3
++4}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-insert {
++    CREATE TABLE data(x INTEGER, y TEXT);
++    CREATE MATERIALIZED VIEW distinct_data AS
++        SELECT DISTINCT x, y FROM data;
++
++    -- Initial data
++    INSERT INTO data VALUES (1, 'alpha'), (2, 'beta'), (1, 'alpha');
++    SELECT x, y FROM distinct_data ORDER BY x, y;
++} {1|alpha
++2|beta}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-insert-new {
++    CREATE TABLE data(x INTEGER, y TEXT);
++    CREATE MATERIALIZED VIEW distinct_data AS
++        SELECT DISTINCT x, y FROM data;
++
++    -- Initial data
++    INSERT INTO data VALUES (1, 'alpha'), (2, 'beta'), (1, 'alpha');
++
++    -- Add new distinct values
++    INSERT INTO data VALUES (3, 'gamma'), (4, 'delta');
++    SELECT x, y FROM distinct_data ORDER BY x, y;
++} {1|alpha
++2|beta
++3|gamma
++4|delta}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-insert-dups {
++    CREATE TABLE data(x INTEGER, y TEXT);
++    CREATE MATERIALIZED VIEW distinct_data AS
++        SELECT DISTINCT x, y FROM data;
++
++    -- Initial data with some new values
++    INSERT INTO data VALUES
++        (1, 'alpha'), (2, 'beta'), (1, 'alpha'),
++        (3, 'gamma'), (4, 'delta');
++
++    -- Add duplicates of existing values
++    INSERT INTO data VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
++    -- Should be same as before the duplicate insert
++    SELECT x, y FROM distinct_data ORDER BY x, y;
++} {1|alpha
++2|beta
++3|gamma
++4|delta}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-delete {
++    CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
++    INSERT INTO records VALUES
++        (1, 'X', 1),
++        (2, 'Y', 2),
++        (3, 'X', 1),  -- duplicate values
++        (4, 'Z', 3),
++        (5, 'Y', 2);  -- duplicate values
++
++    CREATE MATERIALIZED VIEW distinct_records AS
++        SELECT DISTINCT category, status FROM records;
++
++    SELECT category, status FROM distinct_records ORDER BY category, status;
++} {X|1
++Y|2
++Z|3}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-delete-partial {
++    CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
++    INSERT INTO records VALUES
++        (1, 'X', 1),
++        (2, 'Y', 2),
++        (3, 'X', 1),  -- duplicate values
++        (4, 'Z', 3),
++        (5, 'Y', 2);  -- duplicate values
++
++    CREATE MATERIALIZED VIEW distinct_records AS
++        SELECT DISTINCT category, status FROM records;
++
++    -- Delete one instance of duplicate
++    DELETE FROM records WHERE id = 3;
++    -- X|1 should still exist (one instance remains)
++    SELECT category, status FROM distinct_records ORDER BY category, status;
++} {X|1
++Y|2
++Z|3}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-delete-all {
++    CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
++    INSERT INTO records VALUES
++        (1, 'X', 1),
++        (2, 'Y', 2),
++        (4, 'Z', 3),
++        (5, 'Y', 2);  -- duplicate values
++
++    CREATE MATERIALIZED VIEW distinct_records AS
++        SELECT DISTINCT category, status FROM records;
++
++    -- Delete all instances of X|1
++    DELETE FROM records WHERE category = 'X' AND status = 1;
++    -- Now X|1 should be gone
++    SELECT category, status FROM distinct_records ORDER BY category, status;
++} {Y|2
++Z|3}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-reappear {
++    CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
++    INSERT INTO records VALUES
++        (2, 'Y', 2),
++        (4, 'Z', 3),
++        (5, 'Y', 2);  -- duplicate values
++
++    CREATE MATERIALIZED VIEW distinct_records AS
++        SELECT DISTINCT category, status FROM records;
++
++    -- Re-add a previously deleted value
++    INSERT INTO records VALUES (6, 'X', 1);
++    -- X|1 should appear
++    SELECT category, status FROM distinct_records ORDER BY category, status;
++} {X|1
++Y|2
++Z|3}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-null-handling {
++    CREATE TABLE nullable(a INTEGER, b TEXT);
++    INSERT INTO nullable VALUES
++        (1, 'one'),
++        (2, NULL),
++        (NULL, 'three'),
++        (1, 'one'),     -- duplicate
++        (2, NULL),      -- duplicate with NULL
++        (NULL, 'three'), -- duplicate with NULL
++        (NULL, NULL);
++
++    CREATE MATERIALIZED VIEW distinct_nullable AS
++        SELECT DISTINCT a, b FROM nullable;
++
++    -- NULLs should be handled as distinct values
++    SELECT a, b FROM distinct_nullable ORDER BY a, b;
++} {|
++|three
++1|one
++2|}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-empty-table {
++    CREATE TABLE empty_source(x INTEGER, y TEXT);
++    CREATE MATERIALIZED VIEW distinct_empty AS
++        SELECT DISTINCT x, y FROM empty_source;
++
++    -- Should be empty
++    SELECT COUNT(*) FROM distinct_empty;
++} {0}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-empty-then-insert {
++    CREATE TABLE empty_source(x INTEGER, y TEXT);
++    CREATE MATERIALIZED VIEW distinct_empty AS
++        SELECT DISTINCT x, y FROM empty_source;
++
++    -- Insert into previously empty table
++    INSERT INTO empty_source VALUES (1, 'first'), (1, 'first'), (2, 'second');
++    SELECT x, y FROM distinct_empty ORDER BY x, y;
++} {1|first
++2|second}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-multi-column-types {
++    CREATE TABLE mixed_types(i INTEGER, t TEXT, r REAL, b BLOB);
++    INSERT INTO mixed_types VALUES
++        (1, 'text1', 1.5, x'0102'),
++        (2, 'text2', 2.5, x'0304'),
++        (1, 'text1', 1.5, x'0102'),  -- exact duplicate
++        (3, 'text3', 3.5, x'0506'),
++        (2, 'text2', 2.5, x'0304');  -- another duplicate
++
++    CREATE MATERIALIZED VIEW distinct_mixed AS
++        SELECT DISTINCT i, t FROM mixed_types;
++
++    SELECT i, t FROM distinct_mixed ORDER BY i, t;
++} {1|text1
++2|text2
++3|text3}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-update-simulation {
++    CREATE TABLE updatable(id INTEGER PRIMARY KEY, val TEXT);
++    INSERT INTO updatable VALUES (1, 'old'), (2, 'old'), (3, 'new');
++
++    CREATE MATERIALIZED VIEW distinct_vals AS
++        SELECT DISTINCT val FROM updatable;
++
++    SELECT val FROM distinct_vals ORDER BY val;
++} {new
++old}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-update-simulation-change {
++    CREATE TABLE updatable(id INTEGER PRIMARY KEY, val TEXT);
++    INSERT INTO updatable VALUES (1, 'old'), (2, 'old'), (3, 'new');
++
++    CREATE MATERIALIZED VIEW distinct_vals AS
++        SELECT DISTINCT val FROM updatable;
++
++    -- Simulate update by delete + insert
++    DELETE FROM updatable WHERE id = 1;
++    INSERT INTO updatable VALUES (1, 'new');
++
++    -- Now we have two 'new' and one 'old', but distinct shows each once
++    SELECT val FROM distinct_vals ORDER BY val;
++} {new
++old}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-update-simulation-all-same {
++    CREATE TABLE updatable(id INTEGER PRIMARY KEY, val TEXT);
++    INSERT INTO updatable VALUES (1, 'new'), (2, 'old'), (3, 'new');
++
++    CREATE MATERIALIZED VIEW distinct_vals AS
++        SELECT DISTINCT val FROM updatable;
++
++    -- Change the 'old' to 'new'
++    DELETE FROM updatable WHERE id = 2;
++    INSERT INTO updatable VALUES (2, 'new');
++
++    -- Now all three rows have 'new', old should disappear
++    SELECT val FROM distinct_vals ORDER BY val;
++} {new}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-large-duplicates {
++    CREATE TABLE many_dups(x INTEGER);
++
++    -- Insert many duplicates
++    INSERT INTO many_dups VALUES (1), (1), (1), (1), (1);
++    INSERT INTO many_dups VALUES (2), (2), (2), (2), (2);
++    INSERT INTO many_dups VALUES (3), (3), (3), (3), (3);
++
++    CREATE MATERIALIZED VIEW distinct_many AS
++        SELECT DISTINCT x FROM many_dups;
++
++    SELECT x FROM distinct_many ORDER BY x;
++} {1
++2
++3}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-large-duplicates-remove {
++    CREATE TABLE many_dups(x INTEGER);
++
++    -- Insert many duplicates
++    INSERT INTO many_dups VALUES (1), (1), (1), (1), (1);
++    INSERT INTO many_dups VALUES (2), (2), (2), (2), (2);
++    INSERT INTO many_dups VALUES (3), (3), (3), (3), (3);
++
++    CREATE MATERIALIZED VIEW distinct_many AS
++        SELECT DISTINCT x FROM many_dups;
++
++    -- Remove some instances of value 2 (rowids 7,8,9,10 keeping rowid 6)
++    DELETE FROM many_dups WHERE rowid IN (7, 8, 9, 10);
++
++    -- Should still have all three values
++    SELECT x FROM distinct_many ORDER BY x;
++} {1
++2
++3}
++
++do_execsql_test_on_specific_db {:memory:} matview-distinct-large-duplicates-remove-all {
++    CREATE TABLE many_dups(x INTEGER);
++
++    -- Insert many duplicates but only one instance of 2
++    INSERT INTO many_dups VALUES (1), (1), (1), (1), (1);
++    INSERT INTO many_dups VALUES (2);
++    INSERT INTO many_dups VALUES (3), (3), (3), (3), (3);
++
++    CREATE MATERIALIZED VIEW distinct_many AS
++        SELECT DISTINCT x FROM many_dups;
++
++    -- Remove ALL instances of value 2
++    DELETE FROM many_dups WHERE x = 2;
++
++    -- Now 2 should be gone
++    SELECT x FROM distinct_many ORDER BY x;
++} {1
++3}
+-- 
+2.39.3 (Apple Git-146)
+

@@ -1,0 +1,740 @@
+use crate::incremental::operator::{
+    AggregateFunction, AggregateState, DbspStateCursors, DirtyMinMax,
+};
+use crate::storage::btree::{BTreeCursor, BTreeKey};
+use crate::types::{IOResult, ImmutableRecord, RefValue, SeekKey, SeekOp, SeekResult};
+use std::cell::Ref;
+use crate::{return_if_io, LimboError, Result, Value};
+use std::collections::HashMap;
+
+#[derive(Debug, Default)]
+pub enum ReadRecord {
+    #[default]
+    GetRecord,
+    Done {
+        state: Option<AggregateState>,
+    },
+}
+
+impl ReadRecord {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn read_record(
+        &mut self,
+        key: SeekKey,
+        aggregates: &[AggregateFunction],
+        cursor: &mut BTreeCursor,
+    ) -> Result<IOResult<Option<AggregateState>>> {
+        loop {
+            match self {
+                ReadRecord::GetRecord => {
+                    let res = return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
+                    if !matches!(res, SeekResult::Found) {
+                        *self = ReadRecord::Done { state: None };
+                    } else {
+                        let record = return_if_io!(cursor.record());
+                        let r = record.ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "Found key {key:?} in aggregate storage but could not read record"
+                            ))
+                        })?;
+                        let values = r.get_values();
+                        // The blob is in column 3: operator_id, zset_id, element_id, value, weight
+                        let blob = values[3].to_owned();
+
+                        let (state, _group_key) = match blob {
+                            Value::Blob(blob) => {
+                                AggregateState::from_blob(&blob, aggregates)
+                                    .ok_or_else(|| {
+                                        LimboError::InternalError(format!(
+                                            "Cannot deserialize aggregate state {blob:?}",
+                                        ))
+                                    })
+                            }
+                            _ => Err(LimboError::ParseError(
+                                "Value in aggregator not blob".to_string(),
+                            )),
+                        }?;
+                        *self = ReadRecord::Done { state: Some(state) }
+                    }
+                }
+                ReadRecord::Done { state } => return Ok(IOResult::Done(state.clone())),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub enum WriteRow {
+    #[default]
+    GetRecord,
+    Delete {
+        rowid: i64,
+    },
+    DeleteIndex,
+    ComputeNewRowId {
+        final_weight: isize,
+    },
+    InsertNew {
+        rowid: i64,
+        final_weight: isize,
+    },
+    InsertIndex {
+        rowid: i64,
+    },
+    UpdateExisting {
+        rowid: i64,
+        final_weight: isize,
+    },
+    Done,
+}
+
+impl WriteRow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Write a row with weight management using index for lookups.
+    ///
+    /// # Arguments
+    /// * `cursors` - DBSP state cursors (table and index)
+    /// * `index_key` - The key to seek in the index
+    /// * `record_values` - The record values (without weight) to insert
+    /// * `weight` - The weight delta to apply
+    pub fn write_row(
+        &mut self,
+        cursors: &mut DbspStateCursors,
+        index_key: Vec<Value>,
+        record_values: Vec<Value>,
+        weight: isize,
+    ) -> Result<IOResult<()>> {
+        loop {
+            match self {
+                WriteRow::GetRecord => {
+                    // First, seek in the index to find if the row exists
+                    let index_values = index_key.clone();
+                    let index_record =
+                        ImmutableRecord::from_values(&index_values, index_values.len());
+
+                    let res = return_if_io!(cursors.index_cursor.seek(
+                        SeekKey::IndexKey(&index_record),
+                        SeekOp::GE { eq_only: true }
+                    ));
+
+                    if !matches!(res, SeekResult::Found) {
+                        // Row doesn't exist, we'll insert a new one
+                        *self = WriteRow::ComputeNewRowId {
+                            final_weight: weight,
+                        };
+                    } else {
+                        // Found in index, get the rowid it points to
+                        let rowid = return_if_io!(cursors.index_cursor.rowid());
+                        let rowid = rowid.ok_or_else(|| {
+                            LimboError::InternalError(
+                                "Index cursor does not have a valid rowid".to_string(),
+                            )
+                        })?;
+
+                        // Now seek in the table using the rowid
+                        let table_res = return_if_io!(cursors
+                            .table_cursor
+                            .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
+
+                        if !matches!(table_res, SeekResult::Found) {
+                            return Err(LimboError::InternalError(
+                                "Index points to non-existent table row".to_string(),
+                            ));
+                        }
+
+                        let existing_record = return_if_io!(cursors.table_cursor.record());
+                        let r = existing_record.ok_or_else(|| {
+                            LimboError::InternalError(
+                                "Found rowid in table but could not read record".to_string(),
+                            )
+                        })?;
+                        let values = r.get_values();
+
+                        // Weight is always the last value (column 4 in our 5-column structure)
+                        let existing_weight = match values.get(4) {
+                            Some(val) => match val.to_owned() {
+                                Value::Integer(w) => w as isize,
+                                _ => {
+                                    return Err(LimboError::InternalError(
+                                        "Invalid weight value in storage".to_string(),
+                                    ))
+                                }
+                            },
+                            None => {
+                                return Err(LimboError::InternalError(
+                                    "No weight value found in storage".to_string(),
+                                ))
+                            }
+                        };
+
+                        let final_weight = existing_weight + weight;
+                        if final_weight <= 0 {
+                            // Store index_key for later deletion of index entry
+                            *self = WriteRow::Delete { rowid }
+                        } else {
+                            // Store the rowid for update
+                            *self = WriteRow::UpdateExisting {
+                                rowid,
+                                final_weight,
+                            }
+                        }
+                    }
+                }
+                WriteRow::Delete { rowid } => {
+                    // Seek to the row and delete it
+                    return_if_io!(cursors
+                        .table_cursor
+                        .seek(SeekKey::TableRowId(*rowid), SeekOp::GE { eq_only: true }));
+
+                    // Transition to DeleteIndex to also delete the index entry
+                    *self = WriteRow::DeleteIndex;
+                    return_if_io!(cursors.table_cursor.delete());
+                }
+                WriteRow::DeleteIndex => {
+                    // Mark as Done before delete to avoid retry on I/O
+                    *self = WriteRow::Done;
+                    return_if_io!(cursors.index_cursor.delete());
+                }
+                WriteRow::ComputeNewRowId { final_weight } => {
+                    // Find the last rowid to compute the next one
+                    return_if_io!(cursors.table_cursor.last());
+                    let rowid = if cursors.table_cursor.is_empty() {
+                        1
+                    } else {
+                        match return_if_io!(cursors.table_cursor.rowid()) {
+                            Some(id) => id + 1,
+                            None => {
+                                return Err(LimboError::InternalError(
+                                    "Table cursor has rows but no valid rowid".to_string(),
+                                ))
+                            }
+                        }
+                    };
+
+                    // Transition to InsertNew with the computed rowid
+                    *self = WriteRow::InsertNew {
+                        rowid,
+                        final_weight: *final_weight,
+                    };
+                }
+                WriteRow::InsertNew {
+                    rowid,
+                    final_weight,
+                } => {
+                    let rowid_val = *rowid;
+                    let final_weight_val = *final_weight;
+
+                    // Seek to where we want to insert
+                    // The insert will position the cursor correctly
+                    return_if_io!(cursors.table_cursor.seek(
+                        SeekKey::TableRowId(rowid_val),
+                        SeekOp::GE { eq_only: false }
+                    ));
+
+                    // Build the complete record with weight
+                    // Use the function parameter record_values directly
+                    let mut complete_record = record_values.clone();
+                    complete_record.push(Value::Integer(final_weight_val as i64));
+
+                    // Create an ImmutableRecord from the values
+                    let immutable_record =
+                        ImmutableRecord::from_values(&complete_record, complete_record.len());
+                    let btree_key = BTreeKey::new_table_rowid(rowid_val, Some(&immutable_record));
+
+                    // Transition to InsertIndex state after table insertion
+                    *self = WriteRow::InsertIndex { rowid: rowid_val };
+                    return_if_io!(cursors.table_cursor.insert(&btree_key));
+                }
+                WriteRow::InsertIndex { rowid } => {
+                    // For has_rowid indexes, we need to append the rowid to the index key
+                    // Use the function parameter index_key directly
+                    let mut index_values = index_key.clone();
+                    index_values.push(Value::Integer(*rowid));
+
+                    // Create the index record with the rowid appended
+                    let index_record =
+                        ImmutableRecord::from_values(&index_values, index_values.len());
+                    let index_btree_key = BTreeKey::new_index_key(&index_record);
+
+                    // Mark as Done before index insert to avoid retry on I/O
+                    *self = WriteRow::Done;
+                    return_if_io!(cursors.index_cursor.insert(&index_btree_key));
+                }
+                WriteRow::UpdateExisting {
+                    rowid,
+                    final_weight,
+                } => {
+                    // Build the complete record with weight
+                    let mut complete_record = record_values.clone();
+                    complete_record.push(Value::Integer(*final_weight as i64));
+
+                    // Create an ImmutableRecord from the values
+                    let immutable_record =
+                        ImmutableRecord::from_values(&complete_record, complete_record.len());
+                    let btree_key = BTreeKey::new_table_rowid(*rowid, Some(&immutable_record));
+
+                    // Mark as Done before insert to avoid retry on I/O
+                    *self = WriteRow::Done;
+                    // BTree insert with existing key will replace the old value
+                    return_if_io!(cursors.table_cursor.insert(&btree_key));
+                }
+                WriteRow::Done => {
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+}
+
+/// State machine for recomputing MIN/MAX values after deletion
+#[derive(Debug)]
+pub enum RecomputeMinMax {
+    Init {
+        /// Groups that need MIN/MAX recalculation
+        dirty_groups: HashMap<String, DirtyMinMax>,
+        /// Iterator over dirty groups
+        group_keys: Vec<String>,
+        /// Current group index
+        current_group_idx: usize,
+        /// Initial aggregate states to update
+        initial_states: HashMap<String, AggregateState>,
+        /// Pending MIN/MAX deltas from the transaction (value, column_index, weight)
+        pending_deltas: HashMap<String, Vec<(Value, usize, isize)>>,
+    },
+    ProcessGroup {
+        /// Current group being processed
+        group_key: String,
+        /// Columns that need recalculation
+        dirty: DirtyMinMax,
+        /// Aggregate states being updated
+        states: HashMap<String, AggregateState>,
+        /// Current column being processed
+        current_column_idx: usize,
+        /// Columns to process (combined MIN and MAX)
+        columns_to_process: Vec<(String, bool)>, // (column_name, is_min)
+        /// Pending MIN/MAX deltas for this group
+        pending_deltas: Vec<(Value, usize, isize)>,
+    },
+    ScanForMin {
+        group_key: String,
+        column_name: String,
+        column_index: usize,
+        states: HashMap<String, AggregateState>,
+        /// Columns still to process
+        columns_to_process: Vec<(String, bool)>,
+        /// Current index in columns_to_process (will resume from here)
+        current_column_idx: usize,
+        /// Pending MIN/MAX deltas for this group
+        pending_deltas: Vec<(Value, usize, isize)>,
+    },
+    ScanForMax {
+        group_key: String,
+        column_name: String,
+        column_index: usize,
+        states: HashMap<String, AggregateState>,
+        /// Columns still to process
+        columns_to_process: Vec<(String, bool)>,
+        /// Current index in columns_to_process (will resume from here)
+        current_column_idx: usize,
+        /// Pending MIN/MAX deltas for this group
+        pending_deltas: Vec<(Value, usize, isize)>,
+    },
+    Done {
+        /// Updated aggregate states after recalculation
+        states: HashMap<String, AggregateState>,
+    },
+}
+
+impl RecomputeMinMax {
+    pub fn new(
+        dirty_groups: HashMap<String, DirtyMinMax>,
+        initial_states: HashMap<String, AggregateState>,
+        pending_deltas: HashMap<String, Vec<(Value, usize, isize)>>,
+    ) -> Self {
+        let group_keys: Vec<String> = dirty_groups.keys().cloned().collect();
+
+        if group_keys.is_empty() {
+            RecomputeMinMax::Done { states: initial_states }
+        } else {
+            RecomputeMinMax::Init {
+                dirty_groups,
+                group_keys,
+                current_group_idx: 0,
+                initial_states,
+                pending_deltas,
+            }
+        }
+    }
+
+    /// Extract value from index record if it matches our operator_id and zset_id
+    fn extract_value_if_matches(
+        record: &Option<Ref<ImmutableRecord>>,
+        operator_storage_id: i64,
+        zset_id: i64,
+    ) -> Option<Value> {
+        if let Some(rec) = record {
+            let values = rec.get_values();
+            if values.len() >= 3 {
+                if let (RefValue::Integer(op_id), RefValue::Integer(zset)) = (&values[0], &values[1]) {
+                    if *op_id == operator_storage_id && *zset == zset_id {
+                        // This is our value (elements with weight <= 0 are already removed)
+                        return Some(values[2].to_owned());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn process(
+        &mut self,
+        operator_id: usize,
+        aggregates: &[AggregateFunction],
+        cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<HashMap<String, AggregateState>>> {
+        use crate::incremental::operator::{generate_storage_id, AGG_TYPE_MINMAX};
+
+        loop {
+            match self {
+                RecomputeMinMax::Init {
+                    dirty_groups,
+                    group_keys,
+                    current_group_idx,
+                    initial_states,
+                    pending_deltas,
+                } => {
+                    if *current_group_idx >= group_keys.len() {
+                        // Return the updated states
+                        let states = std::mem::take(initial_states);
+                        *self = RecomputeMinMax::Done { states };
+                    } else {
+                        let group_key = group_keys[*current_group_idx].clone();
+                        let dirty = dirty_groups.remove(&group_key).unwrap_or_default();
+
+                        // Prepare columns to process with their indices
+                        let mut columns_to_process = Vec::new();
+
+                        // Find aggregate indices for dirty MIN columns
+                        println!("[RecomputeMinMax] Processing group '{}' with {} dirty mins, {} dirty maxs",
+                            group_key, dirty.dirty_mins.len(), dirty.dirty_maxs.len());
+                        for col in &dirty.dirty_mins {
+                            println!("[RecomputeMinMax] Looking for MIN aggregate for column '{}'", col);
+                            if let Some(_idx) = aggregates.iter().position(|agg| {
+                                matches!(agg, AggregateFunction::Min(c) if c == col)
+                            }) {
+                                println!("[RecomputeMinMax] Found MIN aggregate for column '{}'", col);
+                                columns_to_process.push((col.clone(), true));
+                            }
+                        }
+
+                        // Find aggregate indices for dirty MAX columns
+                        for col in &dirty.dirty_maxs {
+                            println!("[RecomputeMinMax] Looking for MAX aggregate for column '{}'", col);
+                            if let Some(_idx) = aggregates.iter().position(|agg| {
+                                matches!(agg, AggregateFunction::Max(c) if c == col)
+                            }) {
+                                println!("[RecomputeMinMax] Found MAX aggregate for column '{}'", col);
+                                columns_to_process.push((col.clone(), false));
+                            }
+                        }
+
+                        if columns_to_process.is_empty() {
+                            println!("[RecomputeMinMax] No columns to process for group '{}', skipping", group_key);
+                            *current_group_idx += 1;
+                        } else {
+                            println!("[RecomputeMinMax] Will process {} columns for group '{}'",
+                                columns_to_process.len(), group_key);
+                            // Get the initial state for this group
+                            let mut group_states = HashMap::new();
+                            if let Some(state) = initial_states.get(&group_key) {
+                                group_states.insert(group_key.clone(), state.clone());
+                            }
+
+                            // Get pending deltas for this group
+                            let group_pending_deltas = pending_deltas.remove(&group_key).unwrap_or_default();
+
+                            *self = RecomputeMinMax::ProcessGroup {
+                                group_key,
+                                dirty,
+                                states: group_states,
+                                current_column_idx: 0,
+                                columns_to_process,
+                                pending_deltas: group_pending_deltas,
+                            };
+                        }
+                    }
+                }
+                RecomputeMinMax::ProcessGroup {
+                    group_key,
+                    dirty: _,
+                    states,
+                    current_column_idx,
+                    columns_to_process,
+                    pending_deltas,
+                } => {
+                    if *current_column_idx >= columns_to_process.len() {
+                        // We've finished this group, return to Done with updated states
+                        let updated_states = std::mem::take(states);
+                        *self = RecomputeMinMax::Done { states: updated_states };
+                    } else {
+                        let (column_name, is_min) = columns_to_process[*current_column_idx].clone();
+
+                        // Find the column index for this aggregate
+                        let column_index = if is_min {
+                            aggregates.iter().position(|agg| {
+                                matches!(agg, AggregateFunction::Min(c) if c == &column_name)
+                            }).unwrap_or(0)
+                        } else {
+                            aggregates.iter().position(|agg| {
+                                matches!(agg, AggregateFunction::Max(c) if c == &column_name)
+                            }).unwrap_or(0)
+                        };
+
+                        if is_min {
+                            *self = RecomputeMinMax::ScanForMin {
+                                group_key: group_key.clone(),
+                                column_name,
+                                column_index,
+                                states: states.clone(),
+                                columns_to_process: columns_to_process.clone(),
+                                current_column_idx: *current_column_idx,
+                                pending_deltas: pending_deltas.clone(),
+                            };
+                        } else {
+                            *self = RecomputeMinMax::ScanForMax {
+                                group_key: group_key.clone(),
+                                column_name,
+                                column_index,
+                                states: states.clone(),
+                                columns_to_process: columns_to_process.clone(),
+                                current_column_idx: *current_column_idx,
+                                pending_deltas: pending_deltas.clone(),
+                            };
+                        }
+                    }
+                }
+                RecomputeMinMax::ScanForMin {
+                    group_key,
+                    column_name,
+                    column_index,
+                    states,
+                    columns_to_process,
+                    current_column_idx,
+                    pending_deltas,
+                } => {
+                    // Build storage ID for this MIN column
+                    let operator_storage_id = generate_storage_id(operator_id, *column_index, AGG_TYPE_MINMAX);
+                    let zset_id = group_key.bytes()
+                        .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+
+                    // Seek to (operator_id, zset_id, NULL) - first element is MIN
+                    let seek_values = vec![
+                        Value::Integer(operator_storage_id),
+                        Value::Integer(zset_id),
+                        Value::Null,
+                    ];
+
+                    let seek_record = ImmutableRecord::from_values(&seek_values, 3);
+                    let res = return_if_io!(cursors.index_cursor.seek(
+                        SeekKey::IndexKey(&seek_record),
+                        SeekOp::GE { eq_only: false }
+                    ));
+
+                    // Build a map of pending deltas for this column for quick lookup
+                    // This consolidates multiple changes to the same value
+                    // Use string representation as key since Value doesn't implement Hash
+                    let mut pending_weights: HashMap<String, (Value, isize)> = HashMap::new();
+                    for (val, col_idx, weight) in pending_deltas.iter() {
+                        if *col_idx == *column_index {
+                            let val_str = format!("{:?}", val);
+                            let entry = pending_weights.entry(val_str).or_insert((val.clone(), 0));
+                            entry.1 += *weight;
+                        }
+                    }
+                    println!("[RecomputeMinMax] Pending weights for column {}: {} entries", column_name, pending_weights.len());
+
+                    let mut found_min = None;
+                    if matches!(res, SeekResult::Found) {
+                        // Scan through values in order until we find one with positive effective weight
+                        loop {
+                            let record = return_if_io!(cursors.index_cursor.record());
+
+                            let should_continue = if let Some(rec) = &record {
+                                let values = rec.get_values();
+                                if values.len() >= 3 {
+                                    if let (RefValue::Integer(op_id), RefValue::Integer(zset)) = (&values[0], &values[1]) {
+                                        if *op_id == operator_storage_id && *zset == zset_id {
+                                            let value = values[2].to_owned();
+
+                                            // Check storage weight first (need to look up in table)
+                                            let storage_weight = if values.len() >= 4 {
+                                                if let RefValue::Integer(rowid) = &values[3] {
+                                                    // Look up weight in table
+                                                    let table_res = return_if_io!(cursors.table_cursor.seek(
+                                                        SeekKey::TableRowId(*rowid),
+                                                        SeekOp::GE { eq_only: true }
+                                                    ));
+
+                                                    if matches!(table_res, SeekResult::Found) {
+                                                        let table_record = return_if_io!(cursors.table_cursor.record());
+                                                        if let Some(table_rec) = &table_record {
+                                                            let table_values = table_rec.get_values();
+                                                            if table_values.len() > 4 {
+                                                                if let RefValue::Integer(w) = &table_values[4] {
+                                                                    *w as isize
+                                                                } else { 0 }
+                                                            } else { 0 }
+                                                        } else { 0 }
+                                                    } else { 0 }
+                                                } else { 0 }
+                                            } else { 0 };
+
+                                            // Calculate effective weight after applying pending deltas
+                                            let val_str = format!("{:?}", value);
+                                            let pending_delta = pending_weights.get(&val_str).map(|(_, w)| *w).unwrap_or(0);
+                                            let effective_weight = storage_weight + pending_delta;
+
+                                            println!("[RecomputeMinMax] Value {:?}: storage_weight={}, pending_delta={}, effective_weight={}",
+                                                value, storage_weight, pending_delta, effective_weight);
+
+                                            if effective_weight > 0 {
+                                                // Found our MIN value!
+                                                found_min = Some(value);
+                                                println!("[RecomputeMinMax] Found MIN: {:?}", found_min);
+                                                false // Stop scanning
+                                            } else {
+                                                true // Continue to next value
+                                            }
+                                        } else {
+                                            false // Different group, stop
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if !should_continue {
+                                break;
+                            }
+
+                            drop(record);
+                            let has_next = return_if_io!(cursors.index_cursor.next());
+                            if !has_next {
+                                break;
+                            }
+                        }
+
+                        // Also check pending deltas for values not in storage
+                        if found_min.is_none() {
+                            // Find the minimum value from pending deltas with positive weight
+                            let mut min_from_pending: Option<Value> = None;
+                            for (_key, (val, weight)) in &pending_weights {
+                                if *weight > 0 {
+                                    if min_from_pending.is_none() || val < min_from_pending.as_ref().unwrap() {
+                                        min_from_pending = Some(val.clone());
+                                    }
+                                }
+                            }
+                            if let Some(min_val) = min_from_pending {
+                                println!("[RecomputeMinMax] Found MIN from pending deltas: {:?}", min_val);
+                                found_min = Some(min_val);
+                            }
+                        }
+                    } else {
+                        println!("[RecomputeMinMax] ScanForMin for group '{}', column '{}' found no records",
+                            group_key, column_name);
+                    }
+
+                    // Update the state with the new MIN value
+                    if let Some(state) = states.get_mut(group_key) {
+                        if let Some(min_val) = found_min {
+                            println!("[RecomputeMinMax] Updating MIN for '{}' to {:?}", column_name, min_val);
+                            state.mins_mut().insert(column_name.clone(), min_val);
+                        } else {
+                            println!("[RecomputeMinMax] Removing MIN for '{}'", column_name);
+                            state.mins_mut().remove(column_name);
+                        }
+                    } else {
+                        println!("[RecomputeMinMax] WARNING: No state found for group '{}'", group_key);
+                    }
+
+                    // Move to next column
+                    *self = RecomputeMinMax::ProcessGroup {
+                        group_key: group_key.clone(),
+                        dirty: DirtyMinMax::new(),
+                        states: states.clone(),
+                        current_column_idx: *current_column_idx + 1,
+                        columns_to_process: columns_to_process.clone(),
+                        pending_deltas: pending_deltas.clone(),
+                    };
+                }
+                RecomputeMinMax::ScanForMax {
+                    group_key,
+                    column_name,
+                    column_index,
+                    states,
+                    columns_to_process,
+                    current_column_idx,
+                    pending_deltas,
+                } => {
+                    // Build storage ID for this MAX column
+                    let operator_storage_id = generate_storage_id(operator_id, *column_index, AGG_TYPE_MINMAX);
+                    let zset_id = group_key.bytes()
+                        .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+
+                    // Seek backwards from (operator_id, zset_id, MAX_VALUE) to find the last element
+                    let seek_values = vec![
+                        Value::Integer(operator_storage_id),
+                        Value::Integer(zset_id),
+                        Value::Integer(i64::MAX),
+                    ];
+
+                    let seek_record = ImmutableRecord::from_values(&seek_values, 3);
+                    let res = return_if_io!(cursors.index_cursor.seek(
+                        SeekKey::IndexKey(&seek_record),
+                        SeekOp::LE { eq_only: false }
+                    ));
+
+                    let mut found_max = None;
+                    if matches!(res, SeekResult::Found) {
+                        let record = return_if_io!(cursors.index_cursor.record());
+                        found_max = Self::extract_value_if_matches(&record, operator_storage_id, zset_id);
+                    }
+
+                    // Update the state with the new MAX value
+                    if let Some(state) = states.get_mut(group_key) {
+                        if let Some(max_val) = found_max {
+                            state.maxs_mut().insert(column_name.clone(), max_val);
+                        } else {
+                            state.maxs_mut().remove(column_name);
+                        }
+                    }
+
+                    // Move to next column
+                    *self = RecomputeMinMax::ProcessGroup {
+                        group_key: group_key.clone(),
+                        dirty: DirtyMinMax::new(),
+                        states: states.clone(),
+                        current_column_idx: *current_column_idx + 1,
+                        columns_to_process: columns_to_process.clone(),
+                        pending_deltas: pending_deltas.clone(),
+                    };
+                }
+                RecomputeMinMax::Done { states } => {
+                    return Ok(IOResult::Done(states.clone()));
+                }
+            }
+        }
+    }
+}

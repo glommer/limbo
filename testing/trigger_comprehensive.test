@@ -1,0 +1,224 @@
+#!/usr/bin/env tclsh
+
+# Test triggers comprehensively with different table types and trigger timings
+
+#############################################################################
+# Test 1: AFTER trigger with INTEGER PRIMARY KEY (rowid alias)
+#############################################################################
+
+do_execsql_test trigger_after_rowid_alias {
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY, 
+        name TEXT,
+        email TEXT
+    );
+    CREATE TABLE audit_log (
+        action TEXT,
+        table_name TEXT,
+        row_id INTEGER,
+        user_name TEXT,
+        user_email TEXT
+    );
+    CREATE TRIGGER users_after_insert AFTER INSERT ON users
+    FOR EACH ROW
+    BEGIN
+        INSERT INTO audit_log VALUES ('INSERT', 'users', NEW.id, NEW.name, NEW.email);
+    END;
+    
+    INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com');
+    INSERT INTO users (id, name, email) VALUES (2, 'Bob', 'bob@example.com');
+    
+    SELECT * FROM audit_log ORDER BY row_id;
+} {INSERT users 1 Alice alice@example.com INSERT users 2 Bob bob@example.com}
+
+#############################################################################
+# Test 2: BEFORE trigger with INTEGER PRIMARY KEY (rowid alias)
+#############################################################################
+
+do_execsql_test trigger_before_rowid_alias {
+    DROP TABLE IF EXISTS users;
+    DROP TABLE IF EXISTS audit_log;
+    
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        name TEXT,
+        email TEXT
+    );
+    CREATE TABLE validation_log (
+        action TEXT,
+        validated_id INTEGER,
+        validated_name TEXT
+    );
+    
+    CREATE TRIGGER users_before_insert BEFORE INSERT ON users
+    FOR EACH ROW
+    BEGIN
+        INSERT INTO validation_log VALUES ('VALIDATING', NEW.id, NEW.name);
+    END;
+    
+    INSERT INTO users (id, name, email) VALUES (10, 'Charlie', 'charlie@example.com');
+    INSERT INTO users (id, name, email) VALUES (20, 'Diana', 'diana@example.com');
+    
+    SELECT * FROM validation_log ORDER BY validated_id;
+} {VALIDATING 10 Charlie VALIDATING 20 Diana}
+
+# Verify the actual inserts happened
+do_execsql_test trigger_before_rowid_alias_verify {
+    SELECT id, name FROM users ORDER BY id;
+} {10 Charlie 20 Diana}
+
+#############################################################################
+# Test 3: AFTER trigger without rowid alias (regular table with implicit rowid)
+#############################################################################
+
+do_execsql_test trigger_after_no_rowid_alias {
+    DROP TABLE IF EXISTS products;
+    DROP TABLE IF EXISTS product_audit;
+    
+    CREATE TABLE products (
+        product_id INT,  -- Not PRIMARY KEY, so no rowid alias
+        name TEXT,
+        price REAL
+    );
+    CREATE TABLE product_audit (
+        action TEXT,
+        product_rowid INTEGER,
+        product_id INT,
+        product_name TEXT,
+        product_price REAL
+    );
+    
+    CREATE TRIGGER products_after_insert AFTER INSERT ON products
+    FOR EACH ROW
+    BEGIN
+        INSERT INTO product_audit VALUES ('INSERTED', NEW.rowid, NEW.product_id, NEW.name, NEW.price);
+    END;
+    
+    INSERT INTO products (product_id, name, price) VALUES (100, 'Laptop', 999.99);
+    INSERT INTO products (product_id, name, price) VALUES (200, 'Mouse', 29.99);
+    
+    SELECT action, product_id, product_name, product_price FROM product_audit ORDER BY product_id;
+} {INSERTED 100 Laptop 999.99 INSERTED 200 Mouse 29.99}
+
+#############################################################################
+# Test 4: BEFORE trigger without rowid alias (regular table with implicit rowid)
+#############################################################################
+
+do_execsql_test trigger_before_no_rowid_alias {
+    DROP TABLE IF EXISTS inventory;
+    DROP TABLE IF EXISTS inventory_check;
+    
+    CREATE TABLE inventory (
+        item_code TEXT,
+        quantity INT,
+        location TEXT
+    );
+    CREATE TABLE inventory_check (
+        check_type TEXT,
+        item_rowid INTEGER,
+        item_code TEXT,
+        quantity INT
+    );
+    
+    CREATE TRIGGER inventory_before_insert BEFORE INSERT ON inventory
+    FOR EACH ROW
+    BEGIN
+        INSERT INTO inventory_check VALUES ('PRE_CHECK', NEW.rowid, NEW.item_code, NEW.quantity);
+    END;
+    
+    INSERT INTO inventory (item_code, quantity, location) VALUES ('ABC123', 50, 'Warehouse A');
+    INSERT INTO inventory (item_code, quantity, location) VALUES ('DEF456', 75, 'Warehouse B');
+    
+    SELECT check_type, item_code, quantity FROM inventory_check ORDER BY item_code;
+} {PRE_CHECK ABC123 50 PRE_CHECK DEF456 75}
+
+# Verify the actual inserts happened
+do_execsql_test trigger_before_no_rowid_alias_verify {
+    SELECT item_code, quantity FROM inventory ORDER BY item_code;
+} {ABC123 50 DEF456 75}
+
+#############################################################################
+# Test 5: Multiple triggers on same table (BEFORE and AFTER)
+#############################################################################
+
+do_execsql_test trigger_multiple_same_table {
+    DROP TABLE IF EXISTS orders;
+    DROP TABLE IF EXISTS order_events;
+    
+    CREATE TABLE orders (
+        order_id INTEGER PRIMARY KEY,
+        customer_name TEXT,
+        total REAL
+    );
+    CREATE TABLE order_events (
+        event_type TEXT,
+        event_time TEXT,  -- 'BEFORE' or 'AFTER'
+        order_id INTEGER,
+        customer TEXT
+    );
+    
+    CREATE TRIGGER orders_before_insert BEFORE INSERT ON orders
+    FOR EACH ROW
+    BEGIN
+        INSERT INTO order_events VALUES ('VALIDATE', 'BEFORE', NEW.order_id, NEW.customer_name);
+    END;
+    
+    CREATE TRIGGER orders_after_insert AFTER INSERT ON orders
+    FOR EACH ROW
+    BEGIN
+        INSERT INTO order_events VALUES ('LOG', 'AFTER', NEW.order_id, NEW.customer_name);
+    END;
+    
+    INSERT INTO orders (order_id, customer_name, total) VALUES (1001, 'John Doe', 149.99);
+    
+    SELECT event_type, event_time, order_id FROM order_events ORDER BY 
+        CASE event_time WHEN 'BEFORE' THEN 1 ELSE 2 END;
+} {VALIDATE BEFORE 1001 LOG AFTER 1001}
+
+#############################################################################
+# Test 6: Trigger with NULL values and auto-generated rowid
+#############################################################################
+
+do_execsql_test trigger_null_values_auto_rowid {
+    DROP TABLE IF EXISTS comments;
+    DROP TABLE IF EXISTS comment_log;
+    
+    CREATE TABLE comments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT,
+        author TEXT
+    );
+    CREATE TABLE comment_log (
+        action TEXT,
+        comment_id INTEGER,
+        has_text INTEGER,
+        has_author INTEGER
+    );
+    
+    CREATE TRIGGER comments_after_insert AFTER INSERT ON comments
+    FOR EACH ROW
+    BEGIN
+        INSERT INTO comment_log VALUES (
+            'INSERT',
+            NEW.id,
+            CASE WHEN NEW.text IS NULL THEN 0 ELSE 1 END,
+            CASE WHEN NEW.author IS NULL THEN 0 ELSE 1 END
+        );
+    END;
+    
+    -- Insert with NULL id (auto-generated), provided text and author
+    INSERT INTO comments (text, author) VALUES ('First comment', 'Alice');
+    -- Insert with NULL author
+    INSERT INTO comments (text, author) VALUES ('Second comment', NULL);
+    -- Insert with all NULLs except auto-generated id
+    INSERT INTO comments (text, author) VALUES (NULL, NULL);
+    
+    SELECT * FROM comment_log ORDER BY comment_id;
+} {INSERT 1 1 1 INSERT 2 1 0 INSERT 3 0 0}
+
+# Verify the actual data
+do_execsql_test trigger_null_values_auto_rowid_verify {
+    SELECT id, text, author FROM comments ORDER BY id;
+} {1 {First comment} Alice 2 {Second comment} {} 3 {} {}}
+
+finish_test

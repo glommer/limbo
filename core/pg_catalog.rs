@@ -281,15 +281,13 @@ impl InternalVirtualTable for PgNamespaceTable {
 }
 
 struct PgNamespaceCursor {
-    conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
 }
 
 impl PgNamespaceCursor {
-    fn new(conn: Arc<Connection>) -> Self {
+    fn new(_conn: Arc<Connection>) -> Self {
         Self {
-            conn,
             rows: Vec::new(),
             current_row: 0,
         }
@@ -431,15 +429,13 @@ impl InternalVirtualTable for PgAttributeTable {
 }
 
 struct PgAttributeCursor {
-    conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
 }
 
 impl PgAttributeCursor {
-    fn new(conn: Arc<Connection>) -> Self {
+    fn new(_conn: Arc<Connection>) -> Self {
         Self {
-            conn,
             rows: Vec::new(),
             current_row: 0,
         }
@@ -522,14 +518,16 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
     ]
 }
 
+// TODO: Fix tests to use correct API
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
-    use crate::{Database, OpenFlags, PlatformIO};
-    use std::sync::Arc;
+    use crate::{Database, PlatformIO, StepResult};
     use tempfile::tempdir;
 
     #[test]
+    
     fn test_pg_namespace_query() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
@@ -538,22 +536,29 @@ mod tests {
         let conn = db.connect().unwrap();
 
         // Switch to PostgreSQL dialect
-        conn.execute("PRAGMA sql_dialect = 'postgres'", ()).unwrap();
+        conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
         // Query pg_namespace
         let mut stmt = conn.prepare("SELECT * FROM pg_namespace").unwrap();
-        let mut rows = stmt.query(()).unwrap();
 
         let mut found_pg_catalog = false;
         let mut found_public = false;
         let mut found_information_schema = false;
 
-        while let Ok(Some(row)) = rows.next() {
-            let nspname: String = row.get(1).unwrap();
-            match nspname.as_str() {
-                "pg_catalog" => found_pg_catalog = true,
-                "public" => found_public = true,
-                "information_schema" => found_information_schema = true,
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    if let Value::Text(nspname) = row.get_value(1) {
+                        match nspname.value.as_ref() {
+                            "pg_catalog" => found_pg_catalog = true,
+                            "public" => found_public = true,
+                            "information_schema" => found_information_schema = true,
+                            _ => {}
+                        }
+                    }
+                }
+                StepResult::Done => break,
                 _ => {}
             }
         }
@@ -564,6 +569,7 @@ mod tests {
     }
 
     #[test]
+    
     fn test_pg_class_lists_user_tables() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
@@ -572,21 +578,28 @@ mod tests {
         let conn = db.connect().unwrap();
 
         // Create test tables in SQLite mode (default)
-        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", ()).unwrap();
-        conn.execute("CREATE TABLE products (id INTEGER, title TEXT, price REAL)", ()).unwrap();
-        conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, product_id INTEGER)", ()).unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        conn.execute("CREATE TABLE products (id INTEGER, title TEXT, price REAL)").unwrap();
+        conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, product_id INTEGER)").unwrap();
 
         // Switch to PostgreSQL dialect
-        conn.execute("PRAGMA sql_dialect = 'postgres'", ()).unwrap();
+        conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
         // Query pg_class for regular tables
         let mut stmt = conn.prepare("SELECT relname FROM pg_class WHERE relkind = 'r' AND relnamespace = 2200").unwrap();
-        let mut rows = stmt.query(()).unwrap();
 
         let mut tables = Vec::new();
-        while let Ok(Some(row)) = rows.next() {
-            let relname: String = row.get(0).unwrap();
-            tables.push(relname);
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    if let Value::Text(relname) = row.get_value(0) {
+                        tables.push(relname.to_string());
+                    }
+                }
+                StepResult::Done => break,
+                _ => {}
+            }
         }
 
         // Should find our three tables
@@ -597,6 +610,7 @@ mod tests {
     }
 
     #[test]
+    
     fn test_pg_class_table_details() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
@@ -605,10 +619,10 @@ mod tests {
         let conn = db.connect().unwrap();
 
         // Create a test table with known columns
-        conn.execute("CREATE TABLE test_table (id INTEGER, name TEXT, value REAL)", ()).unwrap();
+        conn.execute("CREATE TABLE test_table (id INTEGER, name TEXT, value REAL)").unwrap();
 
         // Switch to PostgreSQL dialect
-        conn.execute("PRAGMA sql_dialect = 'postgres'", ()).unwrap();
+        conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
         // Query pg_class for table details
         let mut stmt = conn.prepare(
@@ -616,17 +630,17 @@ mod tests {
              FROM pg_class
              WHERE relname = 'test_table'"
         ).unwrap();
-        let mut rows = stmt.query(()).unwrap();
 
-        if let Ok(Some(row)) = rows.next() {
-            let oid: i64 = row.get(0).unwrap();
-            let relname: String = row.get(1).unwrap();
-            let relkind: String = row.get(2).unwrap();
-            let relnatts: i64 = row.get(3).unwrap();
+        if let StepResult::Row = stmt.step().unwrap() {
+            let row = stmt.row().unwrap();
+            let oid = if let Value::Integer(v) = row.get_value(0) { *v } else { panic!("Expected OID") };
+            let relname = if let Value::Text(v) = row.get_value(1) { v } else { panic!("Expected relname") };
+            let relkind = if let Value::Text(v) = row.get_value(2) { v } else { panic!("Expected relkind") };
+            let relnatts = if let Value::Integer(v) = row.get_value(3) { *v } else { panic!("Expected relnatts") };
 
-            assert!(oid >= 16384, "OID should be >= 16384");
-            assert_eq!(relname, "test_table");
-            assert_eq!(relkind, "r", "relkind should be 'r' for regular table");
+            assert!(oid >= 16384, "OID should be >= 16384 for user tables");
+            assert_eq!(relname.value, "test_table", "Table name should match");
+            assert_eq!(relkind.value, "r", "relkind should be 'r' for regular table");
             assert_eq!(relnatts, 3, "Table should have 3 columns");
         } else {
             panic!("test_table not found in pg_class");
@@ -634,6 +648,7 @@ mod tests {
     }
 
     #[test]
+    
     fn test_sqlite_tables_hidden_in_postgres_mode() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
@@ -642,10 +657,10 @@ mod tests {
         let conn = db.connect().unwrap();
 
         // Create a test table
-        conn.execute("CREATE TABLE test_table (id INTEGER)", ()).unwrap();
+        conn.execute("CREATE TABLE test_table (id INTEGER)").unwrap();
 
         // Switch to PostgreSQL dialect
-        conn.execute("PRAGMA sql_dialect = 'postgres'", ()).unwrap();
+        conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
         // Try to query sqlite_master - should fail
         let result = conn.prepare("SELECT * FROM sqlite_master");
@@ -657,6 +672,7 @@ mod tests {
     }
 
     #[test]
+    
     fn test_postgres_tables_hidden_in_sqlite_mode() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
@@ -680,6 +696,7 @@ mod tests {
     }
 
     #[test]
+    
     fn test_dialect_switching() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
@@ -688,37 +705,51 @@ mod tests {
         let conn = db.connect().unwrap();
 
         // Create a test table
-        conn.execute("CREATE TABLE users (id INTEGER, name TEXT)", ()).unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER, name TEXT)").unwrap();
 
         // In SQLite mode, check sqlite_master
         let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").unwrap();
-        let mut rows = stmt.query(()).unwrap();
         let mut found = false;
-        while let Ok(Some(row)) = rows.next() {
-            let name: String = row.get(0).unwrap();
-            if name == "users" {
-                found = true;
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    if let Value::Text(name) = row.get_value(0) {
+                        if name.value == "users" {
+                            found = true;
+                        }
+                    }
+                }
+                StepResult::Done => break,
+                _ => {}
             }
         }
         assert!(found, "users table not found in sqlite_master");
 
         // Switch to PostgreSQL mode
-        conn.execute("PRAGMA sql_dialect = 'postgres'", ()).unwrap();
+        conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
         // In PostgreSQL mode, check pg_class
         let mut stmt = conn.prepare("SELECT relname FROM pg_class WHERE relkind = 'r'").unwrap();
-        let mut rows = stmt.query(()).unwrap();
         let mut found = false;
-        while let Ok(Some(row)) = rows.next() {
-            let name: String = row.get(0).unwrap();
-            if name == "users" {
-                found = true;
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    if let Value::Text(name) = row.get_value(0) {
+                        if name.value == "users" {
+                            found = true;
+                        }
+                    }
+                }
+                StepResult::Done => break,
+                _ => {}
             }
         }
         assert!(found, "users table not found in pg_class");
 
         // Switch back to SQLite mode
-        conn.execute("PRAGMA sql_dialect = 'sqlite'", ()).unwrap();
+        conn.execute("PRAGMA sql_dialect = 'sqlite'").unwrap();
 
         // sqlite_master should work again
         let result = conn.prepare("SELECT * FROM sqlite_master");
@@ -726,6 +757,7 @@ mod tests {
     }
 
     #[test]
+    
     fn test_pg_class_with_where_constraints() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
@@ -734,38 +766,53 @@ mod tests {
         let conn = db.connect().unwrap();
 
         // Create multiple tables
-        conn.execute("CREATE TABLE table1 (id INTEGER)", ()).unwrap();
-        conn.execute("CREATE TABLE table2 (id INTEGER, name TEXT)", ()).unwrap();
-        conn.execute("CREATE TABLE table3 (id INTEGER, name TEXT, value REAL)", ()).unwrap();
+        conn.execute("CREATE TABLE table1 (id INTEGER)").unwrap();
+        conn.execute("CREATE TABLE table2 (id INTEGER, name TEXT)").unwrap();
+        conn.execute("CREATE TABLE table3 (id INTEGER, name TEXT, value REAL)").unwrap();
 
         // Switch to PostgreSQL dialect
-        conn.execute("PRAGMA sql_dialect = 'postgres'", ()).unwrap();
+        conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
         // Test various WHERE clause combinations
 
         // Test 1: Filter by relkind = 'r'
         let mut stmt = conn.prepare("SELECT COUNT(*) FROM pg_class WHERE relkind = 'r'").unwrap();
-        let mut rows = stmt.query(()).unwrap();
-        if let Ok(Some(row)) = rows.next() {
-            let count: i64 = row.get(0).unwrap();
-            assert_eq!(count, 3, "Should have 3 regular tables");
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                if let Value::Integer(count) = row.get_value(0) {
+                    assert_eq!(*count, 3, "Should have 3 regular tables");
+                }
+            }
+            _ => panic!("Expected row from COUNT query"),
         }
 
         // Test 2: Filter by relnamespace = 2200 (public schema)
         let mut stmt = conn.prepare("SELECT COUNT(*) FROM pg_class WHERE relnamespace = 2200").unwrap();
-        let mut rows = stmt.query(()).unwrap();
-        if let Ok(Some(row)) = rows.next() {
-            let count: i64 = row.get(0).unwrap();
-            assert_eq!(count, 3, "Should have 3 tables in public schema");
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                if let Value::Integer(count) = row.get_value(0) {
+                    assert_eq!(*count, 3, "Should have 3 tables in public schema");
+                }
+            }
+            _ => panic!("Expected row from COUNT query"),
         }
 
         // Test 3: Combined filters
         let mut stmt = conn.prepare("SELECT relname FROM pg_class WHERE relkind = 'r' AND relnamespace = 2200 ORDER BY relname").unwrap();
-        let mut rows = stmt.query(()).unwrap();
         let mut tables = Vec::new();
-        while let Ok(Some(row)) = rows.next() {
-            let name: String = row.get(0).unwrap();
-            tables.push(name);
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    if let Value::Text(name) = row.get_value(0) {
+                        tables.push(name.to_string());
+                    }
+                }
+                StepResult::Done => break,
+                _ => {}
+            }
         }
         assert_eq!(tables, vec!["table1", "table2", "table3"]);
     }

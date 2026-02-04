@@ -15,6 +15,8 @@
 //! - ResultRow: Output a row to result set
 //! - Halt: Terminate program
 
+#![allow(dead_code)]
+
 use crate::schema::{Table};
 use crate::translate::emitter::Resolver;
 use crate::translate::logical::{LogicalPlan, TableScan, Filter, Projection, LogicalExpr};
@@ -305,7 +307,7 @@ impl<'a> LogicalCompiler<'a> {
         &mut self,
         table_scan: &TableScan,
         projection_exprs: &[LogicalExpr],
-        output_schema: &crate::translate::logical::SchemaRef,
+        _output_schema: &crate::translate::logical::SchemaRef,
     ) -> Result<CompilationResult> {
         // Look up the table in the schema
         let table = self.resolver.schema.tables.get(&table_scan.table_name)
@@ -390,7 +392,7 @@ impl<'a> LogicalCompiler<'a> {
         table_scan: &TableScan,
         predicate: &LogicalExpr,
         projection_exprs: &[LogicalExpr],
-        output_schema: &crate::translate::logical::SchemaRef,
+        _output_schema: &crate::translate::logical::SchemaRef,
     ) -> Result<CompilationResult> {
         // Look up the table in the schema
         let table = self.resolver.schema.tables.get(&table_scan.table_name)
@@ -533,7 +535,7 @@ impl<'a> LogicalCompiler<'a> {
 
                 // For now, assume this is referencing a column from the current table scan
                 // We should lookup the column index from the table schema
-                let table_name = column_ref.table.as_deref();
+                let _table_name = column_ref.table.as_deref();
 
                 // This is a hack - we need to find the column index somehow
                 // In a real implementation, we'd maintain a mapping from columns to register positions

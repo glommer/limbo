@@ -1,0 +1,650 @@
+use super::operator::{
+    generate_storage_id, AGG_TYPE_MINMAX, ComputationTracker, DbspStateCursors, EvalState,
+    IncrementalOperator,
+};
+use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
+use crate::incremental::persistence::WriteRow;
+use crate::types::{IOResult, ImmutableRecord, RefValue, SeekKey, SeekOp, SeekResult};
+use crate::{return_and_restore_if_io, return_if_io, Result, Value};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
+
+type MinMaxDeltas = HashMap<String, Vec<(Value, String, isize)>>; // group_key_str -> [(value, column_name, weight)]
+
+/// State machine for persisting Min/Max values to storage
+#[derive(Debug)]
+enum MinMaxPersistState {
+    Init {
+        min_max_deltas: MinMaxDeltas,
+        group_keys: Vec<String>,
+    },
+    ProcessGroup {
+        min_max_deltas: MinMaxDeltas,
+        group_keys: Vec<String>,
+        group_idx: usize,
+        value_idx: usize,
+    },
+    WriteValue {
+        min_max_deltas: MinMaxDeltas,
+        group_keys: Vec<String>,
+        group_idx: usize,
+        value_idx: usize,
+        value: Value,
+        weight: isize,
+        write_row: WriteRow,
+    },
+    Done,
+}
+
+impl MinMaxPersistState {
+    fn new(min_max_deltas: MinMaxDeltas) -> Self {
+        let group_keys: Vec<String> = min_max_deltas.keys().cloned().collect();
+        Self::Init {
+            min_max_deltas,
+            group_keys,
+        }
+    }
+
+    fn persist_min_max(
+        &mut self,
+        operator_id: usize,
+        cursors: &mut DbspStateCursors,
+        generate_group_rowid: impl Fn(&str) -> i64,
+    ) -> Result<IOResult<()>> {
+        loop {
+            match self {
+                MinMaxPersistState::Init {
+                    min_max_deltas,
+                    group_keys,
+                } => {
+                    if group_keys.is_empty() {
+                        *self = MinMaxPersistState::Done;
+                    } else {
+                        let min_max_deltas = std::mem::take(min_max_deltas);
+                        let group_keys = std::mem::take(group_keys);
+                        *self = MinMaxPersistState::ProcessGroup {
+                            min_max_deltas,
+                            group_keys,
+                            group_idx: 0,
+                            value_idx: 0,
+                        };
+                    }
+                }
+                MinMaxPersistState::ProcessGroup {
+                    min_max_deltas,
+                    group_keys,
+                    group_idx,
+                    value_idx,
+                } => {
+                    if *group_idx >= group_keys.len() {
+                        *self = MinMaxPersistState::Done;
+                        continue;
+                    }
+
+                    let group_key_str = &group_keys[*group_idx];
+                    if let Some(values) = min_max_deltas.get(group_key_str) {
+                        if *value_idx >= values.len() {
+                            // Move to next group
+                            *group_idx += 1;
+                            *value_idx = 0;
+                            continue;
+                        }
+
+                        let (value, _col_name, weight) = values[*value_idx].clone();
+                        let min_max_deltas = std::mem::take(min_max_deltas);
+                        let group_keys = std::mem::take(group_keys);
+                        *self = MinMaxPersistState::WriteValue {
+                            min_max_deltas,
+                            group_keys,
+                            group_idx: *group_idx,
+                            value_idx: *value_idx,
+                            value,
+                            weight,
+                            write_row: WriteRow::new(),
+                        };
+                    } else {
+                        // No values for this group, move to next
+                        *group_idx += 1;
+                        *value_idx = 0;
+                    }
+                }
+                MinMaxPersistState::WriteValue {
+                    min_max_deltas,
+                    group_keys,
+                    group_idx,
+                    value_idx,
+                    value,
+                    weight,
+                    write_row,
+                } => {
+                    let group_key_str = &group_keys[*group_idx];
+
+                    // Build the key components for MinMax storage
+                    // For MinMax, we need to use the column index
+                    // TODO: Need to pass column_index here
+                    let operator_storage_id = generate_storage_id(operator_id, 0, AGG_TYPE_MINMAX);
+                    let zset_id = generate_group_rowid(group_key_str);
+
+                    // element_id is the actual value for Min/Max
+                    let element_id_val = value.clone();
+
+                    // Create index key
+                    let index_key = vec![
+                        Value::Integer(operator_storage_id),
+                        Value::Integer(zset_id),
+                        element_id_val.clone(),
+                    ];
+
+                    // Record values (operator_id, zset_id, element_id, value=element_id)
+                    let record_values = vec![
+                        Value::Integer(operator_storage_id),
+                        Value::Integer(zset_id),
+                        element_id_val.clone(),
+                        element_id_val, // value column is same as element_id for Min/Max
+                    ];
+
+                    let _write_result = return_if_io!(write_row.write_row(
+                        cursors,
+                        index_key.clone(),
+                        record_values,
+                        *weight
+                    ));
+
+                    // Move to next value
+                    let min_max_deltas = std::mem::take(min_max_deltas);
+                    let group_keys = std::mem::take(group_keys);
+                    *self = MinMaxPersistState::ProcessGroup {
+                        min_max_deltas,
+                        group_keys,
+                        group_idx: *group_idx,
+                        value_idx: *value_idx + 1,
+                    };
+                }
+                MinMaxPersistState::Done => {
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+}
+
+/// Min/Max operator - stores individual values with counts for efficient min/max computation
+#[derive(Debug)]
+pub struct MinMaxOperator {
+    operator_id: usize,
+    group_by: Vec<String>,
+    min_columns: Vec<String>, // Columns to compute MIN for
+    max_columns: Vec<String>, // Columns to compute MAX for
+    input_column_names: Vec<String>,
+    tracker: Option<Arc<Mutex<ComputationTracker>>>,
+    commit_state: MinMaxCommitState,
+}
+
+#[derive(Debug)]
+enum MinMaxCommitState {
+    Idle,
+    ProcessDeltas {
+        delta: Delta,
+        min_max_deltas: MinMaxDeltas,
+        persist_state: Option<Box<MinMaxPersistState>>,
+    },
+    Done {
+        delta: Delta,
+    },
+}
+
+impl MinMaxOperator {
+    pub fn new(
+        operator_id: usize,
+        group_by: Vec<String>,
+        min_columns: Vec<String>,
+        max_columns: Vec<String>,
+        input_column_names: Vec<String>,
+    ) -> Self {
+        Self {
+            operator_id,
+            group_by,
+            min_columns,
+            max_columns,
+            input_column_names,
+            tracker: None,
+            commit_state: MinMaxCommitState::Idle,
+        }
+    }
+
+    /// Extract group key from row values
+    fn extract_group_key(&self, values: &[Value]) -> Vec<Value> {
+        let mut group_key = Vec::new();
+        for col_name in &self.group_by {
+            if let Some(idx) = self.input_column_names.iter().position(|c| c == col_name) {
+                group_key.push(values.get(idx).cloned().unwrap_or(Value::Null));
+            } else {
+                group_key.push(Value::Null);
+            }
+        }
+        group_key
+    }
+
+    /// Convert group key to string for HashMap
+    fn group_key_to_string(group_key: &[Value]) -> String {
+        group_key
+            .iter()
+            .map(|v| match v {
+                Value::Text(t) => String::from_utf8_lossy(&t.value).to_string(),
+                Value::Integer(i) => i.to_string(),
+                Value::Float(f) => f.to_string(),
+                Value::Null => "NULL".to_string(),
+                _ => format!("{:?}", v), // Fallback for other types
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Generate a rowid for a group
+    fn generate_group_rowid(&self, group_key_str: &str) -> i64 {
+        if self.group_by.is_empty() {
+            0
+        } else {
+            group_key_str
+                .bytes()
+                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64))
+        }
+    }
+
+    /// Extract Min/Max values from a delta
+    fn extract_min_max_deltas(&self, delta: &Delta) -> MinMaxDeltas {
+        let mut min_max_deltas: MinMaxDeltas = HashMap::new();
+
+        for (row, weight) in &delta.changes {
+            // Extract group key
+            let group_key = self.extract_group_key(&row.values);
+            let group_key_str = Self::group_key_to_string(&group_key);
+
+            // Extract values for MIN columns
+            for col_name in &self.min_columns {
+                if let Some(idx) = self.input_column_names.iter().position(|c| c == col_name) {
+                    if let Some(val) = row.values.get(idx) {
+                        // Skip NULL values
+                        if !matches!(val, Value::Null) {
+                            min_max_deltas
+                                .entry(group_key_str.clone())
+                                .or_insert_with(Vec::new)
+                                .push((val.clone(), col_name.clone(), *weight));
+                        }
+                    }
+                }
+            }
+
+            // Extract values for MAX columns
+            for col_name in &self.max_columns {
+                if let Some(idx) = self.input_column_names.iter().position(|c| c == col_name) {
+                    if let Some(val) = row.values.get(idx) {
+                        // Skip NULL values
+                        if !matches!(val, Value::Null) {
+                            min_max_deltas
+                                .entry(group_key_str.clone())
+                                .or_insert_with(Vec::new)
+                                .push((val.clone(), col_name.clone(), *weight));
+                        }
+                    }
+                }
+            }
+        }
+
+        min_max_deltas
+    }
+
+    /// Read MIN value for a group and column
+    fn read_min_value(
+        &self,
+        group_key_str: &str,
+        cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Option<Value>>> {
+        // For MinMax, we need to use the column index
+        // TODO: Need to pass column_index here
+        let operator_storage_id = generate_storage_id(self.operator_id, 0, AGG_TYPE_MINMAX);
+        let zset_id = self.generate_group_rowid(group_key_str);
+
+        // Seek to (operator_id, zset_id, NULL) - first element is MIN
+        let seek_values = vec![
+            Value::Integer(operator_storage_id),
+            Value::Integer(zset_id),
+            Value::Null,
+        ];
+
+        let seek_record = ImmutableRecord::from_values(&seek_values, 3);
+        let res = return_if_io!(cursors.index_cursor.seek(
+            SeekKey::IndexKey(&seek_record),
+            SeekOp::GE { eq_only: false }
+        ));
+
+        if matches!(res, SeekResult::Found) {
+            // Scan through all values to find the first one with non-zero weight
+            loop {
+                let record = return_if_io!(cursors.index_cursor.record());
+                let should_continue = if let Some(rec) = &record {
+                    let values = rec.get_values();
+                    if values.len() >= 4 {
+                        if let (RefValue::Integer(op_id), RefValue::Integer(zset)) =
+                            (&values[0], &values[1])
+                        {
+                            if *op_id == operator_storage_id && *zset == zset_id {
+                                // Get the rowid from the index (column 3)
+                                if let RefValue::Integer(rowid) = &values[3] {
+                                    // Seek to the table record to check weight
+                                    let table_res = return_if_io!(cursors.table_cursor.seek(
+                                        SeekKey::TableRowId(*rowid),
+                                        SeekOp::GE { eq_only: true }
+                                    ));
+
+                                    if matches!(table_res, SeekResult::Found) {
+                                        let table_record =
+                                            return_if_io!(cursors.table_cursor.record());
+                                        if let Some(table_rec) = table_record {
+                                            let table_values = table_rec.get_values();
+
+                                            // Check weight (column 4)
+                                            if table_values.len() > 4 {
+                                                if let RefValue::Integer(weight) = &table_values[4]
+                                                {
+                                                    if *weight > 0 {
+                                                        // This value is still valid
+                                                        let min_val = values[2].to_owned();
+                                                        drop(record);
+                                                        return Ok(IOResult::Done(Some(min_val)));
+                                                    } else {
+                                                        // Continue to next value
+                                                        true
+                                                    }
+                                                } else {
+                                                    true
+                                                }
+                                            } else {
+                                                true
+                                            }
+                                        } else {
+                                            true
+                                        }
+                                    } else {
+                                        true
+                                    }
+                                } else {
+                                    true
+                                }
+                            } else {
+                                // Different group, no match
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if !should_continue {
+                    break;
+                }
+
+                // Drop record before moving to next
+                drop(record);
+
+                // Move to next record
+                let has_next = return_if_io!(cursors.index_cursor.next());
+                if !has_next {
+                    break;
+                }
+            }
+        }
+        Ok(IOResult::Done(None))
+    }
+
+    /// Read MAX value for a group and column
+    fn read_max_value(
+        &self,
+        group_key_str: &str,
+        cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Option<Value>>> {
+        // For MinMax, we need to use the column index
+        // TODO: Need to pass column_index here
+        let operator_storage_id = generate_storage_id(self.operator_id, 0, AGG_TYPE_MINMAX);
+        let zset_id = self.generate_group_rowid(group_key_str);
+
+        // Seek to (operator_id, zset_id, NULL) and scan to last valid element
+        let seek_values = vec![
+            Value::Integer(operator_storage_id),
+            Value::Integer(zset_id),
+            Value::Null,
+        ];
+
+        let seek_record = ImmutableRecord::from_values(&seek_values, 3);
+        let res = return_if_io!(cursors.index_cursor.seek(
+            SeekKey::IndexKey(&seek_record),
+            SeekOp::GE { eq_only: false }
+        ));
+
+        let mut max_value: Option<Value> = None;
+        if matches!(res, SeekResult::Found) {
+            // Scan through all values, keeping track of the last valid one
+            loop {
+                let record = return_if_io!(cursors.index_cursor.record());
+                let should_continue = if let Some(rec) = &record {
+                    let values = rec.get_values();
+                    if values.len() >= 4 {
+                        if let (RefValue::Integer(op_id), RefValue::Integer(zset)) =
+                            (&values[0], &values[1])
+                        {
+                            if *op_id == operator_storage_id && *zset == zset_id {
+                                // Get the rowid from the index (column 3)
+                                if let RefValue::Integer(rowid) = &values[3] {
+                                    // Seek to the table record to check weight
+                                    let table_res = return_if_io!(cursors.table_cursor.seek(
+                                        SeekKey::TableRowId(*rowid),
+                                        SeekOp::GE { eq_only: true }
+                                    ));
+
+                                    if matches!(table_res, SeekResult::Found) {
+                                        let table_record =
+                                            return_if_io!(cursors.table_cursor.record());
+                                        if let Some(table_rec) = table_record {
+                                            let table_values = table_rec.get_values();
+
+                                            // Check weight (column 4)
+                                            if table_values.len() > 4 {
+                                                if let RefValue::Integer(weight) = &table_values[4]
+                                                {
+                                                    if *weight > 0 {
+                                                        // This value is valid, update max_value
+                                                        max_value = Some(values[2].to_owned());
+                                                        // Continue to find potentially higher values
+                                                        true
+                                                    } else {
+                                                        // Continue to next value
+                                                        true
+                                                    }
+                                                } else {
+                                                    true
+                                                }
+                                            } else {
+                                                true
+                                            }
+                                        } else {
+                                            true
+                                        }
+                                    } else {
+                                        true
+                                    }
+                                } else {
+                                    true
+                                }
+                            } else {
+                                // Different group, no more values for this group
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if !should_continue {
+                    break;
+                }
+
+                // Drop the record before calling next()
+                drop(record);
+                let has_next = return_if_io!(cursors.index_cursor.next());
+                if !has_next {
+                    break;
+                }
+            }
+        }
+
+        Ok(IOResult::Done(max_value))
+    }
+}
+
+impl IncrementalOperator for MinMaxOperator {
+    fn eval(
+        &mut self,
+        state: &mut EvalState,
+        cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Delta>> {
+        match state {
+            EvalState::Uninitialized => {
+                panic!("Cannot eval MinMaxOperator with Uninitialized state");
+            }
+            EvalState::Init { deltas } => {
+                assert!(
+                    deltas.right.is_empty(),
+                    "MinMaxOperator expects right_delta to be empty"
+                );
+
+                let mut output_delta = Delta::new();
+                println!("[MinMaxOperator] eval called, processing {} changes", deltas.left.changes.len());
+
+                // For each group, read current min/max values and output them
+                let mut groups = BTreeSet::new();
+                for (row, _weight) in &deltas.left.changes {
+                    let group_key = self.extract_group_key(&row.values);
+                    let group_key_str = Self::group_key_to_string(&group_key);
+                    groups.insert((group_key_str, group_key));
+                }
+
+                // For affected groups, we need to output both old and new values
+                // For now, we'll just output the new values with weight 1
+                // TODO: This is not truly incremental - we should track previous output
+                // and emit proper deltas (-1 for old, +1 for new)
+                println!("[MinMaxOperator] Processing {} groups", groups.len());
+                for (group_key_str, group_key) in groups {
+                    println!("[MinMaxOperator] Building output for group '{}'", group_key_str);
+                    println!("  Group key values: {:?}", group_key);
+                    // Build output row: group_by columns + min/max values
+                    let mut output_values = group_key.clone();
+
+                    // Add MIN values in order
+                    // Note: For now we assume a single column for MIN/MAX
+                    // If columns differ, we'd need separate reads per column
+                    if !self.min_columns.is_empty() {
+                        let min_value = return_if_io!(self.read_min_value(&group_key_str, cursors));
+                        println!("  MIN value: {:?}", min_value);
+                        output_values.push(min_value.unwrap_or(Value::Null));
+                    }
+
+                    // Add MAX values in order
+                    if !self.max_columns.is_empty() {
+                        let max_value = return_if_io!(self.read_max_value(&group_key_str, cursors));
+                        println!("  MAX value: {:?}", max_value);
+                        output_values.push(max_value.unwrap_or(Value::Null));
+                    }
+
+                    println!("  Complete output row: {:?}", output_values);
+                    let result_key = self.generate_group_rowid(&group_key_str);
+                    let output_row = HashableRow::new(result_key, output_values);
+                    // WARNING: This is incorrect for updates - we should emit -1 for old value first
+                    output_delta.changes.push((output_row, 1));
+                }
+
+                *state = EvalState::Done;
+                Ok(IOResult::Done(output_delta))
+            }
+            _ => panic!("MinMaxOperator doesn't support complex eval states"),
+        }
+    }
+
+    fn commit(
+        &mut self,
+        deltas: DeltaPair,
+        cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Delta>> {
+        assert!(
+            deltas.right.is_empty(),
+            "MinMaxOperator expects right delta to be empty in commit"
+        );
+
+        let delta = deltas.left;
+
+        loop {
+            let mut state = std::mem::replace(&mut self.commit_state, MinMaxCommitState::Idle);
+
+            match &mut state {
+                MinMaxCommitState::Idle => {
+                    let min_max_deltas = self.extract_min_max_deltas(&delta);
+                    self.commit_state = MinMaxCommitState::ProcessDeltas {
+                        delta: delta.clone(),
+                        min_max_deltas: min_max_deltas.clone(),
+                        persist_state: Some(Box::new(MinMaxPersistState::new(min_max_deltas))),
+                    };
+                }
+                MinMaxCommitState::ProcessDeltas {
+                    delta,
+                    min_max_deltas: _,
+                    persist_state,
+                } => {
+                    if let Some(ref mut persist_state) = persist_state {
+                        let _result = return_and_restore_if_io!(
+                            &mut self.commit_state,
+                            state,
+                            persist_state.persist_min_max(
+                                self.operator_id,
+                                cursors,
+                                |group_key_str| self.generate_group_rowid(group_key_str)
+                            )
+                        );
+
+                        // result is () because return_and_restore_if_io! returns the inner value when Done
+                        // The macro has already handled IOResult::Again case
+                        {
+                            self.commit_state = MinMaxCommitState::Done {
+                                delta: delta.clone(),
+                            };
+                        }
+                    } else {
+                        self.commit_state = MinMaxCommitState::Done {
+                            delta: delta.clone(),
+                        };
+                    }
+                }
+                MinMaxCommitState::Done { delta } => {
+                    self.commit_state = MinMaxCommitState::Idle;
+                    let delta = std::mem::take(delta);
+
+                    // Generate output delta with updated min/max values
+                    let eval_state = &mut EvalState::from_delta(delta.clone());
+                    return self.eval(eval_state, cursors);
+                }
+            }
+        }
+    }
+
+    fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
+        self.tracker = Some(tracker);
+    }
+}

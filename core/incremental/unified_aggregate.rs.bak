@@ -1,0 +1,433 @@
+use super::operator::{
+    generate_storage_id, AGG_TYPE_MINMAX, AGG_TYPE_REGULAR, AggregateFunction, AggregateState,
+    ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
+};
+use super::persistence::ReadRecord;
+use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
+use crate::types::{IOResult, ImmutableRecord, RefValue, SeekKey, SeekOp, SeekResult};
+use crate::{return_if_io, Result, Value};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
+
+/// A unified aggregate operator that handles all types of aggregations:
+/// - Regular aggregates (COUNT, SUM, AVG)
+/// - MIN/MAX aggregates (which need special storage)
+#[derive(Debug)]
+pub struct UnifiedAggregateOperator {
+    operator_id: usize,
+    group_by: Vec<String>,
+
+    // Regular aggregates (COUNT, SUM, AVG)
+    regular_aggregates: Vec<AggregateFunction>,
+
+    // MIN/MAX aggregates grouped by column
+    // e.g., {"price": (has_min, has_max), "quantity": (has_min, has_max)}
+    minmax_columns: HashMap<String, (bool, bool)>,
+
+    input_column_names: Vec<String>,
+    output_column_names: Vec<String>,
+    tracker: Option<Arc<Mutex<ComputationTracker>>>,
+
+    // We'll use MinMaxOperator's storage for MIN/MAX values
+    // and AggregateOperator's storage for regular aggregates
+    regular_op_id: usize,  // operator_id for regular aggregates
+    minmax_op_id: usize,   // operator_id for MIN/MAX storage
+}
+
+impl UnifiedAggregateOperator {
+    pub fn new(
+        operator_id: usize,
+        group_by: Vec<String>,
+        regular_aggregates: Vec<AggregateFunction>,
+        min_columns: Vec<String>,
+        max_columns: Vec<String>,
+        input_column_names: Vec<String>,
+        output_column_names: Vec<String>,
+    ) -> Self {
+        // Build minmax_columns map to track which columns have MIN/MAX
+        let mut minmax_columns = HashMap::new();
+
+        for col in &min_columns {
+            minmax_columns.entry(col.clone()).or_insert((false, false)).0 = true;
+        }
+
+        for col in &max_columns {
+            minmax_columns.entry(col.clone()).or_insert((false, false)).1 = true;
+        }
+
+        Self {
+            operator_id,
+            group_by,
+            regular_aggregates,
+            minmax_columns,
+            input_column_names,
+            output_column_names,
+            tracker: None,
+            regular_op_id: operator_id * 2,      // Even ID for regular aggregates
+            minmax_op_id: operator_id * 2 + 1,   // Odd ID for MIN/MAX
+        }
+    }
+
+    /// Extract group key from row values
+    fn extract_group_key(&self, values: &[Value]) -> Vec<Value> {
+        let mut group_key = Vec::new();
+        for col_name in &self.group_by {
+            if let Some(idx) = self.input_column_names.iter().position(|c| c == col_name) {
+                group_key.push(values.get(idx).cloned().unwrap_or(Value::Null));
+            } else {
+                group_key.push(Value::Null);
+            }
+        }
+        group_key
+    }
+
+    /// Convert group key to string for HashMap
+    fn group_key_to_string(group_key: &[Value]) -> String {
+        group_key
+            .iter()
+            .map(|v| match v {
+                Value::Text(t) => String::from_utf8_lossy(&t.value).to_string(),
+                Value::Integer(i) => i.to_string(),
+                Value::Float(f) => f.to_string(),
+                Value::Null => "NULL".to_string(),
+                _ => format!("{:?}", v),
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Generate a rowid for a group
+    fn generate_group_rowid(&self, group_key_str: &str) -> i64 {
+        if self.group_by.is_empty() {
+            0
+        } else {
+            group_key_str
+                .bytes()
+                .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64))
+        }
+    }
+
+    /// Read regular aggregate state from storage
+    fn read_regular_aggregate_state(
+        &self,
+        group_key_str: &str,
+        cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Option<AggregateState>>> {
+        // For regular aggregates, use column_index=0 and AGG_TYPE_REGULAR
+        let operator_storage_id = generate_storage_id(self.regular_op_id, 0, AGG_TYPE_REGULAR);
+        let group_hash = self.generate_group_rowid(group_key_str);
+        let composite_key = (operator_storage_id << 32) | (group_hash & 0xFFFFFFFF);
+
+        let mut read_record = ReadRecord::new();
+        let record = ImmutableRecord::from_values(
+            &[Value::Integer(operator_storage_id), Value::Integer(group_hash), Value::Integer(composite_key)],
+            3,
+        );
+        let seek_key = SeekKey::IndexKey(&record);
+
+        read_record.read_record(seek_key, &self.regular_aggregates, &mut cursors.table_cursor)
+    }
+
+    /// Read MIN value for a group and column
+    fn read_min_value(
+        &self,
+        group_key_str: &str,
+        column: &str,
+        cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Option<Value>>> {
+        // Use column-specific operator ID
+        let column_index = self.minmax_columns.keys().position(|k| k == column).unwrap_or(0);
+        // For MinMax, use the column index
+        let operator_storage_id = generate_storage_id(self.minmax_op_id, column_index, AGG_TYPE_MINMAX);
+        let zset_id = self.generate_group_rowid(group_key_str);
+
+        // Seek to (operator_id, zset_id, NULL) - first element is MIN
+        let seek_values = vec![
+            Value::Integer(operator_storage_id),
+            Value::Integer(zset_id),
+            Value::Null,
+        ];
+
+        let seek_record = ImmutableRecord::from_values(&seek_values, 3);
+        let res = return_if_io!(cursors.index_cursor.seek(
+            SeekKey::IndexKey(&seek_record),
+            SeekOp::GE { eq_only: false }
+        ));
+
+        if matches!(res, SeekResult::Found) {
+            // Scan through all values to find the first one with non-zero weight
+            loop {
+                let record = return_if_io!(cursors.index_cursor.record());
+                let should_continue = if let Some(rec) = &record {
+                    let values = rec.get_values();
+                    if values.len() >= 4 {
+                        if let (RefValue::Integer(op_id), RefValue::Integer(zset)) = (&values[0], &values[1]) {
+                            if *op_id == operator_storage_id && *zset == zset_id {
+                                // Get the rowid from the index (column 3)
+                                if let RefValue::Integer(rowid) = &values[3] {
+                                    // Seek to the table record to check weight
+                                    let table_res = return_if_io!(cursors.table_cursor.seek(
+                                        SeekKey::TableRowId(*rowid),
+                                        SeekOp::GE { eq_only: true }
+                                    ));
+
+                                    if matches!(table_res, SeekResult::Found) {
+                                        let table_record = return_if_io!(cursors.table_cursor.record());
+                                        if let Some(table_rec) = table_record {
+                                            let table_values = table_rec.get_values();
+                                            // Check weight (column 4)
+                                            if table_values.len() > 4 {
+                                                if let RefValue::Integer(weight) = &table_values[4] {
+                                                    if *weight > 0 {
+                                                        // This value is still valid
+                                                        let min_val = values[2].to_owned();
+                                                        drop(record);
+                                                        return Ok(IOResult::Done(Some(min_val)));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                true // Continue to next value
+                            } else {
+                                false // Different group, no match
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if !should_continue {
+                    break;
+                }
+
+                // Drop record before moving to next
+                drop(record);
+
+                // Move to next record
+                let has_next = return_if_io!(cursors.index_cursor.next());
+                if !has_next {
+                    break;
+                }
+            }
+        }
+        Ok(IOResult::Done(None))
+    }
+
+    /// Read MAX value for a group and column
+    fn read_max_value(
+        &self,
+        group_key_str: &str,
+        column: &str,
+        cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Option<Value>>> {
+        // Use column-specific operator ID
+        let column_index = self.minmax_columns.keys().position(|k| k == column).unwrap_or(0);
+        // For MinMax, use the column index
+        let operator_storage_id = generate_storage_id(self.minmax_op_id, column_index, AGG_TYPE_MINMAX);
+        let zset_id = self.generate_group_rowid(group_key_str);
+
+        // Seek to (operator_id, zset_id, NULL) and scan to last valid element
+        let seek_values = vec![
+            Value::Integer(operator_storage_id),
+            Value::Integer(zset_id),
+            Value::Null,
+        ];
+
+        let seek_record = ImmutableRecord::from_values(&seek_values, 3);
+        let res = return_if_io!(cursors.index_cursor.seek(
+            SeekKey::IndexKey(&seek_record),
+            SeekOp::GE { eq_only: false }
+        ));
+
+        let mut max_value: Option<Value> = None;
+        if matches!(res, SeekResult::Found) {
+            // Scan through all values, keeping track of the last valid one
+            loop {
+                let record = return_if_io!(cursors.index_cursor.record());
+                let should_continue = if let Some(rec) = &record {
+                    let values = rec.get_values();
+                    if values.len() >= 4 {
+                        if let (RefValue::Integer(op_id), RefValue::Integer(zset)) = (&values[0], &values[1]) {
+                            if *op_id == operator_storage_id && *zset == zset_id {
+                                // Get the rowid from the index (column 3)
+                                if let RefValue::Integer(rowid) = &values[3] {
+                                    // Seek to the table record to check weight
+                                    let table_res = return_if_io!(cursors.table_cursor.seek(
+                                        SeekKey::TableRowId(*rowid),
+                                        SeekOp::GE { eq_only: true }
+                                    ));
+
+                                    if matches!(table_res, SeekResult::Found) {
+                                        let table_record = return_if_io!(cursors.table_cursor.record());
+                                        if let Some(table_rec) = table_record {
+                                            let table_values = table_rec.get_values();
+                                            // Check weight (column 4)
+                                            if table_values.len() > 4 {
+                                                if let RefValue::Integer(weight) = &table_values[4] {
+                                                    if *weight > 0 {
+                                                        // This value is valid, update max_value
+                                                        max_value = Some(values[2].to_owned());
+                                                        // Continue to find potentially higher values
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                true // Continue to next value
+                            } else {
+                                false // Different group, no more values for this group
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if !should_continue {
+                    break;
+                }
+
+                // Drop the record before calling next()
+                drop(record);
+                let has_next = return_if_io!(cursors.index_cursor.next());
+                if !has_next {
+                    break;
+                }
+            }
+        }
+
+        Ok(IOResult::Done(max_value))
+    }
+}
+
+impl IncrementalOperator for UnifiedAggregateOperator {
+    fn eval(
+        &mut self,
+        state: &mut EvalState,
+        cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Delta>> {
+        match state {
+            EvalState::Uninitialized => {
+                panic!("Cannot eval UnifiedAggregateOperator with Uninitialized state");
+            }
+            EvalState::Init { deltas } => {
+                println!("[UnifiedAggregate] eval called with {} changes", deltas.left.changes.len());
+                assert!(
+                    deltas.right.is_empty(),
+                    "UnifiedAggregateOperator expects right_delta to be empty"
+                );
+
+                let mut output_delta = Delta::new();
+
+                // For each group, read current values and output them
+                let mut groups = BTreeSet::new();
+                for (row, _weight) in &deltas.left.changes {
+                    let group_key = self.extract_group_key(&row.values);
+                    let group_key_str = Self::group_key_to_string(&group_key);
+                    groups.insert((group_key_str, group_key));
+                }
+
+                println!("[UnifiedAggregate] Processing {} groups", groups.len());
+                for (group_key_str, group_key) in groups {
+                    println!("[UnifiedAggregate] Building output for group '{}'", group_key_str);
+                    println!("  Group key values: {:?}", group_key);
+
+                    // Build output row: group_by columns + aggregate values
+                    let mut output_values = group_key.clone();
+
+                    // Process aggregates in the order they appear in output_column_names
+                    // Skip the group-by columns
+                    let start_idx = self.group_by.len();
+                    for col_name in &self.output_column_names[start_idx..] {
+                        // Check if this is a MIN column
+                        if col_name.starts_with("min_") || col_name.starts_with("MIN(") {
+                            // Extract the source column name
+                            let source_col = if col_name.starts_with("min_") {
+                                &col_name[4..]
+                            } else {
+                                // Handle MIN(column) format
+                                &col_name[4..col_name.len()-1]
+                            };
+
+                            if self.minmax_columns.contains_key(source_col) {
+                                let min_value = return_if_io!(self.read_min_value(&group_key_str, source_col, cursors));
+                                println!("  MIN({}) = {:?}", source_col, min_value);
+                                output_values.push(min_value.unwrap_or(Value::Null));
+                            } else {
+                                output_values.push(Value::Null);
+                            }
+                        }
+                        // Check if this is a MAX column
+                        else if col_name.starts_with("max_") || col_name.starts_with("MAX(") {
+                            // Extract the source column name
+                            let source_col = if col_name.starts_with("max_") {
+                                &col_name[4..]
+                            } else {
+                                // Handle MAX(column) format
+                                &col_name[4..col_name.len()-1]
+                            };
+
+                            if self.minmax_columns.contains_key(source_col) {
+                                let max_value = return_if_io!(self.read_max_value(&group_key_str, source_col, cursors));
+                                println!("  MAX({}) = {:?}", source_col, max_value);
+                                output_values.push(max_value.unwrap_or(Value::Null));
+                            } else {
+                                output_values.push(Value::Null);
+                            }
+                        }
+                        // Regular aggregate (COUNT, SUM, AVG)
+                        else {
+                            // Read regular aggregate state
+                            let agg_state = return_if_io!(self.read_regular_aggregate_state(&group_key_str, cursors));
+                            if let Some(state) = agg_state {
+                                let values = state.to_values(&self.regular_aggregates);
+                                println!("  Regular aggregates: {:?}", values);
+                                output_values.extend(values);
+                            } else {
+                                // No state found, use defaults
+                                for _ in &self.regular_aggregates {
+                                    output_values.push(Value::Null);
+                                }
+                            }
+                        }
+                    }
+
+                    println!("  Complete output row: {:?}", output_values);
+                    let result_key = self.generate_group_rowid(&group_key_str);
+                    let output_row = HashableRow::new(result_key, output_values);
+                    output_delta.changes.push((output_row, 1));
+                }
+
+                *state = EvalState::Done;
+                Ok(IOResult::Done(output_delta))
+            }
+            _ => panic!("UnifiedAggregateOperator doesn't support complex eval states"),
+        }
+    }
+
+    fn commit(
+        &mut self,
+        _deltas: DeltaPair,
+        _cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Delta>> {
+        // TODO: Implement commit logic that handles both regular and MIN/MAX aggregates
+        // For now, return empty delta
+        Ok(IOResult::Done(Delta::new()))
+    }
+
+    fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
+        self.tracker = Some(tracker);
+    }
+}

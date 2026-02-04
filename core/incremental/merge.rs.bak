@@ -1,0 +1,143 @@
+use super::operator::{ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator};
+use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
+use crate::types::IOResult;
+use crate::{Result, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// Merge operator - combines outputs from multiple parallel operators
+/// that computed different parts of the same logical operation
+#[derive(Debug)]
+pub struct MergeOperator {
+    /// Column indices to take from each input operator
+    /// e.g., [(0, [0, 1]), (1, [0, 2, 3])] means:
+    /// - From input 0, take columns 0 and 1
+    /// - From input 1, take columns 0, 2, and 3
+    input_column_mapping: Vec<(usize, Vec<usize>)>,
+
+    /// The group-by columns (same across all inputs)
+    group_by_count: usize,
+}
+
+impl MergeOperator {
+    pub fn new(input_column_mapping: Vec<(usize, Vec<usize>)>, group_by_count: usize) -> Self {
+        Self {
+            input_column_mapping,
+            group_by_count,
+        }
+    }
+
+    /// Convert group key to string for HashMap key (since Value doesn't implement Hash)
+    fn group_key_to_string(group_key: &[Value]) -> String {
+        group_key
+            .iter()
+            .map(|v| match v {
+                Value::Text(t) => String::from_utf8_lossy(&t.value).to_string(),
+                Value::Integer(i) => i.to_string(),
+                Value::Float(f) => f.to_string(),
+                Value::Null => "NULL".to_string(),
+                _ => format!("{:?}", v),
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Merge deltas from multiple inputs into a single output delta
+    fn merge_deltas(&self, left_delta: &Delta, right_delta: &Delta) -> Delta {
+        let mut output_delta = Delta::new();
+
+        // Build maps from group key to rows for each input
+        let mut left_groups: HashMap<String, (Vec<Value>, Vec<Value>)> = HashMap::new();
+        let mut right_groups: HashMap<String, (Vec<Value>, Vec<Value>)> = HashMap::new();
+
+        // Process left delta
+        for (row, weight) in &left_delta.changes {
+            if *weight > 0 {  // Only consider positive weights for now
+                let group_key: Vec<Value> = row.values[..self.group_by_count].to_vec();
+                let group_key_str = Self::group_key_to_string(&group_key);
+                left_groups.insert(group_key_str, (group_key, row.values.clone()));
+            }
+        }
+
+        // Process right delta
+        for (row, weight) in &right_delta.changes {
+            if *weight > 0 {  // Only consider positive weights for now
+                let group_key: Vec<Value> = row.values[..self.group_by_count].to_vec();
+                let group_key_str = Self::group_key_to_string(&group_key);
+                right_groups.insert(group_key_str, (group_key, row.values.clone()));
+            }
+        }
+
+        // Merge groups that appear in both
+        for (group_key_str, (group_key, left_values)) in &left_groups {
+            if let Some((_, right_values)) = right_groups.get(group_key_str) {
+                // Build merged row: group_by columns + selected columns from each input
+                let mut merged_values = group_key.clone();
+
+                // Add non-group-by columns from left
+                for idx in self.group_by_count..left_values.len() {
+                    merged_values.push(left_values[idx].clone());
+                }
+
+                // Add non-group-by columns from right
+                for idx in self.group_by_count..right_values.len() {
+                    merged_values.push(right_values[idx].clone());
+                }
+
+                // Generate a rowid based on group key
+                let rowid = group_key.iter().fold(0i64, |acc, v| {
+                    acc.wrapping_mul(31).wrapping_add(match v {
+                        Value::Integer(i) => *i,
+                        Value::Text(t) => t.value.iter().fold(0i64, |a, b| a.wrapping_add(*b as i64)),
+                        _ => 0,
+                    })
+                });
+
+                let output_row = HashableRow::new(rowid, merged_values);
+                output_delta.changes.push((output_row, 1));
+            }
+        }
+
+        output_delta
+    }
+}
+
+impl IncrementalOperator for MergeOperator {
+    fn eval(
+        &mut self,
+        state: &mut EvalState,
+        _cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Delta>> {
+        match state {
+            EvalState::Uninitialized => {
+                panic!("Cannot eval MergeOperator with Uninitialized state");
+            }
+            EvalState::Init { deltas } => {
+                println!("[MergeOperator] Merging {} left changes with {} right changes",
+                    deltas.left.changes.len(), deltas.right.changes.len());
+
+                let output = self.merge_deltas(&deltas.left, &deltas.right);
+
+                println!("[MergeOperator] Produced {} output rows", output.changes.len());
+
+                *state = EvalState::Done;
+                Ok(IOResult::Done(output))
+            }
+            _ => panic!("MergeOperator doesn't support complex eval states"),
+        }
+    }
+
+    fn commit(
+        &mut self,
+        deltas: DeltaPair,
+        _cursors: &mut DbspStateCursors,
+    ) -> Result<IOResult<Delta>> {
+        // For commit, just merge the deltas
+        let output = self.merge_deltas(&deltas.left, &deltas.right);
+        Ok(IOResult::Done(output))
+    }
+
+    fn set_tracker(&mut self, _tracker: Arc<Mutex<ComputationTracker>>) {
+        // MergeOperator doesn't need tracking
+    }
+}

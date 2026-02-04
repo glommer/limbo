@@ -1,0 +1,447 @@
+// Query decomposition - converts SQL AST to operator DAG
+// Inspired by Feldera's SQL-to-DBSP compiler but simplified for our needs
+
+use super::operator::{
+    AggregateFunction, AggregateOperator, Delta, FilterOperator, FilterPredicate,
+    IncrementalOperator, OperatorDAG, ProjectColumn, ProjectOperator, QueryOperator,
+};
+use crate::{LimboError, Result};
+use turso_sqlite3_parser::ast;
+
+/// Decomposes a SQL SELECT statement into an operator DAG
+/// Likely lots are still to be done
+pub fn decompose_select(select: &ast::Select) -> Result<OperatorDAG> {
+    let mut dag = OperatorDAG::new();
+
+    // For now, create a simple demonstration DAG
+    // Real implementation would extract table names, columns, etc. from the AST
+
+    // Step 1: Table scan (source of data)
+    let table_idx = dag.add_operator(QueryOperator::TableScan {
+        table_name: "items".to_string(),
+        column_names: vec!["id".to_string(), "name".to_string(), "status".to_string()],
+    });
+
+    // Step 2: Filter (WHERE clause) - using centralized parser
+    let predicate = FilterPredicate::from_select(select);
+    let filter_idx = if !matches!(predicate, FilterPredicate::None) {
+        dag.add_operator(QueryOperator::Filter {
+            predicate,
+            input: table_idx,
+        })
+    } else {
+        table_idx
+    };
+
+    // Step 3: Check for GROUP BY and aggregates
+    let (group_by, aggregates) = extract_group_by_and_aggregates(select);
+
+    let agg_idx = if !group_by.is_empty() || !aggregates.is_empty() {
+        dag.add_operator(QueryOperator::Aggregate {
+            group_by,
+            aggregates,
+            input: filter_idx,
+        })
+    } else {
+        filter_idx
+    };
+
+    // Step 4: Project (SELECT columns)
+    let _project_idx = dag.add_operator(QueryOperator::Project {
+        columns: vec![ProjectColumn::Column("*".to_string())],
+        input: agg_idx,
+    });
+
+    Ok(dag)
+}
+
+/// Extract GROUP BY columns and aggregate functions from a SELECT statement
+pub fn extract_group_by_and_aggregates(
+    select: &ast::Select,
+) -> (Vec<String>, Vec<AggregateFunction>) {
+    let mut group_by = Vec::new();
+    let mut aggregates = Vec::new();
+
+    // Extract from OneSelect::Select if present
+    if let ast::OneSelect::Select(ref select_inner) = &*select.body.select {
+        // Extract GROUP BY columns
+        if let Some(ref group) = select_inner.group_by {
+            // GroupBy has exprs field
+            for expr in &group.exprs {
+                if let Some(col_name) = extract_column_name(expr) {
+                    group_by.push(col_name);
+                }
+            }
+        }
+
+        // Extract aggregate functions from SELECT list
+        for result_col in &select_inner.columns {
+            if let ast::ResultColumn::Expr(expr, _) = result_col {
+                if let ast::Expr::FunctionCall { name, args, .. } = expr {
+                    let func_name = name.as_str().to_uppercase();
+                    match func_name.as_str() {
+                        "COUNT" => {
+                            aggregates.push(AggregateFunction::Count);
+                        }
+                        "SUM" => {
+                            if let Some(args) = args {
+                                if let Some(arg) = args.first() {
+                                    if let Some(col_name) = extract_column_name(arg) {
+                                        aggregates.push(AggregateFunction::Sum(col_name));
+                                    }
+                                }
+                            }
+                        }
+                        "AVG" => {
+                            if let Some(args) = args {
+                                if let Some(arg) = args.first() {
+                                    if let Some(col_name) = extract_column_name(arg) {
+                                        aggregates.push(AggregateFunction::Avg(col_name));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    (group_by, aggregates)
+}
+
+/// Extract column name from an expression
+fn extract_column_name(expr: &ast::Expr) -> Option<String> {
+    match expr {
+        ast::Expr::Id(name) => Some(name.as_str().to_string()),
+        ast::Expr::Qualified(name, _) => Some(name.as_str().to_string()),
+        _ => None,
+    }
+}
+
+/// Executes an operator DAG on a delta
+pub fn execute_dag(
+    dag: &OperatorDAG,
+    input_delta: Delta,
+    column_names: Vec<String>,
+) -> Result<Delta> {
+    // For now, handle simple linear DAGs
+    // Real implementation would topologically sort and handle complex graphs
+
+    let mut current_delta = input_delta;
+    let mut current_columns = column_names;
+
+    for operator in &dag.operators {
+        match operator {
+            QueryOperator::TableScan { .. } => {
+                // Table scan is the source, just pass through
+            }
+            QueryOperator::Filter { predicate, .. } => {
+                let mut filter_op = FilterOperator::new(predicate.clone(), current_columns.clone());
+                if let Some(tracker) = &dag.tracker {
+                    filter_op.set_tracker(tracker.clone());
+                }
+                filter_op.initialize(current_delta.clone());
+                current_delta = filter_op.get_current_state();
+            }
+            QueryOperator::Project { columns, .. } => {
+                let mut project_op = ProjectOperator::new(columns.clone(), current_columns.clone());
+                if let Some(tracker) = &dag.tracker {
+                    project_op.set_tracker(tracker.clone());
+                }
+                project_op.initialize(current_delta.clone());
+                current_delta = project_op.get_current_state();
+
+                // Update column names after projection
+                current_columns = columns
+                    .iter()
+                    .map(|c| match c {
+                        ProjectColumn::Column(name) => name.clone(),
+                        ProjectColumn::Expression { alias, .. } => {
+                            alias.clone().unwrap_or_else(|| "expr".to_string())
+                        }
+                    })
+                    .collect();
+            }
+            QueryOperator::Join { .. } => {
+                return Err(LimboError::ParseError(
+                    "JOIN execution in DAG not yet fully integrated".to_string(),
+                ));
+            }
+            QueryOperator::Aggregate {
+                group_by,
+                aggregates,
+                ..
+            } => {
+                let mut agg_op = AggregateOperator::new(
+                    group_by.clone(),
+                    aggregates.clone(),
+                    current_columns.clone(),
+                );
+                if let Some(tracker) = &dag.tracker {
+                    agg_op.set_tracker(tracker.clone());
+                }
+                agg_op.initialize(current_delta.clone());
+                current_delta = agg_op.get_current_state().clone();
+
+                // Update column names after aggregation
+                current_columns = group_by.clone();
+                for agg in aggregates {
+                    match agg {
+                        AggregateFunction::Count => current_columns.push("count".to_string()),
+                        AggregateFunction::Sum(col) => current_columns.push(format!("sum_{}", col)),
+                        AggregateFunction::Avg(col) => current_columns.push(format!("avg_{}", col)),
+                        AggregateFunction::Min(col) => current_columns.push(format!("min_{}", col)),
+                        AggregateFunction::Max(col) => current_columns.push(format!("max_{}", col)),
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(current_delta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::incremental::operator::{
+        ComputationTracker, FilterOperator, FilterPredicate, IncrementalOperator,
+        ProjectColumn, ProjectOperator, QueryOperator,
+    };
+    use crate::types::Text;
+    use crate::Value;
+    use fallible_iterator::FallibleIterator;
+    use std::sync::{Arc, Mutex};
+    use turso_sqlite3_parser::{ast::Cmd, lexer::sql::Parser};
+
+    #[test]
+    fn test_simple_select_decomposes_to_filter_and_project() {
+        let query = "SELECT id, name FROM items WHERE status = 'active'";
+        let view_sql = format!("CREATE VIEW test AS {}", query);
+
+        let mut parser = Parser::new(view_sql.as_bytes());
+        let cmd = parser.next().unwrap().unwrap();
+
+        if let Cmd::Stmt(turso_sqlite3_parser::ast::Stmt::CreateView { select, .. }) = cmd {
+            let dag = decompose_select(&select).unwrap();
+
+            // Should have: TableScan -> Filter -> Project
+            assert_eq!(dag.operators.len(), 3);
+            assert!(matches!(dag.operators[0], QueryOperator::TableScan { .. }));
+            assert!(matches!(dag.operators[1], QueryOperator::Filter { .. }));
+            assert!(matches!(dag.operators[2], QueryOperator::Project { .. }));
+        } else {
+            panic!("Failed to parse view");
+        }
+    }
+
+    #[test]
+    fn test_filter_processes_only_delta() {
+        let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
+
+        // Create a filter for "status = 'active'"
+        let predicate = FilterPredicate::Equals {
+            column: "status".to_string(),
+            value: Value::Text(Text::new("active")),
+        };
+        let column_names = vec!["id".to_string(), "name".to_string(), "status".to_string()];
+
+        let mut filter = FilterOperator::new(predicate, column_names);
+        filter.set_tracker(tracker.clone());
+
+        // Process initial data
+        let mut initial = Delta::new();
+        for i in 0..100 {
+            let status = if i % 2 == 0 { "active" } else { "inactive" };
+            initial.insert(
+                i,
+                vec![
+                    Value::Integer(i),
+                    Value::Text(Text::new(&format!("item_{}", i))),
+                    Value::Text(Text::new(status)),
+                ],
+            );
+        }
+        filter.initialize(initial);
+
+        // Check initial filter count
+        let initial_count = tracker.lock().unwrap().filter_evaluations;
+        assert_eq!(initial_count, 100); // Processed all 100 initial items
+
+        // Reset tracker for delta processing
+        tracker.lock().unwrap().filter_evaluations = 0;
+
+        // Add one row via delta
+        let mut delta = Delta::new();
+        delta.insert(
+            100,
+            vec![
+                Value::Integer(100),
+                Value::Text(Text::new("item_100")),
+                Value::Text(Text::new("active")),
+            ],
+        );
+
+        let output = filter.process_delta(delta);
+
+        // Should only process the delta (1 row), not all 101 rows
+        let delta_count = tracker.lock().unwrap().filter_evaluations;
+        assert_eq!(delta_count, 1);
+
+        // Output should contain the new active row
+        assert_eq!(output.len(), 1);
+        assert!(output.changes.contains_key(&100));
+
+        // Verify incremental behavior
+        tracker.lock().unwrap().assert_incremental(1, 101);
+    }
+
+    #[test]
+    fn test_project_operator_selects_columns() {
+        let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
+
+        let columns = vec![
+            ProjectColumn::Column("id".to_string()),
+            ProjectColumn::Column("name".to_string()),
+        ];
+        let input_columns = vec!["id".to_string(), "name".to_string(), "status".to_string()];
+
+        let mut project = ProjectOperator::new(columns, input_columns);
+        project.set_tracker(tracker.clone());
+
+        // Create input data with 3 columns
+        let mut delta = Delta::new();
+        delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text(Text::new("Alice")),
+                Value::Text(Text::new("active")),
+            ],
+        );
+
+        project.initialize(delta);
+        let output = project.get_current_state();
+
+        // Output should have only 2 columns (id, name)
+        assert_eq!(output.len(), 1);
+        let change = &output.changes.iter().find(|(k, _)| *k == 1).unwrap().1;
+        assert_eq!(change.values.len(), 2);
+        assert_eq!(change.values[0], Value::Integer(1));
+        assert_eq!(change.values[1], Value::Text(Text::new("Alice")));
+
+        // Should have recorded one projection
+        assert_eq!(tracker.lock().unwrap().project_operations, 1);
+    }
+
+    #[test]
+    fn test_filter_and_project_composition() {
+        let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
+
+        // Create a simple DAG: Filter -> Project
+        let mut dag = OperatorDAG::new();
+        dag.set_tracker(tracker.clone());
+
+        dag.add_operator(QueryOperator::TableScan {
+            table_name: "items".to_string(),
+            column_names: vec!["id".to_string(), "name".to_string(), "status".to_string()],
+        });
+
+        dag.add_operator(QueryOperator::Filter {
+            predicate: FilterPredicate::Equals {
+                column: "status".to_string(),
+                value: Value::Text(Text::new("active")),
+            },
+            input: 0,
+        });
+
+        dag.add_operator(QueryOperator::Project {
+            columns: vec![
+                ProjectColumn::Column("id".to_string()),
+                ProjectColumn::Column("name".to_string()),
+            ],
+            input: 1,
+        });
+
+        // Create test data
+        let mut input_delta = Delta::new();
+        input_delta.insert(
+            1,
+            vec![
+                Value::Integer(1),
+                Value::Text(Text::new("Item1")),
+                Value::Text(Text::new("active")),
+            ],
+        );
+        input_delta.insert(
+            2,
+            vec![
+                Value::Integer(2),
+                Value::Text(Text::new("Item2")),
+                Value::Text(Text::new("inactive")),
+            ],
+        );
+
+        let column_names = vec!["id".to_string(), "name".to_string(), "status".to_string()];
+        let output = execute_dag(&dag, input_delta, column_names).unwrap();
+
+        // Should only have the active item, with only id and name columns
+        assert_eq!(output.len(), 1);
+        assert!(output.changes.iter().any(|(k, _)| *k == 1));
+        let change = &output.changes.iter().find(|(k, _)| *k == 1).unwrap().1;
+        assert_eq!(change.values.len(), 2); // Only id and name
+
+        // Check computation counts
+        let tracker_guard = tracker.lock().unwrap();
+        assert_eq!(tracker_guard.filter_evaluations, 2); // Filtered 2 rows
+        assert_eq!(tracker_guard.project_operations, 1); // Projected 1 row (after filter)
+    }
+
+    #[test]
+    fn test_incremental_update_after_initial_load() {
+        let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
+
+        let predicate = FilterPredicate::GreaterThan {
+            column: "value".to_string(),
+            value: Value::Integer(50),
+        };
+        let column_names = vec!["id".to_string(), "value".to_string()];
+
+        let mut filter = FilterOperator::new(predicate, column_names);
+        filter.set_tracker(tracker.clone());
+
+        // Load initial data
+        let mut initial = Delta::new();
+        for i in 0..100 {
+            initial.insert(i, vec![Value::Integer(i), Value::Integer(i as i64)]);
+        }
+        filter.initialize(initial);
+
+        // Initial state should have 49 items (51-99)
+        let state = filter.get_current_state();
+        assert_eq!(state.len(), 49);
+
+        // Reset tracker
+        tracker.lock().unwrap().filter_evaluations = 0;
+
+        // Add new items incrementally
+        let mut delta = Delta::new();
+        delta.insert(100, vec![Value::Integer(100), Value::Integer(100)]);
+        delta.insert(101, vec![Value::Integer(101), Value::Integer(25)]); // Won't pass filter
+
+        let output = filter.process_delta(delta);
+
+        // Should only process 2 new items
+        assert_eq!(tracker.lock().unwrap().filter_evaluations, 2);
+
+        // Output should have only item 100
+        assert_eq!(output.len(), 1);
+        assert!(output.changes.contains_key(&100));
+
+        // State should now have 50 items
+        let final_state = filter.get_current_state();
+        assert_eq!(final_state.len(), 50);
+    }
+}

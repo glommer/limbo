@@ -1,0 +1,213 @@
+diff --git a/core/vdbe/execute.rs b/core/vdbe/execute.rs
+index current..optimized 100644
+--- a/core/vdbe/execute.rs
++++ b/core/vdbe/execute.rs
+@@ -6479,28 +6479,23 @@ pub fn op_program(
+ 
+     // Execute the subprogram instructions
+ 
+-    // Push the current frame onto the stack so nested Program instructions can check for recursion
+-    state.frame_stack.push(frame);
+-
+-    // Pop the frame back off to work with it
+-    let mut frame = state.frame_stack.pop().unwrap();
+-
+     // Save parent's registers and swap in frame's registers
+-    let saved_parent_registers = std::mem::replace(&mut state.registers, frame.registers);
++    let mut frame_registers = frame.registers;
++    let saved_parent_registers = std::mem::swap(&mut state.registers, &mut frame_registers);
+     let saved_parent_pc = state.pc;
+ 
+-    // Push frame back onto stack for recursion checking during execution
++    // Push frame onto stack for recursion checking during execution
++    // Store the parent registers in the frame on the stack
+     state.frame_stack.push(VdbeFrame {
+         subprogram: frame.subprogram.clone(),
+-        pc: frame.pc,
+-        parent_saved_pc: frame.parent_saved_pc,
+-        registers: vec![], // Temporary placeholder - registers are in state now
+-        base_reg: frame.base_reg,
+-        ignore_jump: frame.ignore_jump.clone(),
+-        token: frame.token,
+-        input_registers: frame.input_registers.clone(),
+-        return_registers: frame.return_registers.clone(),
++        pc: 0,
++        parent_saved_pc: saved_parent_pc,
++        registers: saved_parent_registers, // Store parent registers here
++        base_reg: frame.base_reg,
++        ignore_jump: frame.ignore_jump,
++        token: frame.token,
++        input_registers: frame.input_registers,
++        return_registers: frame.return_registers,
+     });
+ 
+     // Execute subprogram instructions using the normal instruction execution
+-    while frame.pc < frame.subprogram.instructions.len() {
+-        let sub_insn = &frame.subprogram.instructions[frame.pc];
++    let mut pc = 0usize;
++    let instructions = &frame.subprogram.instructions;
++    
++    while pc < instructions.len() {
++        let sub_insn = &instructions[pc];
+ 
+         // Update state's PC to the frame's PC for proper instruction execution
+-        state.pc = frame.pc as u32;
++        state.pc = pc as u32;
+ 
+         // Get the function for this instruction and execute it
+         let sub_fn = sub_insn.to_function();
+@@ -6516,7 +6511,7 @@ pub fn op_program(
+         match sub_fn(program, state, sub_insn, pager, mv_store) {
+             Ok(InsnFunctionStepResult::Step) => {
+                 // Update frame's PC from state's PC (instruction may have modified it)
+-                frame.pc = state.pc as usize;
++                pc = state.pc as usize;
+             }
+             Ok(InsnFunctionStepResult::Done) => {
+                 // Subprogram completed (hit Halt)
+@@ -6524,8 +6519,11 @@ pub fn op_program(
+             }
+             Ok(InsnFunctionStepResult::Row) => {
+                 // Subprograms should not generate rows - restore parent state and error
+-                state.registers = saved_parent_registers;
+-                state.pc = saved_parent_pc;
++                if let Some(frame) = state.frame_stack.pop() {
++                    state.registers = frame.registers; // Restore parent registers
++                    state.pc = frame.parent_saved_pc;
++                }
+ 
+                 // Remove the frame from stack before returning error
+-                state.frame_stack.pop();
+ 
+                 return Err(LimboError::InternalError(format!(
+                     "Subprogram '{}' attempted to generate a row, which is not allowed",
+@@ -6537,11 +6535,14 @@ pub fn op_program(
+             }
+             Ok(InsnFunctionStepResult::IO(io)) => {
+                 // Need to save frame state and restore parent state for I/O
+-                frame.registers = std::mem::replace(&mut state.registers, saved_parent_registers);
+-                frame.pc = state.pc as usize;
+-                state.pc = saved_parent_pc;
+-
+                 // Update the frame on the stack with current state
+                 if let Some(stack_frame) = state.frame_stack.last_mut() {
+-                    stack_frame.pc = frame.pc;
+-                    stack_frame.registers = frame.registers;
++                    // Swap current registers with parent registers stored in frame
++                    std::mem::swap(&mut state.registers, &mut stack_frame.registers);
++                    stack_frame.pc = pc;
++                    state.pc = stack_frame.parent_saved_pc;
+                 }
+ 
+                 return Ok(InsnFunctionStepResult::IO(io));
+             }
+-            Ok(InsnFunctionStepResult::Interrupt) => {
+-                // Save frame state and restore parent state
+-                frame.registers = std::mem::replace(&mut state.registers, saved_parent_registers);
+-                frame.pc = state.pc as usize;
+-                state.pc = saved_parent_pc;
+-
+-                // Update the frame on the stack with current state
+-                if let Some(stack_frame) = state.frame_stack.last_mut() {
+-                    stack_frame.pc = frame.pc;
+-                    stack_frame.registers = frame.registers;
+-                }
+-                return Ok(InsnFunctionStepResult::Interrupt);
+-            }
+-            Ok(InsnFunctionStepResult::Busy) => {
++            Ok(result @ (InsnFunctionStepResult::Interrupt | InsnFunctionStepResult::Busy)) => {
+                 // Save frame state and restore parent state
+-                frame.registers = std::mem::replace(&mut state.registers, saved_parent_registers);
+-                frame.pc = state.pc as usize;
+-                state.pc = saved_parent_pc;
+-
+                 // Update the frame on the stack with current state
+                 if let Some(stack_frame) = state.frame_stack.last_mut() {
+-                    stack_frame.pc = frame.pc;
+-                    stack_frame.registers = frame.registers;
++                    // Swap current registers with parent registers stored in frame
++                    std::mem::swap(&mut state.registers, &mut stack_frame.registers);
++                    stack_frame.pc = pc;
++                    state.pc = stack_frame.parent_saved_pc;
+                 }
+-                return Ok(InsnFunctionStepResult::Busy);
++                return Ok(result);
+             }
+             Err(err) => {
+                 // Restore parent state on error
+-                state.registers = saved_parent_registers;
+-                state.pc = saved_parent_pc;
+-
+-                // Remove the frame from stack before returning error
+-                state.frame_stack.pop();
++                if let Some(frame) = state.frame_stack.pop() {
++                    state.registers = frame.registers; // Restore parent registers
++                    state.pc = frame.parent_saved_pc;
++                }
+ 
+                 return Err(err);
+             }
+@@ -6591,17 +6570,15 @@ pub fn op_program(
+     }
+ 
+     // Check if the frame was already popped (by RAISE(IGNORE))
+-    let frame_was_popped = state.frame_stack.is_empty()
+-        || state
+-            .frame_stack
+-            .last()
+-            .map(|f| f.token != frame.token)
+-            .unwrap_or(true);
++    if state.frame_stack.is_empty() || 
++       state.frame_stack.last().map_or(true, |f| f.token != frame.token) {
+ 
+-    if frame_was_popped {
+         // Frame was already popped (e.g., by RAISE(IGNORE) in halt())
+         // The PC has already been set to the correct location, so just restore registers
+-        state.registers = saved_parent_registers;
++        // Parent registers are already restored by RAISE(IGNORE) handler
+         return Ok(InsnFunctionStepResult::Step);
+     }
+ 
+-    // Get the frame's registers back before copying results
+-    frame.registers = std::mem::replace(&mut state.registers, saved_parent_registers);
++    // Pop the frame and restore parent state
++    let stack_frame = state.frame_stack.pop().unwrap();
++    let mut subprogram_registers = state.registers;
++    state.registers = stack_frame.registers; // Restore parent registers
+ 
+     // If return_registers is specified, copy subprogram's registers to parent
+-    if let Some(ref mapping) = frame.return_registers {
++    if let Some(ref mapping) = stack_frame.return_registers {
+         // Validate that destination registers exist in parent
+         let dest_end = mapping.dest_start + mapping.count;
+         if dest_end > state.registers.len() {
+             return Err(LimboError::InternalError(format!(
+                 "Subprogram '{}' tried to write results to registers {}-{}, but parent only has {} registers",
+-                frame.subprogram.name,
++                stack_frame.subprogram.name,
+                 mapping.dest_start,
+                 dest_end - 1,
+                 state.registers.len()
+@@ -6611,8 +6588,8 @@ pub fn op_program(
+         
+         // Copy subprogram's registers [0..count) to parent's [dest_start..dest_start+count)
+         for i in 0..mapping.count {
+-            if i < frame.registers.len() {
+-                state.registers[mapping.dest_start + i] = frame.registers[i].clone();
++            if i < subprogram_registers.len() {
++                state.registers[mapping.dest_start + i] = subprogram_registers[i].clone();
+             }
+         }
+     }
+ 
+-    // Remove the frame from the stack (it was there for recursion checking)
+-    state.frame_stack.pop();
+-
+     // Subprogram completed successfully
+-
+     // Restore the parent's PC and advance to next instruction
+-    state.pc = frame.parent_saved_pc + 1;
++    state.pc = stack_frame.parent_saved_pc + 1;
+ 
+     Ok(InsnFunctionStepResult::Step)
+ }

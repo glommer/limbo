@@ -1,0 +1,43 @@
+--- a/core/incremental/minmax.rs
++++ b/core/incremental/minmax.rs
+@@ -523,9 +523,9 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::incremental::dbsp::HashableRow;
+-    use crate::incremental::operator::{create_dbsp_state_index, DbspStateCursors, DeltaPair, EvalState, IncrementalOperator, StorageKeyType};
++    use crate::incremental::dbsp::{DeltaPair, HashableRow};
++    use crate::incremental::operator::{DbspStateCursors, EvalState, IncrementalOperator};
++    use crate::storage::btree::BTreeCursor;
+     use crate::storage::pager::CreateBTreeFlags;
+-    use crate::types::Text;
++    use crate::schema::Index;
++    use crate::types::{OwnedValue, Text};
+     use crate::util::IOExt;
+@@ -560,5 +560,5 @@
+ 
+     /// Helper to create test data
+     fn create_test_text(s: &str) -> Value {
+-        Value::Text(Text::from_string(s.to_string()))
++        Value::Text(Text { value: s.as_bytes().to_vec(), subtype: crate::types::TextSubtype::Text })
+     }
+@@ -589,8 +589,18 @@
+         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+ 
+         // Create the index
+-        pager.io.block(|| create_dbsp_state_index(&pager, index_root_page_id, table_root_page_id)).unwrap();
++        let index_def = Index::dbsp_state_index(index_root_page_id);
++        pager.io.block(|| {
++            crate::incremental::operator::create_dbsp_state_index(index_root_page_id)
++        });
+ 
+-        let mut cursors = DbspStateCursors::new(&pager, table_root_page_id, index_root_page_id);
++        // Create table cursor with 5 columns
++        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
++        
++        // Create index cursor with 4 columns
++        let index_cursor = BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
++        
++        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+ 
+         // Create MinMaxOperator for MIN(price), MAX(price) with no GROUP BY

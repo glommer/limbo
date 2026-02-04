@@ -1,0 +1,7 @@
+CREATE TABLE part (p_partkey INTEGER, p_size INTEGER);
+INSERT INTO part VALUES (1, 3), (2, 7);
+
+CREATE MATERIALIZED VIEW v AS
+SELECT p_partkey FROM part WHERE p_size BETWEEN 1 AND 5;
+
+SELECT * FROM v;

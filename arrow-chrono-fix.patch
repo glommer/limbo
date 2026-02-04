@@ -1,0 +1,11 @@
+--- a/arrow-arith/src/temporal.rs
++++ b/arrow-arith/src/temporal.rs
+@@ -88,7 +88,7 @@ where
+         DatePart::Year => |d| d.year(),
+         DatePart::Month => |d| d.month() as i32,
+         DatePart::Week => |d| d.iso_week().week() as i32,
+-        DatePart::Quarter => |d| d.quarter() as i32,
++        DatePart::Quarter => |d| d.quarter0() as i32 + 1,
+         DatePart::Day => |d| d.day() as i32,
+         DatePart::DayOfWeekSunday0 => |d| d.weekday().num_days_from_sunday() as i32,
+         DatePart::DayOfWeekMonday0 => |d| d.weekday().num_days_from_monday() as i32,
