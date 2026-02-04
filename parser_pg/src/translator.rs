@@ -33,7 +33,7 @@ impl PostgreSQLTranslator {
     }
 
     /// Translate a PostgreSQL parse result into Turso's format
-    pub fn translate(&self, parse_result: &ParseResult) -> Result<TranslatedQuery, ParseError> {
+    pub fn translate(&self, parse_result: &ParseResult) -> Result<ast::Stmt, ParseError> {
         // The pg_query ParseResult contains a protobuf representation
         // We need to walk the AST nodes and convert them
 
@@ -45,11 +45,14 @@ impl PostgreSQLTranslator {
         let node = &parse_result.protobuf.nodes()[0];
 
         match &node.0 {
-            NodeRef::SelectStmt(select) => self.translate_select(select),
-            NodeRef::InsertStmt(_insert) => self.translate_insert(),
-            NodeRef::UpdateStmt(_update) => self.translate_update(),
-            NodeRef::DeleteStmt(_delete) => self.translate_delete(),
-            NodeRef::CreateStmt(_create) => self.translate_create_table(),
+            NodeRef::SelectStmt(select) => {
+                let select_ast = self.translate_select(select)?;
+                Ok(ast::Stmt::Select(select_ast))
+            },
+            NodeRef::InsertStmt(_insert) => Err(ParseError::ParseError("INSERT statements not yet supported".to_string())),
+            NodeRef::UpdateStmt(_update) => Err(ParseError::ParseError("UPDATE statements not yet supported".to_string())),
+            NodeRef::DeleteStmt(_delete) => Err(ParseError::ParseError("DELETE statements not yet supported".to_string())),
+            NodeRef::CreateStmt(_create) => Err(ParseError::ParseError("CREATE statements not yet supported".to_string())),
             _ => Err(ParseError::ParseError(format!(
                 "Unsupported statement type: {:?}",
                 node.0
@@ -57,7 +60,7 @@ impl PostgreSQLTranslator {
         }
     }
 
-    fn translate_select(&self, select: &pg_query::protobuf::SelectStmt) -> Result<TranslatedQuery, ParseError> {
+    fn translate_select(&self, select: &pg_query::protobuf::SelectStmt) -> Result<ast::Select, ParseError> {
         // Translate PostgreSQL SELECT to turso_parser AST
 
         // 1. Handle FROM clause first to get the base table(s)
@@ -106,7 +109,7 @@ impl PostgreSQLTranslator {
             limit: None,
         };
 
-        Ok(TranslatedQuery::Select(select_ast))
+        Ok(select_ast)
     }
 
     fn translate_from_clause(&self, from_item: &pg_query::protobuf::Node) -> Result<ast::FromClause, ParseError> {
@@ -281,36 +284,6 @@ impl PostgreSQLTranslator {
         Ok(ast::Expr::Binary(left, binary_op, right))
     }
 
-    fn translate_insert(&self) -> Result<TranslatedQuery, ParseError> {
-        // TODO: Translate INSERT
-        Err(ParseError::ParseError("INSERT translation not yet implemented".to_string()))
-    }
-
-    fn translate_update(&self) -> Result<TranslatedQuery, ParseError> {
-        // TODO: Translate UPDATE
-        Err(ParseError::ParseError("UPDATE translation not yet implemented".to_string()))
-    }
-
-    fn translate_delete(&self) -> Result<TranslatedQuery, ParseError> {
-        // TODO: Translate DELETE
-        Err(ParseError::ParseError("DELETE translation not yet implemented".to_string()))
-    }
-
-    fn translate_create_table(&self) -> Result<TranslatedQuery, ParseError> {
-        // TODO: Translate CREATE TABLE
-        // Need to map PostgreSQL types to SQLite types
-        Err(ParseError::ParseError("CREATE TABLE translation not yet implemented".to_string()))
-    }
-}
-
-/// Result of translating a PostgreSQL query
-#[derive(Debug)]
-pub enum TranslatedQuery {
-    Select(ast::Select),
-    Insert(String), // Placeholder
-    Update(String), // Placeholder
-    Delete(String), // Placeholder
-    CreateTable(String), // Placeholder
 }
 
 /// PostgreSQL to SQLite type mapping
@@ -381,7 +354,7 @@ mod tests {
 
         assert!(translated.is_ok());
 
-        if let Ok(TranslatedQuery::Select(select)) = translated {
+        if let Ok(ast::Stmt::Select(select)) = translated {
             // Check the select body
             if let ast::OneSelect::Select { columns, from, where_clause, .. } = &select.body.select {
                 // Should have one result column (*)
@@ -408,7 +381,7 @@ mod tests {
         let parse_result = crate::parse(sql).unwrap();
         let translated = translator.translate(&parse_result).unwrap();
 
-        if let TranslatedQuery::Select(select) = translated {
+        if let ast::Stmt::Select(select) = translated {
             if let ast::OneSelect::Select { from, .. } = &select.body.select {
                 if let Some(from_clause) = from {
                     if let ast::SelectTable::Table(qualified_name, _, _) = &*from_clause.select {
@@ -435,7 +408,7 @@ mod tests {
         let translated = translator.translate(&parse_result);
         assert!(translated.is_ok());
 
-        if let Ok(TranslatedQuery::Select(select)) = translated {
+        if let Ok(ast::Stmt::Select(select)) = translated {
             if let ast::OneSelect::Select { columns, from, .. } = &select.body.select {
                 // Should have one result column: *
                 assert_eq!(columns.len(), 1);
@@ -478,7 +451,7 @@ mod tests {
             let translated = translator.translate(&parse_result);
             assert!(translated.is_ok(), "Failed to translate: {} ({})", sql, description);
 
-            if let Ok(TranslatedQuery::Select(select)) = translated {
+            if let Ok(ast::Stmt::Select(select)) = translated {
                 // Verify it's a valid Select AST
                 match &select.body.select {
                     ast::OneSelect::Select { columns, .. } => {
@@ -498,7 +471,7 @@ mod tests {
         let translated = translator.translate(&parse_result);
         assert!(translated.is_ok());
 
-        if let Ok(TranslatedQuery::Select(select)) = translated {
+        if let Ok(ast::Stmt::Select(select)) = translated {
             if let ast::OneSelect::Select { columns, .. } = &select.body.select {
                 assert_eq!(columns.len(), 3);
 

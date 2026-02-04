@@ -111,6 +111,7 @@ pub use storage::{
 use tracing::{instrument, Level};
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 use turso_parser::{ast, ast::Cmd, parser::Parser};
+use turso_parser_pg;
 pub use types::IOResult;
 pub use types::Value;
 pub use types::ValueRef;

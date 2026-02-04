@@ -6482,6 +6482,7 @@ dependencies = [
  "turso_ext",
  "turso_macros",
  "turso_parser",
+ "turso_parser_pg",
  "twox-hash",
  "uncased",
  "uuid",

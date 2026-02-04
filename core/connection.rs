@@ -214,6 +214,39 @@ impl Connection {
         );
         self.executing_triggers.write().pop();
     }
+
+    /// Parse SQL using the appropriate parser based on the current sql_dialect setting
+    /// Returns the parsed command and the number of bytes consumed
+    fn parse_sql(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        match self.get_sql_dialect() {
+            SqlDialect::Sqlite => {
+                let mut parser = Parser::new(sql.as_bytes());
+                let cmd = parser.next_cmd()?;
+                let offset = parser.offset();
+                Ok((cmd, offset))
+            }
+            SqlDialect::Postgres => {
+                let cmd = self.parse_postgresql_sql(sql)?;
+                // For PostgreSQL, we consume the entire input
+                Ok((cmd, sql.len()))
+            }
+        }
+    }
+
+    /// Parse PostgreSQL SQL using pg_query and translate to Turso AST
+    fn parse_postgresql_sql(&self, sql: &str) -> Result<Option<Cmd>> {
+        // Parse using pg_query
+        let parse_result = turso_parser_pg::parse(sql)
+            .map_err(|e| LimboError::ParseError(format!("PostgreSQL parse error: {}", e)))?;
+
+        // Translate to Turso AST
+        let translator = turso_parser_pg::translator::PostgreSQLTranslator::new();
+        let stmt = translator.translate(&parse_result)
+            .map_err(|e| LimboError::ParseError(format!("PostgreSQL translation error: {}", e)))?;
+
+        // Wrap in Cmd
+        Ok(Some(Cmd::Stmt(stmt)))
+    }
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self._prepare(sql)
     }
@@ -231,11 +264,9 @@ impl Connection {
 
         let sql = sql.as_ref();
         tracing::debug!("Preparing: {}", sql);
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
+        let (cmd, byte_offset_end) = self.parse_sql(sql)?;
         let syms = self.syms.read();
         let cmd = cmd.expect("Successful parse on nonempty input string should produce a command");
-        let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
@@ -440,26 +471,54 @@ impl Connection {
         self.maybe_update_schema();
         let sql = sql.as_ref();
         tracing::trace!("Preparing and executing batch: {}", sql);
-        let mut parser = Parser::new(sql.as_bytes());
-        while let Some(cmd) = parser.next_cmd()? {
-            let syms = self.syms.read();
-            let pager = self.pager.load().clone();
-            let byte_offset_end = parser.offset();
-            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
-                .unwrap()
-                .trim();
-            let mode = QueryMode::new(&cmd);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-            let program = translate::translate(
-                self.schema.read().deref(),
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                input,
-            )?;
-            Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
+
+        match self.get_sql_dialect() {
+            SqlDialect::Sqlite => {
+                let mut parser = Parser::new(sql.as_bytes());
+                while let Some(cmd) = parser.next_cmd()? {
+                    let syms = self.syms.read();
+                    let pager = self.pager.load().clone();
+                    let byte_offset_end = parser.offset();
+                    let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+                        .unwrap()
+                        .trim();
+                    let mode = QueryMode::new(&cmd);
+                    let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+                    let program = translate::translate(
+                        self.schema.read().deref(),
+                        stmt,
+                        pager.clone(),
+                        self.clone(),
+                        &syms,
+                        mode,
+                        input,
+                    )?;
+                    Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
+                }
+            },
+            SqlDialect::Postgres => {
+                // For PostgreSQL, parse single statement
+                let (cmd, byte_offset_end) = self.parse_sql(sql)?;
+                if let Some(cmd) = cmd {
+                    let syms = self.syms.read();
+                    let pager = self.pager.load().clone();
+                    let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+                        .unwrap()
+                        .trim();
+                    let mode = QueryMode::new(&cmd);
+                    let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+                    let program = translate::translate(
+                        self.schema.read().deref(),
+                        stmt,
+                        pager.clone(),
+                        self.clone(),
+                        &syms,
+                        mode,
+                        input,
+                    )?;
+                    Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
+                }
+            }
         }
         Ok(())
     }
@@ -472,9 +531,7 @@ impl Connection {
         let sql = sql.as_ref();
         self.maybe_update_schema();
         tracing::trace!("Querying: {}", sql);
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
-        let byte_offset_end = parser.offset();
+        let (cmd, byte_offset_end) = self.parse_sql(sql)?;
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
@@ -523,26 +580,54 @@ impl Connection {
         }
         let sql = sql.as_ref();
         self.maybe_update_schema();
-        let mut parser = Parser::new(sql.as_bytes());
-        while let Some(cmd) = parser.next_cmd()? {
-            let syms = self.syms.read();
-            let pager = self.pager.load().clone();
-            let byte_offset_end = parser.offset();
-            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
-                .unwrap()
-                .trim();
-            let mode = QueryMode::new(&cmd);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-            let program = translate::translate(
-                self.schema.read().deref(),
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                input,
-            )?;
-            Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
+
+        match self.get_sql_dialect() {
+            SqlDialect::Sqlite => {
+                let mut parser = Parser::new(sql.as_bytes());
+                while let Some(cmd) = parser.next_cmd()? {
+                    let syms = self.syms.read();
+                    let pager = self.pager.load().clone();
+                    let byte_offset_end = parser.offset();
+                    let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+                        .unwrap()
+                        .trim();
+                    let mode = QueryMode::new(&cmd);
+                    let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+                    let program = translate::translate(
+                        self.schema.read().deref(),
+                        stmt,
+                        pager.clone(),
+                        self.clone(),
+                        &syms,
+                        mode,
+                        input,
+                    )?;
+                    Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
+                }
+            },
+            SqlDialect::Postgres => {
+                // For PostgreSQL, parse single statement
+                let (cmd, byte_offset_end) = self.parse_sql(sql)?;
+                if let Some(cmd) = cmd {
+                    let syms = self.syms.read();
+                    let pager = self.pager.load().clone();
+                    let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+                        .unwrap()
+                        .trim();
+                    let mode = QueryMode::new(&cmd);
+                    let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+                    let program = translate::translate(
+                        self.schema.read().deref(),
+                        stmt,
+                        pager.clone(),
+                        self.clone(),
+                        &syms,
+                        mode,
+                        input,
+                    )?;
+                    Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
+                }
+            }
         }
         Ok(())
     }
@@ -552,13 +637,12 @@ impl Connection {
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Statement, usize)>> {
-        let mut parser = Parser::new(sql.as_ref().as_bytes());
-        let Some(cmd) = parser.next_cmd()? else {
+        let (cmd, byte_offset_end) = self.parse_sql(sql.as_ref())?;
+        let Some(cmd) = cmd else {
             return Ok(None);
         };
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
-        let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
@@ -574,7 +658,7 @@ impl Connection {
             input,
         )?;
         let stmt = Statement::new(program, pager, mode);
-        Ok(Some((stmt, parser.offset())))
+        Ok(Some((stmt, byte_offset_end)))
     }
 
     #[cfg(feature = "fs")]
