@@ -15,12 +15,12 @@ use crate::{
     io::{MemoryIO, PlatformIO, IO},
     match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
     util::IOExt,
-    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore,
+    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSqlDialect, AtomicSyncMode, AtomicTempStore,
     AtomicTransactionState, BusyHandler, BusyHandlerCallback, CaptureDataChangesMode,
     CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion, ConnectionMetrics, Database,
     DatabaseCatalog, DatabaseOpts, Duration, EncryptionKey, EncryptionOpts, IndexMethod,
     LimboError, MvStore, OpenFlags, PageSize, Pager, Parser, QueryMode, QueryRunner, Result,
-    Schema, Statement, SyncMode, TransactionMode, TransactionState, Trigger, Value, VirtualTable,
+    Schema, SqlDialect, Statement, SyncMode, TransactionMode, TransactionState, Trigger, Value, VirtualTable,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -49,6 +49,7 @@ use tracing::{instrument, Level};
 /// - `cache_size`
 /// - `page_size`
 /// - `sync_mode`
+/// - `sql_dialect`
 /// - `data_sync_retry`
 /// - `encryption_key` (whether set)
 /// - `encryption_cipher_mode`
@@ -105,6 +106,7 @@ pub struct Connection {
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
     pub(super) temp_store: AtomicTempStore,
+    pub(super) sql_dialect: AtomicSqlDialect,
     pub(super) data_sync_retry: AtomicBool,
     /// Busy handler for lock contention
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
@@ -1544,6 +1546,14 @@ impl Connection {
 
     pub fn set_temp_store(&self, value: crate::TempStore) {
         self.temp_store.set(value);
+    }
+
+    pub fn get_sql_dialect(&self) -> SqlDialect {
+        self.sql_dialect.get()
+    }
+
+    pub fn set_sql_dialect(&self, dialect: SqlDialect) {
+        self.sql_dialect.set(dialect);
     }
 
     pub fn get_data_sync_retry(&self) -> bool {

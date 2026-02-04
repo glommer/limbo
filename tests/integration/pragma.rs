@@ -368,3 +368,58 @@ fn test_pragma_synchronous_normal(db: TempDatabase) {
     };
     assert_eq!(*count, 7, "all inserts should have succeeded");
 }
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_sql_dialect(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Test getting the default value
+    let mut rows = conn.query("PRAGMA sql_dialect;").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(dialect) = row.get_value(0) else {
+        panic!("expected text value");
+    };
+    assert_eq!(dialect.as_str(), "sqlite", "default dialect should be sqlite");
+
+    // Test setting to postgres
+    conn.execute("PRAGMA sql_dialect = postgres;").unwrap();
+
+    let mut rows = conn.query("PRAGMA sql_dialect;").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(dialect) = row.get_value(0) else {
+        panic!("expected text value");
+    };
+    assert_eq!(dialect.as_str(), "postgres", "dialect should be postgres after setting");
+
+    // Test setting back to sqlite
+    conn.execute("PRAGMA sql_dialect = sqlite;").unwrap();
+
+    let mut rows = conn.query("PRAGMA sql_dialect;").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(dialect) = row.get_value(0) else {
+        panic!("expected text value");
+    };
+    assert_eq!(dialect.as_str(), "sqlite", "dialect should be sqlite after setting back");
+
+    // Test postgresql alias
+    conn.execute("PRAGMA sql_dialect = postgresql;").unwrap();
+
+    let mut rows = conn.query("PRAGMA sql_dialect;").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(dialect) = row.get_value(0) else {
+        panic!("expected text value");
+    };
+    assert_eq!(dialect.as_str(), "postgres", "postgresql should be normalized to postgres");
+}

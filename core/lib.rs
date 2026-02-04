@@ -236,6 +236,16 @@ pub enum TempStore {
     Memory = 2,
 }
 
+/// Control SQL parsing dialect.
+/// - 0 = SQLite (default)
+/// - 1 = PostgreSQL
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SqlDialect {
+    #[default]
+    Sqlite = 0,
+    Postgres = 1,
+}
+
 pub(crate) type MvStore = mvcc::MvStore<mvcc::LocalClock>;
 
 pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::LocalClock>;
@@ -1205,6 +1215,7 @@ impl Database {
             encryption_cipher_mode: AtomicCipherMode::new(encryption_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             temp_store: AtomicTempStore::new(TempStore::Default),
+            sql_dialect: AtomicSqlDialect::new(SqlDialect::Sqlite),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
