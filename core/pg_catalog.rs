@@ -29,16 +29,25 @@ impl InternalVirtualTable for PgClassTable {
 
     fn best_index(
         &self,
-        _constraints: &[ConstraintInfo],
+        constraints: &[ConstraintInfo],
         _order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode> {
+        // Create constraint usages for each constraint
+        let constraint_usages = constraints
+            .iter()
+            .map(|_constraint| turso_ext::ConstraintUsage {
+                argv_index: Some(0),
+                omit: false,
+            })
+            .collect();
+
         Ok(IndexInfo {
             idx_num: 0,
             idx_str: None,
             order_by_consumed: false,
             estimated_cost: 1000.0,
             estimated_rows: 100,
-            constraint_usages: Vec::new(),
+            constraint_usages,
         })
     }
 
@@ -239,16 +248,24 @@ impl InternalVirtualTable for PgNamespaceTable {
 
     fn best_index(
         &self,
-        _constraints: &[ConstraintInfo],
+        constraints: &[ConstraintInfo],
         _order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_constraint| turso_ext::ConstraintUsage {
+                argv_index: Some(0),
+                omit: false,
+            })
+            .collect();
+
         Ok(IndexInfo {
             idx_num: 0,
             idx_str: None,
             order_by_consumed: false,
             estimated_cost: 10.0,
             estimated_rows: 5,
-            constraint_usages: Vec::new(),
+            constraint_usages,
         })
     }
 
@@ -360,16 +377,24 @@ impl InternalVirtualTable for PgAttributeTable {
 
     fn best_index(
         &self,
-        _constraints: &[ConstraintInfo],
+        constraints: &[ConstraintInfo],
         _order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_constraint| turso_ext::ConstraintUsage {
+                argv_index: Some(0),
+                omit: false,
+            })
+            .collect();
+
         Ok(IndexInfo {
             idx_num: 0,
             idx_str: None,
             order_by_consumed: false,
             estimated_cost: 1000.0,
             estimated_rows: 1000,
-            constraint_usages: Vec::new(),
+            constraint_usages,
         })
     }
 
