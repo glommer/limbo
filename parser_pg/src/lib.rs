@@ -1,6 +1,8 @@
 use pg_query::ParseResult;
 use thiserror::Error;
 
+pub mod translator;
+
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error("Parse error: {0}")]
