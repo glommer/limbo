@@ -15,15 +15,14 @@
 //! - ResultRow: Output a row to result set
 //! - Halt: Terminate program
 
-use crate::schema::{BTreeTable, Schema};
-use crate::sync::Arc;
+use crate::schema::{Table};
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::translate_expr;
-use crate::translate::logical::{LogicalPlan, TableScan, Filter, Projection, LogicalExpr, BinaryOperator};
+use crate::translate::logical::{LogicalPlan, TableScan, Filter, Projection, LogicalExpr};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::{BranchOffset, CursorID};
 use crate::Result;
+use turso_parser::ast;
 
 /// Context for compiling logical plans to VDBE bytecode
 pub struct LogicalCompiler<'a> {
@@ -50,16 +49,22 @@ impl<'a> LogicalCompiler<'a> {
     /// Generates: OpenRead → Rewind → [loop: Column reads] → Next → [loop end]
     fn compile_table_scan(&mut self, table_scan: &TableScan) -> Result<CompilationResult> {
         // Look up the table in the schema
-        let table = self.resolver.schema.get_table(&table_scan.table_name)
+        let table = self.resolver.schema.tables.get(&table_scan.table_name)
             .ok_or_else(|| crate::LimboError::ParseError(format!("Table not found: {}", table_scan.table_name)))?;
 
+        // Get the BTreeTable from the Table enum
+        let btree_table = match table.as_ref() {
+            Table::BTree(btree) => btree.clone(),
+            _ => return Err(crate::LimboError::ParseError(format!("Table {} is not a B-tree table", table_scan.table_name))),
+        };
+
         // Allocate a cursor for the table
-        let cursor_id = self.program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        let cursor_id = self.program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
 
         // Open the table for reading
         self.program.emit_insn(Insn::OpenRead {
             cursor_id,
-            root_page: table.root_page,
+            root_page: table.get_root_page(),
             db: 0, // main database
         });
 
@@ -68,17 +73,17 @@ impl<'a> LogicalCompiler<'a> {
         let result_start_reg = self.program.alloc_registers(num_columns);
 
         // Set up the scan loop
-        let loop_start = self.program.alloc_label();
-        let loop_end = self.program.alloc_label();
+        let loop_start = self.program.allocate_label();
+        let loop_end = self.program.allocate_label();
 
         // Rewind cursor to the first row
         self.program.emit_insn(Insn::Rewind {
             cursor_id,
-            pc_if_empty: BranchOffset::Label(loop_end),
+            pc_if_empty: loop_end,
         });
 
         // Loop start label
-        self.program.assign_label(loop_start);
+        self.program.preassign_label_to_next_insn(loop_start);
 
         // Read columns into registers based on projection
         if let Some(projection_indices) = &table_scan.projection {
@@ -113,11 +118,11 @@ impl<'a> LogicalCompiler<'a> {
         // Advance to next row
         self.program.emit_insn(Insn::Next {
             cursor_id,
-            pc_if_next: BranchOffset::Label(loop_start),
+            pc_if_next: loop_start,
         });
 
         // Loop end label
-        self.program.assign_label(loop_end);
+        self.program.preassign_label_to_next_insn(loop_end);
 
         Ok(CompilationResult {
             output_start_reg: result_start_reg,
@@ -161,16 +166,22 @@ impl<'a> LogicalCompiler<'a> {
         predicate: &LogicalExpr,
     ) -> Result<CompilationResult> {
         // Look up the table in the schema
-        let table = self.resolver.schema.get_table(&table_scan.table_name)
+        let table = self.resolver.schema.tables.get(&table_scan.table_name)
             .ok_or_else(|| crate::LimboError::ParseError(format!("Table not found: {}", table_scan.table_name)))?;
 
+        // Get the BTreeTable from the Table enum
+        let btree_table = match table.as_ref() {
+            Table::BTree(btree) => btree.clone(),
+            _ => return Err(crate::LimboError::ParseError(format!("Table {} is not a B-tree table", table_scan.table_name))),
+        };
+
         // Allocate a cursor for the table
-        let cursor_id = self.program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        let cursor_id = self.program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
 
         // Open the table for reading
         self.program.emit_insn(Insn::OpenRead {
             cursor_id,
-            root_page: table.root_page,
+            root_page: table.get_root_page(),
             db: 0, // main database
         });
 
@@ -182,18 +193,18 @@ impl<'a> LogicalCompiler<'a> {
         let predicate_reg = self.program.alloc_registers(1);
 
         // Set up the scan loop
-        let loop_start = self.program.alloc_label();
-        let loop_end = self.program.alloc_label();
-        let check_next = self.program.alloc_label();
+        let loop_start = self.program.allocate_label();
+        let loop_end = self.program.allocate_label();
+        let check_next = self.program.allocate_label();
 
         // Rewind cursor to the first row
         self.program.emit_insn(Insn::Rewind {
             cursor_id,
-            pc_if_empty: BranchOffset::Label(loop_end),
+            pc_if_empty: loop_end,
         });
 
         // Loop start label
-        self.program.assign_label(loop_start);
+        self.program.preassign_label_to_next_insn(loop_start);
 
         // Read columns into registers based on projection
         if let Some(projection_indices) = &table_scan.projection {
@@ -224,7 +235,7 @@ impl<'a> LogicalCompiler<'a> {
         // If predicate is false (0), jump to check_next
         self.program.emit_insn(Insn::IfNot {
             reg: predicate_reg,
-            target_pc: BranchOffset::Label(check_next),
+            target_pc: check_next,
             jump_if_null: false, // Don't jump on NULL (treat as false)
         });
 
@@ -236,14 +247,14 @@ impl<'a> LogicalCompiler<'a> {
         });
 
         // Check next label - advance to next row
-        self.program.assign_label(check_next);
+        self.program.preassign_label_to_next_insn(check_next);
         self.program.emit_insn(Insn::Next {
             cursor_id,
-            pc_if_next: BranchOffset::Label(loop_start),
+            pc_if_next: loop_start,
         });
 
         // Loop end label
-        self.program.assign_label(loop_end);
+        self.program.preassign_label_to_next_insn(loop_end);
 
         Ok(CompilationResult {
             output_start_reg: result_start_reg,
@@ -297,16 +308,22 @@ impl<'a> LogicalCompiler<'a> {
         output_schema: &crate::translate::logical::SchemaRef,
     ) -> Result<CompilationResult> {
         // Look up the table in the schema
-        let table = self.resolver.schema.get_table(&table_scan.table_name)
+        let table = self.resolver.schema.tables.get(&table_scan.table_name)
             .ok_or_else(|| crate::LimboError::ParseError(format!("Table not found: {}", table_scan.table_name)))?;
 
+        // Get the BTreeTable from the Table enum
+        let btree_table = match table.as_ref() {
+            Table::BTree(btree) => btree.clone(),
+            _ => return Err(crate::LimboError::ParseError(format!("Table {} is not a B-tree table", table_scan.table_name))),
+        };
+
         // Allocate a cursor for the table
-        let cursor_id = self.program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        let cursor_id = self.program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
 
         // Open the table for reading
         self.program.emit_insn(Insn::OpenRead {
             cursor_id,
-            root_page: table.root_page,
+            root_page: table.get_root_page(),
             db: 0, // main database
         });
 
@@ -318,17 +335,17 @@ impl<'a> LogicalCompiler<'a> {
         let projection_output_regs = self.program.alloc_registers(projection_exprs.len());
 
         // Set up the scan loop
-        let loop_start = self.program.alloc_label();
-        let loop_end = self.program.alloc_label();
+        let loop_start = self.program.allocate_label();
+        let loop_end = self.program.allocate_label();
 
         // Rewind cursor to the first row
         self.program.emit_insn(Insn::Rewind {
             cursor_id,
-            pc_if_empty: BranchOffset::Label(loop_end),
+            pc_if_empty: loop_end,
         });
 
         // Loop start label
-        self.program.assign_label(loop_start);
+        self.program.preassign_label_to_next_insn(loop_start);
 
         // Read table columns into registers
         for column_idx in 0..num_table_columns {
@@ -354,11 +371,11 @@ impl<'a> LogicalCompiler<'a> {
         // Advance to next row
         self.program.emit_insn(Insn::Next {
             cursor_id,
-            pc_if_next: BranchOffset::Label(loop_start),
+            pc_if_next: loop_start,
         });
 
         // Loop end label
-        self.program.assign_label(loop_end);
+        self.program.preassign_label_to_next_insn(loop_end);
 
         Ok(CompilationResult {
             output_start_reg: projection_output_regs,
@@ -376,16 +393,22 @@ impl<'a> LogicalCompiler<'a> {
         output_schema: &crate::translate::logical::SchemaRef,
     ) -> Result<CompilationResult> {
         // Look up the table in the schema
-        let table = self.resolver.schema.get_table(&table_scan.table_name)
+        let table = self.resolver.schema.tables.get(&table_scan.table_name)
             .ok_or_else(|| crate::LimboError::ParseError(format!("Table not found: {}", table_scan.table_name)))?;
 
+        // Get the BTreeTable from the Table enum
+        let btree_table = match table.as_ref() {
+            Table::BTree(btree) => btree.clone(),
+            _ => return Err(crate::LimboError::ParseError(format!("Table {} is not a B-tree table", table_scan.table_name))),
+        };
+
         // Allocate a cursor for the table
-        let cursor_id = self.program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        let cursor_id = self.program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
 
         // Open the table for reading
         self.program.emit_insn(Insn::OpenRead {
             cursor_id,
-            root_page: table.root_page,
+            root_page: table.get_root_page(),
             db: 0, // main database
         });
 
@@ -398,18 +421,18 @@ impl<'a> LogicalCompiler<'a> {
         let predicate_reg = self.program.alloc_registers(1);
 
         // Set up the scan loop
-        let loop_start = self.program.alloc_label();
-        let loop_end = self.program.alloc_label();
-        let check_next = self.program.alloc_label();
+        let loop_start = self.program.allocate_label();
+        let loop_end = self.program.allocate_label();
+        let check_next = self.program.allocate_label();
 
         // Rewind cursor to the first row
         self.program.emit_insn(Insn::Rewind {
             cursor_id,
-            pc_if_empty: BranchOffset::Label(loop_end),
+            pc_if_empty: loop_end,
         });
 
         // Loop start label
-        self.program.assign_label(loop_start);
+        self.program.preassign_label_to_next_insn(loop_start);
 
         // Read table columns into registers
         for column_idx in 0..num_table_columns {
@@ -427,7 +450,7 @@ impl<'a> LogicalCompiler<'a> {
         // If predicate is false (0), jump to check_next
         self.program.emit_insn(Insn::IfNot {
             reg: predicate_reg,
-            target_pc: BranchOffset::Label(check_next),
+            target_pc: check_next,
             jump_if_null: false, // Don't jump on NULL (treat as false)
         });
 
@@ -443,14 +466,14 @@ impl<'a> LogicalCompiler<'a> {
         });
 
         // Check next label - advance to next row
-        self.program.assign_label(check_next);
+        self.program.preassign_label_to_next_insn(check_next);
         self.program.emit_insn(Insn::Next {
             cursor_id,
-            pc_if_next: BranchOffset::Label(loop_start),
+            pc_if_next: loop_start,
         });
 
         // Loop end label
-        self.program.assign_label(loop_end);
+        self.program.preassign_label_to_next_insn(loop_end);
 
         Ok(CompilationResult {
             output_start_reg: projection_output_regs,
@@ -477,7 +500,7 @@ impl<'a> LogicalCompiler<'a> {
                             dest: dest_reg,
                         });
                     }
-                    crate::types::Value::Real(f) => {
+                    crate::types::Value::Float(f) => {
                         self.program.emit_insn(Insn::Real {
                             value: *f,
                             dest: dest_reg,
@@ -485,7 +508,7 @@ impl<'a> LogicalCompiler<'a> {
                     }
                     crate::types::Value::Text(s) => {
                         self.program.emit_insn(Insn::String8 {
-                            value: s.clone(),
+                            value: s.to_string(),
                             dest: dest_reg,
                         });
                     }
@@ -567,11 +590,8 @@ impl<'a> LogicalCompiler<'a> {
             LogicalExpr::Cast { .. } => {
                 todo!("CAST expressions not yet implemented");
             }
-            LogicalExpr::Subquery(_) => {
-                todo!("Subquery expressions not yet implemented");
-            }
-            LogicalExpr::Placeholder(_) => {
-                todo!("Placeholder expressions not yet implemented");
+            _ => {
+                todo!("Expression type not yet implemented");
             }
         }
     }
@@ -579,30 +599,29 @@ impl<'a> LogicalCompiler<'a> {
     /// Compile a binary operation into VDBE bytecode
     fn compile_binary_op(
         &mut self,
-        op: &BinaryOperator,
+        op: &ast::Operator,
         left_reg: usize,
         right_reg: usize,
         dest_reg: usize,
     ) -> Result<()> {
         use crate::vdbe::insn::CmpInsFlags;
-        use turso_parser::ast;
 
         match op {
-            ast::Operator::Plus => {
+            ast::Operator::Add => {
                 self.program.emit_insn(Insn::Add {
                     lhs: left_reg,
                     rhs: right_reg,
                     dest: dest_reg,
                 });
             }
-            ast::Operator::Minus => {
+            ast::Operator::Subtract => {
                 self.program.emit_insn(Insn::Subtract {
                     lhs: left_reg,
                     rhs: right_reg,
                     dest: dest_reg,
                 });
             }
-            ast::Operator::Star => {
+            ast::Operator::Multiply => {
                 self.program.emit_insn(Insn::Multiply {
                     lhs: left_reg,
                     rhs: right_reg,
@@ -724,65 +743,65 @@ impl<'a> LogicalCompiler<'a> {
             }
             ast::Operator::And => {
                 // Logical AND: if left is false, result is false; otherwise result is right
-                let skip_right_eval = self.program.alloc_label();
-                let end_label = self.program.alloc_label();
+                let skip_right_eval = self.program.allocate_label();
+                let end_label = self.program.allocate_label();
 
                 // Check if left operand is false (0)
                 self.program.emit_insn(Insn::IfNot {
                     reg: left_reg,
-                    target_pc: BranchOffset::Label(skip_right_eval),
+                    target_pc: skip_right_eval,
                     jump_if_null: true, // NULL is treated as false in AND
                 });
 
                 // Left is true, so result depends on right operand
                 self.program.emit_insn(Insn::Move {
-                    from_reg: right_reg,
-                    to_reg: dest_reg,
+                    source_reg: right_reg,
+                    dest_reg: dest_reg,
                     count: 1,
                 });
                 self.program.emit_insn(Insn::Goto {
-                    target_pc: BranchOffset::Label(end_label),
+                    target_pc: end_label,
                 });
 
                 // Left is false, so result is false
-                self.program.assign_label(skip_right_eval);
+                self.program.preassign_label_to_next_insn(skip_right_eval);
                 self.program.emit_insn(Insn::Integer {
                     value: 0,
                     dest: dest_reg,
                 });
 
-                self.program.assign_label(end_label);
+                self.program.preassign_label_to_next_insn(end_label);
             }
             ast::Operator::Or => {
                 // Logical OR: if left is true, result is true; otherwise result is right
-                let skip_right_eval = self.program.alloc_label();
-                let end_label = self.program.alloc_label();
+                let skip_right_eval = self.program.allocate_label();
+                let end_label = self.program.allocate_label();
 
                 // Check if left operand is true (non-zero)
                 self.program.emit_insn(Insn::If {
                     reg: left_reg,
-                    target_pc: BranchOffset::Label(skip_right_eval),
+                    target_pc: skip_right_eval,
                     jump_if_null: false, // Don't treat NULL as true
                 });
 
                 // Left is false/null, so result depends on right operand
                 self.program.emit_insn(Insn::Move {
-                    from_reg: right_reg,
-                    to_reg: dest_reg,
+                    source_reg: right_reg,
+                    dest_reg: dest_reg,
                     count: 1,
                 });
                 self.program.emit_insn(Insn::Goto {
-                    target_pc: BranchOffset::Label(end_label),
+                    target_pc: end_label,
                 });
 
                 // Left is true, so result is true
-                self.program.assign_label(skip_right_eval);
+                self.program.preassign_label_to_next_insn(skip_right_eval);
                 self.program.emit_insn(Insn::Integer {
                     value: 1,
                     dest: dest_reg,
                 });
 
-                self.program.assign_label(end_label);
+                self.program.preassign_label_to_next_insn(end_label);
             }
             _ => {
                 todo!("Binary operator not yet implemented: {:?}", op);
@@ -826,7 +845,7 @@ pub fn compile_logical_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Column, Schema, Type};
+    use crate::schema::{BTreeTable, Column, Schema, Table, Type};
     use crate::translate::logical::{ColumnInfo, LogicalSchema};
     use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
     use std::sync::Arc;
@@ -841,15 +860,21 @@ mod tests {
             Column::new("age".to_string(), Type::Integer, false, None, false),
         ];
 
-        let table = Table::new(
-            "test_table".to_string(),
+        let btree_table = BTreeTable {
+            root_page: 2, // Some test root page
+            name: "test_table".to_string(),
+            primary_key_columns: vec![],
             columns,
-            vec![], // indexes
-            false,  // without_rowid
-            false,  // strict
-        );
+            has_rowid: true,
+            is_strict: false,
+            has_autoincrement: false,
+            unique_sets: vec![],
+            foreign_keys: vec![],
+        };
 
-        schema.add_table("test_table".to_string(), table);
+        let table = Table::BTree(Arc::new(btree_table));
+
+        schema.tables.insert("test_table".to_string(), Arc::new(table));
         Arc::new(schema)
     }
 
