@@ -521,3 +521,252 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
         ),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Database, OpenFlags, PlatformIO};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_pg_namespace_query() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+
+        // Switch to PostgreSQL dialect
+        conn.execute("PRAGMA sql_dialect = 'postgres'", ()).unwrap();
+
+        // Query pg_namespace
+        let mut stmt = conn.prepare("SELECT * FROM pg_namespace").unwrap();
+        let mut rows = stmt.query(()).unwrap();
+
+        let mut found_pg_catalog = false;
+        let mut found_public = false;
+        let mut found_information_schema = false;
+
+        while let Ok(Some(row)) = rows.next() {
+            let nspname: String = row.get(1).unwrap();
+            match nspname.as_str() {
+                "pg_catalog" => found_pg_catalog = true,
+                "public" => found_public = true,
+                "information_schema" => found_information_schema = true,
+                _ => {}
+            }
+        }
+
+        assert!(found_pg_catalog, "pg_catalog namespace not found");
+        assert!(found_public, "public namespace not found");
+        assert!(found_information_schema, "information_schema namespace not found");
+    }
+
+    #[test]
+    fn test_pg_class_lists_user_tables() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+
+        // Create test tables in SQLite mode (default)
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", ()).unwrap();
+        conn.execute("CREATE TABLE products (id INTEGER, title TEXT, price REAL)", ()).unwrap();
+        conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, product_id INTEGER)", ()).unwrap();
+
+        // Switch to PostgreSQL dialect
+        conn.execute("PRAGMA sql_dialect = 'postgres'", ()).unwrap();
+
+        // Query pg_class for regular tables
+        let mut stmt = conn.prepare("SELECT relname FROM pg_class WHERE relkind = 'r' AND relnamespace = 2200").unwrap();
+        let mut rows = stmt.query(()).unwrap();
+
+        let mut tables = Vec::new();
+        while let Ok(Some(row)) = rows.next() {
+            let relname: String = row.get(0).unwrap();
+            tables.push(relname);
+        }
+
+        // Should find our three tables
+        assert!(tables.contains(&"users".to_string()), "users table not found");
+        assert!(tables.contains(&"products".to_string()), "products table not found");
+        assert!(tables.contains(&"orders".to_string()), "orders table not found");
+        assert_eq!(tables.len(), 3, "Expected exactly 3 tables");
+    }
+
+    #[test]
+    fn test_pg_class_table_details() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+
+        // Create a test table with known columns
+        conn.execute("CREATE TABLE test_table (id INTEGER, name TEXT, value REAL)", ()).unwrap();
+
+        // Switch to PostgreSQL dialect
+        conn.execute("PRAGMA sql_dialect = 'postgres'", ()).unwrap();
+
+        // Query pg_class for table details
+        let mut stmt = conn.prepare(
+            "SELECT oid, relname, relkind, relnatts
+             FROM pg_class
+             WHERE relname = 'test_table'"
+        ).unwrap();
+        let mut rows = stmt.query(()).unwrap();
+
+        if let Ok(Some(row)) = rows.next() {
+            let oid: i64 = row.get(0).unwrap();
+            let relname: String = row.get(1).unwrap();
+            let relkind: String = row.get(2).unwrap();
+            let relnatts: i64 = row.get(3).unwrap();
+
+            assert!(oid >= 16384, "OID should be >= 16384");
+            assert_eq!(relname, "test_table");
+            assert_eq!(relkind, "r", "relkind should be 'r' for regular table");
+            assert_eq!(relnatts, 3, "Table should have 3 columns");
+        } else {
+            panic!("test_table not found in pg_class");
+        }
+    }
+
+    #[test]
+    fn test_sqlite_tables_hidden_in_postgres_mode() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+
+        // Create a test table
+        conn.execute("CREATE TABLE test_table (id INTEGER)", ()).unwrap();
+
+        // Switch to PostgreSQL dialect
+        conn.execute("PRAGMA sql_dialect = 'postgres'", ()).unwrap();
+
+        // Try to query sqlite_master - should fail
+        let result = conn.prepare("SELECT * FROM sqlite_master");
+        assert!(result.is_err(), "sqlite_master should not be accessible in PostgreSQL mode");
+
+        // Try to query sqlite_schema - should also fail
+        let result = conn.prepare("SELECT * FROM sqlite_schema");
+        assert!(result.is_err(), "sqlite_schema should not be accessible in PostgreSQL mode");
+    }
+
+    #[test]
+    fn test_postgres_tables_hidden_in_sqlite_mode() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+
+        // Default is SQLite mode
+
+        // Try to query pg_class - should fail
+        let result = conn.prepare("SELECT * FROM pg_class");
+        assert!(result.is_err(), "pg_class should not be accessible in SQLite mode");
+
+        // Try to query pg_namespace - should fail
+        let result = conn.prepare("SELECT * FROM pg_namespace");
+        assert!(result.is_err(), "pg_namespace should not be accessible in SQLite mode");
+
+        // sqlite_master should work
+        let result = conn.prepare("SELECT * FROM sqlite_master");
+        assert!(result.is_ok(), "sqlite_master should be accessible in SQLite mode");
+    }
+
+    #[test]
+    fn test_dialect_switching() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+
+        // Create a test table
+        conn.execute("CREATE TABLE users (id INTEGER, name TEXT)", ()).unwrap();
+
+        // In SQLite mode, check sqlite_master
+        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").unwrap();
+        let mut rows = stmt.query(()).unwrap();
+        let mut found = false;
+        while let Ok(Some(row)) = rows.next() {
+            let name: String = row.get(0).unwrap();
+            if name == "users" {
+                found = true;
+            }
+        }
+        assert!(found, "users table not found in sqlite_master");
+
+        // Switch to PostgreSQL mode
+        conn.execute("PRAGMA sql_dialect = 'postgres'", ()).unwrap();
+
+        // In PostgreSQL mode, check pg_class
+        let mut stmt = conn.prepare("SELECT relname FROM pg_class WHERE relkind = 'r'").unwrap();
+        let mut rows = stmt.query(()).unwrap();
+        let mut found = false;
+        while let Ok(Some(row)) = rows.next() {
+            let name: String = row.get(0).unwrap();
+            if name == "users" {
+                found = true;
+            }
+        }
+        assert!(found, "users table not found in pg_class");
+
+        // Switch back to SQLite mode
+        conn.execute("PRAGMA sql_dialect = 'sqlite'", ()).unwrap();
+
+        // sqlite_master should work again
+        let result = conn.prepare("SELECT * FROM sqlite_master");
+        assert!(result.is_ok(), "sqlite_master should be accessible after switching back to SQLite mode");
+    }
+
+    #[test]
+    fn test_pg_class_with_where_constraints() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+
+        // Create multiple tables
+        conn.execute("CREATE TABLE table1 (id INTEGER)", ()).unwrap();
+        conn.execute("CREATE TABLE table2 (id INTEGER, name TEXT)", ()).unwrap();
+        conn.execute("CREATE TABLE table3 (id INTEGER, name TEXT, value REAL)", ()).unwrap();
+
+        // Switch to PostgreSQL dialect
+        conn.execute("PRAGMA sql_dialect = 'postgres'", ()).unwrap();
+
+        // Test various WHERE clause combinations
+
+        // Test 1: Filter by relkind = 'r'
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM pg_class WHERE relkind = 'r'").unwrap();
+        let mut rows = stmt.query(()).unwrap();
+        if let Ok(Some(row)) = rows.next() {
+            let count: i64 = row.get(0).unwrap();
+            assert_eq!(count, 3, "Should have 3 regular tables");
+        }
+
+        // Test 2: Filter by relnamespace = 2200 (public schema)
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM pg_class WHERE relnamespace = 2200").unwrap();
+        let mut rows = stmt.query(()).unwrap();
+        if let Ok(Some(row)) = rows.next() {
+            let count: i64 = row.get(0).unwrap();
+            assert_eq!(count, 3, "Should have 3 tables in public schema");
+        }
+
+        // Test 3: Combined filters
+        let mut stmt = conn.prepare("SELECT relname FROM pg_class WHERE relkind = 'r' AND relnamespace = 2200 ORDER BY relname").unwrap();
+        let mut rows = stmt.query(()).unwrap();
+        let mut tables = Vec::new();
+        while let Ok(Some(row)) = rows.next() {
+            let name: String = row.get(0).unwrap();
+            tables.push(name);
+        }
+        assert_eq!(tables, vec!["table1", "table2", "table3"]);
+    }
+}
