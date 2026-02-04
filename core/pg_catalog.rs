@@ -36,7 +36,7 @@ impl InternalVirtualTable for PgClassTable {
         let constraint_usages = constraints
             .iter()
             .map(|_constraint| turso_ext::ConstraintUsage {
-                argv_index: Some(0),
+                argv_index: None,  // We'll handle filtering ourselves
                 omit: false,
             })
             .collect();
@@ -254,7 +254,7 @@ impl InternalVirtualTable for PgNamespaceTable {
         let constraint_usages = constraints
             .iter()
             .map(|_constraint| turso_ext::ConstraintUsage {
-                argv_index: Some(0),
+                argv_index: None,  // We'll handle filtering ourselves
                 omit: false,
             })
             .collect();
@@ -383,7 +383,7 @@ impl InternalVirtualTable for PgAttributeTable {
         let constraint_usages = constraints
             .iter()
             .map(|_constraint| turso_ext::ConstraintUsage {
-                argv_index: Some(0),
+                argv_index: None,  // We'll handle filtering ourselves
                 omit: false,
             })
             .collect();
