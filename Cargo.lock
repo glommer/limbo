@@ -6563,6 +6563,7 @@ dependencies = [
  "miette",
  "pg_query",
  "thiserror 2.0.16",
+ "turso_parser",
 ]
 
 [[package]]
