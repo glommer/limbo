@@ -145,6 +145,22 @@ impl PostgreSQLTranslator {
                         // Check if this is a SELECT *
                         if let Some(pg_query::protobuf::node::Node::AStar(_)) = &val.node {
                             result_columns.push(ast::ResultColumn::Star);
+                        } else if let Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) = &val.node {
+                            // Check if this is a column reference with "*"
+                            if let Some(field) = col_ref.fields.first() {
+                                if let Some(pg_query::protobuf::node::Node::AStar(_)) = &field.node {
+                                    result_columns.push(ast::ResultColumn::Star);
+                                    continue;
+                                }
+                            }
+                            // Regular column reference
+                            let expr = self.translate_expr(val)?;
+                            let alias: Option<ast::As> = if res_target.name.is_empty() {
+                                None
+                            } else {
+                                Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
+                            };
+                            result_columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
                         } else {
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
@@ -194,8 +210,8 @@ impl PostgreSQLTranslator {
                             }
                         }
                         Some(pg_query::protobuf::node::Node::AStar(_)) => {
-                            // SELECT * case
-                            Ok(ast::Expr::Name(ast::Name::from_string("*")))
+                            // SELECT * case - should be handled in translate_target_list, not here
+                            return Err(ParseError::ParseError("AStar should be handled in target list, not as expression".to_string()));
                         }
                         _ => Err(ParseError::ParseError(format!("Invalid column reference, expected String or AStar but got: {:?}", field.node))),
                     }
@@ -211,8 +227,7 @@ impl PostgreSQLTranslator {
             }
             Some(pg_query::protobuf::node::Node::AStar(_)) => {
                 // SELECT * - this should be handled as ResultColumn::Star in translate_target_list
-                // For now, return a name expression
-                Ok(ast::Expr::Name(ast::Name::from_string("*")))
+                return Err(ParseError::ParseError("AStar should not be translated as expression".to_string()));
             }
             _ => Err(ParseError::ParseError(format!(
                 "Unsupported expression type: {:?}",
@@ -412,7 +427,7 @@ mod tests {
             if let ast::OneSelect::Select { columns, from, .. } = &select.body.select {
                 // Should have one result column: *
                 assert_eq!(columns.len(), 1);
-                matches!(columns[0], ast::ResultColumn::Star);
+                assert!(matches!(columns[0], ast::ResultColumn::Star), "Expected ResultColumn::Star but got {:?}", columns[0]);
 
                 // Should have FROM clause
                 if let Some(from_clause) = from {
@@ -424,6 +439,148 @@ mod tests {
                     }
                 } else {
                     panic!("Expected FROM clause");
+                }
+            } else {
+                panic!("Expected OneSelect::Select");
+            }
+        } else {
+            panic!("Expected select query");
+        }
+    }
+
+    #[test]
+    fn test_column_expressions() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT id, name FROM users";
+        let parse_result = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parse_result);
+        assert!(translated.is_ok());
+
+        if let Ok(ast::Stmt::Select(select)) = translated {
+            if let ast::OneSelect::Select { columns, from, .. } = &select.body.select {
+                // Should have two result columns: id, name
+                assert_eq!(columns.len(), 2);
+
+                // First column should be 'id'
+                if let ast::ResultColumn::Expr(expr, alias) = &columns[0] {
+                    assert!(matches!(**expr, ast::Expr::Name(_)), "Expected Name expression but got {:?}", expr);
+                    if let ast::Expr::Name(name) = &**expr {
+                        assert_eq!(name.as_str(), "id");
+                    }
+                    assert!(alias.is_none());
+                } else {
+                    panic!("Expected expression result column for first column");
+                }
+
+                // Second column should be 'name'
+                if let ast::ResultColumn::Expr(expr, alias) = &columns[1] {
+                    assert!(matches!(**expr, ast::Expr::Name(_)), "Expected Name expression but got {:?}", expr);
+                    if let ast::Expr::Name(name) = &**expr {
+                        assert_eq!(name.as_str(), "name");
+                    }
+                    assert!(alias.is_none());
+                } else {
+                    panic!("Expected expression result column for second column");
+                }
+
+                // Should have FROM clause
+                assert!(from.is_some());
+            } else {
+                panic!("Expected OneSelect::Select");
+            }
+        } else {
+            panic!("Expected select query");
+        }
+    }
+
+    #[test]
+    fn test_qualified_column_expressions() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT users.id, t.name FROM users t";
+        let parse_result = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parse_result);
+        assert!(translated.is_ok());
+
+        if let Ok(ast::Stmt::Select(select)) = translated {
+            if let ast::OneSelect::Select { columns, from, .. } = &select.body.select {
+                // Should have two result columns: users.id, t.name
+                assert_eq!(columns.len(), 2);
+
+                // First column should be 'users.id'
+                if let ast::ResultColumn::Expr(expr, alias) = &columns[0] {
+                    assert!(matches!(**expr, ast::Expr::Qualified(_, _)), "Expected Qualified expression but got {:?}", expr);
+                    if let ast::Expr::Qualified(table_name, col_name) = &**expr {
+                        assert_eq!(table_name.as_str(), "users");
+                        assert_eq!(col_name.as_str(), "id");
+                    }
+                    assert!(alias.is_none());
+                } else {
+                    panic!("Expected expression result column for first qualified column");
+                }
+
+                // Second column should be 't.name'
+                if let ast::ResultColumn::Expr(expr, alias) = &columns[1] {
+                    assert!(matches!(**expr, ast::Expr::Qualified(_, _)), "Expected Qualified expression but got {:?}", expr);
+                    if let ast::Expr::Qualified(table_name, col_name) = &**expr {
+                        assert_eq!(table_name.as_str(), "t");
+                        assert_eq!(col_name.as_str(), "name");
+                    }
+                    assert!(alias.is_none());
+                } else {
+                    panic!("Expected expression result column for second qualified column");
+                }
+
+                // Should have FROM clause
+                assert!(from.is_some());
+            } else {
+                panic!("Expected OneSelect::Select");
+            }
+        } else {
+            panic!("Expected select query");
+        }
+    }
+
+    #[test]
+    fn test_select_with_where_clause() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT * FROM users WHERE id = 1";
+        let parse_result = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parse_result);
+        assert!(translated.is_ok());
+
+        if let Ok(ast::Stmt::Select(select)) = translated {
+            if let ast::OneSelect::Select { columns, from, where_clause, .. } = &select.body.select {
+                // Should have SELECT *
+                assert_eq!(columns.len(), 1);
+                assert!(matches!(columns[0], ast::ResultColumn::Star));
+
+                // Should have FROM clause
+                assert!(from.is_some());
+
+                // Should have WHERE clause
+                assert!(where_clause.is_some());
+                if let Some(where_expr) = where_clause {
+                    // WHERE id = 1 should be a binary expression
+                    assert!(matches!(**where_expr, ast::Expr::Binary(_, _, _)), "Expected Binary expression but got {:?}", where_expr);
+                    if let ast::Expr::Binary(left, op, right) = &**where_expr {
+                        // Left side should be column 'id'
+                        assert!(matches!(**left, ast::Expr::Name(_)), "Expected Name expression for left side");
+                        if let ast::Expr::Name(name) = &**left {
+                            assert_eq!(name.as_str(), "id");
+                        }
+
+                        // Operator should be Equals
+                        assert!(matches!(op, ast::Operator::Equals), "Expected Equals operator");
+
+                        // Right side should be literal 1
+                        assert!(matches!(**right, ast::Expr::Literal(_)), "Expected Literal expression for right side");
+                        if let ast::Expr::Literal(literal) = &**right {
+                            assert!(matches!(literal, ast::Literal::Numeric(_)), "Expected numeric literal");
+                            if let ast::Literal::Numeric(num_str) = literal {
+                                assert_eq!(num_str, "1");
+                            }
+                        }
+                    }
                 }
             } else {
                 panic!("Expected OneSelect::Select");
