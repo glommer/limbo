@@ -515,7 +515,206 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
             )
             .expect("pg_attribute virtual table creation should not fail"),
         ),
+        // pg_get_tabledef virtual table (custom extension for getting PostgreSQL DDL)
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_get_tabledef".to_string(),
+                PgGetTableDefTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgGetTableDefTable::new())),
+            )
+            .expect("pg_get_tabledef virtual table creation should not fail"),
+        ),
     ]
+}
+
+/// Virtual table for getting PostgreSQL-compatible CREATE TABLE statements
+#[derive(Debug)]
+struct PgGetTableDefTable;
+
+impl PgGetTableDefTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+struct PgGetTableDefCursor {
+    conn: Arc<Connection>,
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+    row_count: usize,
+}
+
+impl PgGetTableDefCursor {
+    fn new(conn: Arc<Connection>) -> Self {
+        Self {
+            conn,
+            rows: Vec::new(),
+            current_row: 0,
+            row_count: 0,
+        }
+    }
+
+    fn load_table_defs(&mut self) -> Result<(), LimboError> {
+        // Get schema with read lock
+        let schema = self.conn.schema.read().clone();
+        self.rows.clear();
+
+        // Get DDL from sqlite_master for each user table
+        for (table_name, table) in &schema.tables {
+            // Skip system tables (sqlite_master, sqlite_schema, etc.)
+            if table_name.starts_with("sqlite_") || table_name == "sqlite_master" || table_name == "sqlite_schema" {
+                continue;
+            }
+
+            // Skip virtual tables and subqueries
+            if !matches!(table.as_ref(), Table::BTree(_)) {
+                continue;
+            }
+
+            // Get the original SQLite DDL
+            let sqlite_ddl = self.get_sqlite_ddl(table_name)?;
+
+            // Convert to PostgreSQL DDL
+            let postgres_ddl = self.convert_to_postgres_ddl(&sqlite_ddl);
+
+            self.rows.push(vec![
+                Value::Text(table_name.clone().into()),
+                Value::Text(sqlite_ddl.into()),
+                Value::Text(postgres_ddl.into()),
+            ]);
+        }
+
+        Ok(())
+    }
+
+    fn get_sqlite_ddl(&self, table_name: &str) -> Result<String, LimboError> {
+        // Get the DDL from the schema's sqlite_master info
+        // For now, we'll reconstruct it from the table definition
+        // In a full implementation, we'd query sqlite_master directly
+        let schema = self.conn.schema.read();
+
+        if let Some(table) = schema.tables.get(table_name) {
+            if let Table::BTree(btree_table) = table.as_ref() {
+                let mut ddl = format!("CREATE TABLE {} (", table_name);
+                let cols: Vec<String> = btree_table.columns.iter().map(|col| {
+                    let col_name = col.name.as_deref().unwrap_or("unnamed");
+                    let mut col_def = format!("{} {}", col_name, col.ty_str);
+
+                    // Check if this column is a primary key
+                    for (pk_col, _) in &btree_table.primary_key_columns {
+                        if pk_col == col_name {
+                            col_def.push_str(" PRIMARY KEY");
+                            break;
+                        }
+                    }
+
+                    // Add NOT NULL if column is not nullable
+                    if col.notnull() {
+                        col_def.push_str(" NOT NULL");
+                    }
+
+                    // Add default value if present
+                    if col.default.is_some() {
+                        col_def.push_str(" DEFAULT ...");  // Simplified for now
+                    }
+
+                    col_def
+                }).collect();
+                ddl.push_str(&cols.join(", "));
+                ddl.push(')');
+                return Ok(ddl);
+            }
+        }
+        Ok(format!("CREATE TABLE {} (...)", table_name))
+    }
+
+    fn convert_to_postgres_ddl(&self, sqlite_ddl: &str) -> String {
+        let mut postgres_ddl = sqlite_ddl.to_string();
+
+        // Basic SQLite to PostgreSQL type conversions
+        postgres_ddl = postgres_ddl.replace(" INTEGER PRIMARY KEY", " SERIAL PRIMARY KEY");
+        postgres_ddl = postgres_ddl.replace(" AUTOINCREMENT", "");
+        postgres_ddl = postgres_ddl.replace(" INTEGER", " INTEGER");
+        postgres_ddl = postgres_ddl.replace(" REAL", " DOUBLE PRECISION");
+        postgres_ddl = postgres_ddl.replace(" TEXT", " TEXT");
+        postgres_ddl = postgres_ddl.replace(" BLOB", " BYTEA");
+
+        // Handle DATETIME/TIMESTAMP
+        postgres_ddl = postgres_ddl.replace(" DATETIME", " TIMESTAMP");
+
+        // Remove SQLite-specific features
+        postgres_ddl = postgres_ddl.replace(" WITHOUT ROWID", "");
+
+        postgres_ddl
+    }
+}
+
+impl InternalVirtualTableCursor for PgGetTableDefCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.row_count)
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < 3 {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        self.load_table_defs()?;
+        self.row_count = self.rows.len();
+        Ok(!self.rows.is_empty())
+    }
+}
+
+impl InternalVirtualTable for PgGetTableDefTable {
+    fn name(&self) -> String {
+        "pg_get_tabledef".to_string()
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE pg_get_tabledef (
+            table_name TEXT,
+            sqlite_ddl TEXT,
+            postgres_ddl TEXT
+        )".to_string()
+    }
+
+    fn open(
+        &self,
+        conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgGetTableDefCursor::new(conn))))
+    }
+
+    fn best_index(
+        &self,
+        _constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 100.0,
+            estimated_rows: 20,
+            constraint_usages: vec![],
+        })
+    }
 }
 
 // TODO: Fix tests to use correct API
