@@ -27,6 +27,21 @@ pub struct VirtualTable {
 }
 
 impl VirtualTable {
+    pub(crate) fn new_internal(
+        name: String,
+        sql: String,
+        kind: VTabKind,
+        table: Arc<RwLock<dyn InternalVirtualTable>>,
+    ) -> crate::Result<Self> {
+        Ok(VirtualTable {
+            name,
+            columns: Self::resolve_columns(sql)?,
+            kind,
+            vtab_type: VirtualTableType::Internal(table),
+            vtab_id: 0,
+        })
+    }
+
     pub(crate) fn id(&self) -> u64 {
         self.vtab_id
     }
@@ -73,6 +88,9 @@ impl VirtualTable {
 
         #[cfg(feature = "cli_only")]
         vtables.push(Self::dbpage_virtual_table());
+
+        // Add PostgreSQL system catalog virtual tables
+        vtables.extend(crate::pg_catalog::pg_catalog_virtual_tables());
 
         vtables
     }

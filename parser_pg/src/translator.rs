@@ -223,7 +223,10 @@ impl PostgreSQLTranslator {
                 self.translate_const(a_const)
             }
             Some(pg_query::protobuf::node::Node::AExpr(a_expr)) => {
-                self.translate_binary_expr(a_expr)
+                self.translate_a_expr(a_expr)
+            }
+            Some(pg_query::protobuf::node::Node::BoolExpr(bool_expr)) => {
+                self.translate_bool_expr(bool_expr)
             }
             Some(pg_query::protobuf::node::Node::AStar(_)) => {
                 // SELECT * - this should be handled as ResultColumn::Star in translate_target_list
@@ -252,6 +255,29 @@ impl PostgreSQLTranslator {
             }
         } else {
             Err(ParseError::ParseError("Empty constant value".to_string()))
+        }
+    }
+
+    fn translate_a_expr(&self, a_expr: &pg_query::protobuf::AExpr) -> Result<ast::Expr, ParseError> {
+        use pg_query::protobuf::AExprKind;
+
+        match &a_expr.kind() {
+            AExprKind::AexprOp => {
+                // Regular binary operators
+                self.translate_binary_expr(a_expr)
+            }
+            AExprKind::AexprIn => {
+                // IN operator
+                self.translate_in_expr(a_expr)
+            }
+            AExprKind::AexprLike => {
+                // LIKE/NOT LIKE operator
+                self.translate_like_expr(a_expr)
+            }
+            _ => Err(ParseError::ParseError(format!(
+                "Unsupported AExpr kind: {:?}",
+                a_expr.kind()
+            ))),
         }
     }
 
@@ -297,6 +323,131 @@ impl PostgreSQLTranslator {
         };
 
         Ok(ast::Expr::Binary(left, binary_op, right))
+    }
+
+    fn translate_in_expr(&self, a_expr: &pg_query::protobuf::AExpr) -> Result<ast::Expr, ParseError> {
+        // Get the left expression (the column/expression being tested)
+        let lhs = if let Some(lexpr) = &a_expr.lexpr {
+            Box::new(self.translate_expr(lexpr)?)
+        } else {
+            return Err(ParseError::ParseError("Missing left expression for IN operator".to_string()));
+        };
+
+        // Get the right expression (should be a list)
+        let rhs = if let Some(rexpr) = &a_expr.rexpr {
+            match &rexpr.node {
+                Some(pg_query::protobuf::node::Node::List(list)) => {
+                    let mut values = Vec::new();
+                    for item in &list.items {
+                        values.push(Box::new(self.translate_expr(item)?));
+                    }
+                    values
+                }
+                _ => return Err(ParseError::ParseError("Expected list for IN operator right side".to_string())),
+            }
+        } else {
+            return Err(ParseError::ParseError("Missing right expression for IN operator".to_string()));
+        };
+
+        // Check if it's NOT IN
+        let not = a_expr.name.first()
+            .and_then(|name| name.node.as_ref())
+            .and_then(|node| match node {
+                pg_query::protobuf::node::Node::String(s) if s.sval == "<>" => Some(true),
+                _ => Some(false),
+            })
+            .unwrap_or(false);
+
+        Ok(ast::Expr::InList {
+            lhs,
+            not,
+            rhs,
+        })
+    }
+
+    fn translate_like_expr(&self, a_expr: &pg_query::protobuf::AExpr) -> Result<ast::Expr, ParseError> {
+        // Get the operator name to determine if it's LIKE or NOT LIKE
+        let op_name = if let Some(name) = a_expr.name.first() {
+            match &name.node {
+                Some(pg_query::protobuf::node::Node::String(s)) => &s.sval,
+                _ => return Err(ParseError::ParseError("Invalid LIKE operator name".to_string())),
+            }
+        } else {
+            return Err(ParseError::ParseError("Missing LIKE operator name".to_string()));
+        };
+
+        // Determine if it's NOT LIKE
+        let not = match op_name.as_str() {
+            "~~" => false,    // LIKE
+            "!~~" => true,    // NOT LIKE
+            _ => return Err(ParseError::ParseError(format!("Unsupported LIKE operator: {}", op_name))),
+        };
+
+        // Get left and right expressions
+        let lhs = if let Some(lexpr) = &a_expr.lexpr {
+            Box::new(self.translate_expr(lexpr)?)
+        } else {
+            return Err(ParseError::ParseError("Missing left expression for LIKE operator".to_string()));
+        };
+
+        let rhs = if let Some(rexpr) = &a_expr.rexpr {
+            Box::new(self.translate_expr(rexpr)?)
+        } else {
+            return Err(ParseError::ParseError("Missing right expression for LIKE operator".to_string()));
+        };
+
+        Ok(ast::Expr::Like {
+            lhs,
+            not,
+            op: ast::LikeOperator::Like,
+            rhs,
+            escape: None,
+        })
+    }
+
+    fn translate_bool_expr(&self, bool_expr: &pg_query::protobuf::BoolExpr) -> Result<ast::Expr, ParseError> {
+        use pg_query::protobuf::BoolExprType;
+
+        if bool_expr.args.is_empty() {
+            return Err(ParseError::ParseError("BoolExpr must have at least 1 argument".to_string()));
+        }
+
+        // Map PostgreSQL boolean operators to Turso operators
+        match &bool_expr.boolop() {
+            BoolExprType::NotExpr => {
+                // NOT is unary, handle differently
+                if bool_expr.args.len() != 1 {
+                    return Err(ParseError::ParseError("NOT expression must have exactly 1 argument".to_string()));
+                }
+                let operand = Box::new(self.translate_expr(&bool_expr.args[0])?);
+                Ok(ast::Expr::Unary(ast::UnaryOperator::Not, operand))
+            }
+            BoolExprType::AndExpr => {
+                if bool_expr.args.len() < 2 {
+                    return Err(ParseError::ParseError("AND expression must have at least 2 arguments".to_string()));
+                }
+                // Combine all arguments into a binary tree with AND
+                let mut result = self.translate_expr(&bool_expr.args[0])?;
+                for arg in &bool_expr.args[1..] {
+                    let right = self.translate_expr(arg)?;
+                    result = ast::Expr::Binary(Box::new(result), ast::Operator::And, Box::new(right));
+                }
+                Ok(result)
+            }
+            BoolExprType::OrExpr => {
+                if bool_expr.args.len() < 2 {
+                    return Err(ParseError::ParseError("OR expression must have at least 2 arguments".to_string()));
+                }
+                // Combine all arguments into a binary tree with OR
+                let mut result = self.translate_expr(&bool_expr.args[0])?;
+                for arg in &bool_expr.args[1..] {
+                    let right = self.translate_expr(arg)?;
+                    result = ast::Expr::Binary(Box::new(result), ast::Operator::Or, Box::new(right));
+                }
+                Ok(result)
+            }
+            _ => Err(ParseError::ParseError(format!("Unsupported BoolExpr type: {:?}", bool_expr.boolop()))),
+        }
     }
 
 }
@@ -669,6 +820,176 @@ mod tests {
             }
         } else {
             panic!("Expected select query");
+        }
+    }
+
+    #[test]
+    fn test_bool_expr_and_translation() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT * FROM users WHERE age > 18 AND name = 'John'";
+        let parse_result = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parse_result);
+        assert!(translated.is_ok());
+
+        if let Ok(ast::Stmt::Select(select)) = translated {
+            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
+                assert!(where_clause.is_some());
+                if let Some(where_expr) = where_clause {
+                    // Should be a binary AND expression
+                    assert!(matches!(**where_expr, ast::Expr::Binary(_, ast::Operator::And, _)), "Expected AND expression");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_bool_expr_or_translation() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT * FROM users WHERE age > 18 OR name = 'John'";
+        let parse_result = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parse_result);
+        assert!(translated.is_ok());
+
+        if let Ok(ast::Stmt::Select(select)) = translated {
+            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
+                assert!(where_clause.is_some());
+                if let Some(where_expr) = where_clause {
+                    // Should be a binary OR expression
+                    assert!(matches!(**where_expr, ast::Expr::Binary(_, ast::Operator::Or, _)), "Expected OR expression");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_in_list_translation() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT * FROM users WHERE type IN ('admin', 'user', 'guest')";
+        let parse_result = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parse_result);
+        assert!(translated.is_ok());
+
+        if let Ok(ast::Stmt::Select(select)) = translated {
+            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
+                assert!(where_clause.is_some());
+                if let Some(where_expr) = where_clause {
+                    // Should be an InList expression
+                    if let ast::Expr::InList { lhs, not, rhs } = &**where_expr {
+                        assert!(!not, "Should not be NOT IN");
+                        assert_eq!(rhs.len(), 3, "Should have 3 values in the IN list");
+
+                        // Check that lhs is a column reference
+                        assert!(matches!(**lhs, ast::Expr::Name(_)), "Left side should be a column name");
+
+                        // Check that the list values are literals
+                        for value in rhs {
+                            assert!(matches!(**value, ast::Expr::Literal(_)), "IN list values should be literals");
+                        }
+                    } else {
+                        panic!("Expected InList expression but got: {:?}", where_expr);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_like_translation() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT * FROM users WHERE name LIKE 'John%'";
+        let parse_result = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parse_result);
+        assert!(translated.is_ok());
+
+        if let Ok(ast::Stmt::Select(select)) = translated {
+            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
+                assert!(where_clause.is_some());
+                if let Some(where_expr) = where_clause {
+                    // Should be a Like expression
+                    if let ast::Expr::Like { lhs, not, op, rhs, escape } = &**where_expr {
+                        assert!(!not, "Should not be NOT LIKE");
+                        assert!(matches!(op, ast::LikeOperator::Like), "Should be LIKE operator");
+                        assert!(escape.is_none(), "No ESCAPE clause expected");
+
+                        // Check left and right expressions
+                        assert!(matches!(**lhs, ast::Expr::Name(_)), "Left side should be column name");
+                        assert!(matches!(**rhs, ast::Expr::Literal(_)), "Right side should be literal");
+                    } else {
+                        panic!("Expected Like expression but got: {:?}", where_expr);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_not_like_translation() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT * FROM users WHERE name NOT LIKE 'sqlite_%'";
+        let parse_result = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parse_result);
+        assert!(translated.is_ok());
+
+        if let Ok(ast::Stmt::Select(select)) = translated {
+            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
+                assert!(where_clause.is_some());
+                if let Some(where_expr) = where_clause {
+                    // Should be a Like expression with NOT
+                    if let ast::Expr::Like { lhs, not, op, rhs, escape } = &**where_expr {
+                        assert!(*not, "Should be NOT LIKE");
+                        assert!(matches!(op, ast::LikeOperator::Like), "Should be LIKE operator");
+                        assert!(escape.is_none(), "No ESCAPE clause expected");
+
+                        // Check expressions
+                        assert!(matches!(**lhs, ast::Expr::Name(_)), "Left side should be column name");
+                        assert!(matches!(**rhs, ast::Expr::Literal(_)), "Right side should be literal");
+                    } else {
+                        panic!("Expected Like expression but got: {:?}", where_expr);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_complex_schema_query_translation() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT type, name FROM sqlite_schema WHERE type IN ('table', 'index', 'view') AND name NOT LIKE 'sqlite_%'";
+        let parse_result = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parse_result);
+        assert!(translated.is_ok());
+
+        if let Ok(ast::Stmt::Select(select)) = translated {
+            if let ast::OneSelect::Select { columns, from, where_clause, .. } = &select.body.select {
+                // Check columns
+                assert_eq!(columns.len(), 2, "Should have 2 columns");
+
+                // Check FROM clause
+                assert!(from.is_some(), "Should have FROM clause");
+
+                // Check WHERE clause structure
+                assert!(where_clause.is_some(), "Should have WHERE clause");
+                if let Some(where_expr) = where_clause {
+                    // Should be an AND expression
+                    if let ast::Expr::Binary(left, op, right) = &**where_expr {
+                        assert!(matches!(op, ast::Operator::And), "Top level should be AND");
+
+                        // Left side should be IN expression
+                        assert!(matches!(**left, ast::Expr::InList { .. }), "Left side should be IN list");
+
+                        // Right side should be NOT LIKE expression
+                        if let ast::Expr::Like { not, .. } = &**right {
+                            assert!(*not, "Right side should be NOT LIKE");
+                        } else {
+                            panic!("Right side should be LIKE expression");
+                        }
+                    } else {
+                        panic!("WHERE clause should be Binary expression");
+                    }
+                }
+            }
+        } else {
+            panic!("Translation should succeed");
         }
     }
 }
