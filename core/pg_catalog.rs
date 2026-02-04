@@ -1,3 +1,4 @@
+use crate::schema::Table;
 use crate::sync::{Arc, RwLock};
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
 use crate::{Connection, LimboError, Value};
@@ -98,15 +99,47 @@ impl PgClassCursor {
     }
 
     fn load_from_sqlite_master(&mut self) -> Result<(), LimboError> {
-        // Query sqlite_master to get all tables, views, indexes
-        // Map to pg_class format
-        // This is a simplified mapping - we'll expand it later
+        // Query sqlite_master to get all tables, views, indexes and map to pg_class format
 
-        // For now, create mock data to test the structure
-        self.rows = vec![
-            vec![
-                Value::Integer(1),                    // oid
-                Value::Text("test_table".into()),     // relname
+        // Get the schema from connection (using SQLite dialect to access sqlite_master)
+        let schema = self.conn.schema.read().clone();
+        self.rows.clear();
+
+        let mut oid_counter = 16384; // Start PostgreSQL OIDs from a high number to avoid conflicts
+
+        // Iterate through all tables in the schema
+        for (table_name, table) in &schema.tables {
+            // Skip SQLite system tables when in PostgreSQL mode
+            if table_name == "sqlite_schema" || table_name == "sqlite_master" {
+                continue;
+            }
+
+            // Skip PostgreSQL catalog tables (they have their own OIDs)
+            if table_name.starts_with("pg_") {
+                continue;
+            }
+
+            // Skip other SQLite-specific virtual tables
+            if table_name.starts_with("pragma_") || table_name.starts_with("json_") || table_name == "sqlite_dbpage" {
+                continue;
+            }
+
+            let (relkind, relnatts) = match table.as_ref() {
+                Table::BTree(btree_table) => {
+                    ("r", btree_table.columns.len() as i64) // r = regular table
+                }
+                Table::Virtual(_) => {
+                    ("v", 0) // v = view (virtual tables treated as views)
+                }
+                Table::FromClauseSubquery(_) => {
+                    continue; // Skip subqueries
+                }
+            };
+
+            // Create a row for this table
+            self.rows.push(vec![
+                Value::Integer(oid_counter),           // oid
+                Value::Text(table_name.clone().into()), // relname
                 Value::Integer(2200),                  // relnamespace (public schema)
                 Value::Integer(0),                     // reltype
                 Value::Integer(0),                     // reloftype
@@ -121,8 +154,8 @@ impl PgClassCursor {
                 Value::Integer(0),                     // relhasindex
                 Value::Integer(0),                     // relisshared
                 Value::Text("p".into()),               // relpersistence (permanent)
-                Value::Text("r".into()),               // relkind (r=table)
-                Value::Integer(2),                     // relnatts (number of attributes)
+                Value::Text(relkind.into()),           // relkind
+                Value::Integer(relnatts),              // relnatts (number of attributes)
                 Value::Integer(0),                     // relchecks
                 Value::Integer(0),                     // relhasrules
                 Value::Integer(0),                     // relhastriggers
@@ -138,8 +171,11 @@ impl PgClassCursor {
                 Value::Null,                           // relacl
                 Value::Null,                           // reloptions
                 Value::Null,                           // relpartbound
-            ],
-        ];
+            ]);
+
+            oid_counter += 1;
+        }
+
         Ok(())
     }
 }
