@@ -572,15 +572,13 @@ impl PgGetTableDefCursor {
                 continue;
             }
 
-            // Get the original SQLite DDL
+            // Get the original SQLite DDL and convert to PostgreSQL
             let sqlite_ddl = self.get_sqlite_ddl(table_name)?;
-
-            // Convert to PostgreSQL DDL
             let postgres_ddl = self.convert_to_postgres_ddl(&sqlite_ddl);
 
             self.rows.push(vec![
+                Value::Text("public".into()),  // schema_name (PostgreSQL default)
                 Value::Text(table_name.clone().into()),
-                Value::Text(sqlite_ddl.into()),
                 Value::Text(postgres_ddl.into()),
             ]);
         }
@@ -633,18 +631,37 @@ impl PgGetTableDefCursor {
         let mut postgres_ddl = sqlite_ddl.to_string();
 
         // Basic SQLite to PostgreSQL type conversions
+        // Handle INTEGER PRIMARY KEY specially for SERIAL
         postgres_ddl = postgres_ddl.replace(" INTEGER PRIMARY KEY", " SERIAL PRIMARY KEY");
         postgres_ddl = postgres_ddl.replace(" AUTOINCREMENT", "");
-        postgres_ddl = postgres_ddl.replace(" INTEGER", " INTEGER");
-        postgres_ddl = postgres_ddl.replace(" REAL", " DOUBLE PRECISION");
-        postgres_ddl = postgres_ddl.replace(" TEXT", " TEXT");
-        postgres_ddl = postgres_ddl.replace(" BLOB", " BYTEA");
 
-        // Handle DATETIME/TIMESTAMP
-        postgres_ddl = postgres_ddl.replace(" DATETIME", " TIMESTAMP");
+        // Type conversions - use lowercase for PostgreSQL standard
+        // Use regex-like replacements to handle case-insensitive matches
+        let type_replacements = [
+            (" INTEGER", " integer"),
+            (" intEgEr", " integer"),
+            (" REAL", " double precision"),
+            (" real", " double precision"),
+            (" TEXT", " text"),
+            (" text", " text"),
+            (" BLOB", " bytea"),
+            (" blob", " bytea"),
+            (" DATETIME", " timestamp"),
+            (" datetime", " timestamp"),
+        ];
+
+        for (from, to) in &type_replacements {
+            postgres_ddl = postgres_ddl.replace(from, to);
+        }
 
         // Remove SQLite-specific features
         postgres_ddl = postgres_ddl.replace(" WITHOUT ROWID", "");
+
+        // Ensure proper formatting - PostgreSQL conventionally uses lowercase
+        // Convert CREATE TABLE to proper case
+        if postgres_ddl.starts_with("CREATE TABLE") {
+            postgres_ddl = postgres_ddl.replacen("CREATE TABLE", "CREATE TABLE", 1);
+        }
 
         postgres_ddl
     }
@@ -688,9 +705,9 @@ impl InternalVirtualTable for PgGetTableDefTable {
 
     fn sql(&self) -> String {
         "CREATE TABLE pg_get_tabledef (
+            schema_name TEXT,
             table_name TEXT,
-            sqlite_ddl TEXT,
-            postgres_ddl TEXT
+            ddl TEXT
         )".to_string()
     }
 
