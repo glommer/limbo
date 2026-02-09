@@ -1652,7 +1652,9 @@ pub fn op_type_check(
             let _applied = apply_affinity_char(reg, col_affinity);
             let value_type = reg.get_value().value_type();
             match_ignore_ascii_case!(match ty_bytes {
-                b"INTEGER" | b"INT" if value_type == ValueType::Integer || value_type == ValueType::Float => {
+                b"INTEGER" | b"INT"
+                    if value_type == ValueType::Integer || value_type == ValueType::Float =>
+                {
                     if value_type == ValueType::Float {
                         if let Register::Value(value) = reg {
                             if let Value::Float(f) = *value {
