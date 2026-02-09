@@ -45,7 +45,7 @@ fn test_type_casting() {
         "SELECT '{1,2,3}'::int[]",
         "SELECT CAST('123' AS integer)",
         "SELECT CAST('3.14' AS double precision)",
-        "SELECT column::text::json",
+        "SELECT col::text::json",  // "column" is a reserved keyword in PostgreSQL
         "SELECT $1::text",
     ];
 
@@ -74,7 +74,7 @@ fn test_arrays() {
     let queries = vec![
         "SELECT ARRAY[1, 2, 3]",
         "SELECT ARRAY[]::integer[]",
-        "SELECT ARRAY[1, 2, 3][1]",
+        "SELECT (ARRAY[1, 2, 3])[1]",  // Array subscript on constructor requires parentheses
         "SELECT '{1,2,3}'::int[]",
         "SELECT array_column[1]",
         "SELECT array_column[1:3]",
@@ -542,7 +542,8 @@ fn test_row_constructors() {
         "SELECT ROW(1, 2, 'hello')",
         "SELECT (1, 2, 'hello')",
         "SELECT * FROM users WHERE (id, name) = (1, 'John')",
-        "INSERT INTO users (id, name) VALUES ROW(1, 'John')",
+        // Note: ROW() is not valid in INSERT VALUES in PostgreSQL, only in expressions
+        "SELECT ROW(1, 'John')",
         "SELECT max(ROW(a, b)) FROM test_table",
     ];
 

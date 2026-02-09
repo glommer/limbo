@@ -15,10 +15,21 @@ pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
 }
 
 /// Parse multiple PostgreSQL SQL statements
+/// Returns one ParseResult per statement by splitting on semicolons
+/// and parsing each individually.
 pub fn parse_statements(sql: &str) -> Result<Vec<ParseResult>, ParseError> {
-    // pg_query handles multiple statements internally
-    // For now, we'll parse as a single batch
-    parse(sql).map(|result| vec![result])
+    // pg_query parses all statements at once into a single ParseResult.
+    // Split the input on semicolons and parse each statement individually
+    // to return one ParseResult per statement.
+    let mut results = Vec::new();
+    for part in sql.split(';') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        results.push(parse(trimmed)?);
+    }
+    Ok(results)
 }
 
 /// Get tables referenced in a query
