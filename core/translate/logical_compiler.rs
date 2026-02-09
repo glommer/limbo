@@ -16,6 +16,7 @@
 //! - Halt: Terminate program
 
 #![allow(dead_code)]
+#![allow(clippy::only_used_in_recursion)]
 
 use crate::schema::{Table};
 use crate::translate::emitter::Resolver;
@@ -758,7 +759,7 @@ impl<'a> LogicalCompiler<'a> {
                 // Left is true, so result depends on right operand
                 self.program.emit_insn(Insn::Move {
                     source_reg: right_reg,
-                    dest_reg: dest_reg,
+                    dest_reg,
                     count: 1,
                 });
                 self.program.emit_insn(Insn::Goto {
@@ -789,7 +790,7 @@ impl<'a> LogicalCompiler<'a> {
                 // Left is false/null, so result depends on right operand
                 self.program.emit_insn(Insn::Move {
                     source_reg: right_reg,
-                    dest_reg: dest_reg,
+                    dest_reg,
                     count: 1,
                 });
                 self.program.emit_insn(Insn::Goto {

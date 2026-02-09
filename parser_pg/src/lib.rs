@@ -91,7 +91,7 @@ mod tests {
 
         for sql in queries {
             let result = parse(sql);
-            assert!(result.is_ok(), "Failed to parse: {}", sql);
+            assert!(result.is_ok(), "Failed to parse: {sql}");
         }
     }
 }

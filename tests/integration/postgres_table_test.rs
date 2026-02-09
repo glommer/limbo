@@ -19,7 +19,7 @@ fn test_postgres_read_real_table(db: TempDatabase) {
     // Try to read from the table using PostgreSQL parser
     let result = conn.query("SELECT * FROM users");
     if let Err(ref e) = result {
-        panic!("Query failed: {:?}", e);
+        panic!("Query failed: {e:?}");
     }
     let mut rows = result.unwrap().unwrap();
 

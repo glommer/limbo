@@ -17,7 +17,7 @@ fn test_invalid_syntax() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should have failed to parse: {}", sql);
+        assert!(parse(sql).is_err(), "Should have failed to parse: {sql}");
     }
 }
 
@@ -31,7 +31,7 @@ fn test_invalid_dollar_parameters() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should have failed to parse: {}", sql);
+        assert!(parse(sql).is_err(), "Should have failed to parse: {sql}");
     }
 }
 
@@ -45,7 +45,7 @@ fn test_unterminated_strings() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should have failed to parse: {}", sql);
+        assert!(parse(sql).is_err(), "Should have failed to parse: {sql}");
     }
 }
 
@@ -61,7 +61,7 @@ fn test_mismatched_parentheses() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should have failed to parse: {}", sql);
+        assert!(parse(sql).is_err(), "Should have failed to parse: {sql}");
     }
 }
 
@@ -74,7 +74,7 @@ fn test_invalid_type_casts() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should have failed to parse: {}", sql);
+        assert!(parse(sql).is_err(), "Should have failed to parse: {sql}");
     }
 }
 
@@ -87,7 +87,7 @@ fn test_invalid_json_operators() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should have failed to parse: {}", sql);
+        assert!(parse(sql).is_err(), "Should have failed to parse: {sql}");
     }
 }
 
@@ -101,7 +101,7 @@ fn test_invalid_on_conflict() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should have failed to parse: {}", sql);
+        assert!(parse(sql).is_err(), "Should have failed to parse: {sql}");
     }
 }
 
@@ -115,7 +115,7 @@ fn test_invalid_window_functions() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should have failed to parse: {}", sql);
+        assert!(parse(sql).is_err(), "Should have failed to parse: {sql}");
     }
 }
 
@@ -129,7 +129,7 @@ fn test_invalid_cte() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should have failed to parse: {}", sql);
+        assert!(parse(sql).is_err(), "Should have failed to parse: {sql}");
     }
 }
 
@@ -143,7 +143,7 @@ fn test_invalid_case() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should have failed to parse: {}", sql);
+        assert!(parse(sql).is_err(), "Should have failed to parse: {sql}");
     }
 }
 
@@ -158,7 +158,7 @@ fn test_invalid_create_table() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should have failed to parse: {}", sql);
+        assert!(parse(sql).is_err(), "Should have failed to parse: {sql}");
     }
 }
 
@@ -170,7 +170,7 @@ fn test_invalid_nulls_ordering() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should have failed to parse: {}", sql);
+        assert!(parse(sql).is_err(), "Should have failed to parse: {sql}");
     }
 }
 
@@ -188,7 +188,7 @@ fn test_sqlite_specific_syntax() {
     // Note: Some of these might actually parse depending on how lenient we make the parser
     // This is more about documenting differences
     for sql in queries {
-        println!("Testing SQLite-specific syntax: {}", sql);
+        println!("Testing SQLite-specific syntax: {sql}");
         let result = parse(sql);
         // We don't strictly require these to fail, just document the behavior
         if result.is_err() {
@@ -212,7 +212,7 @@ fn test_missing_statement_features() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should fail to parse psql command: {}", sql);
+        assert!(parse(sql).is_err(), "Should fail to parse psql command: {sql}");
     }
 }
 
@@ -227,7 +227,7 @@ fn test_complex_invalid_syntax() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should fail to parse invalid syntax: {}", sql);
+        assert!(parse(sql).is_err(), "Should fail to parse invalid syntax: {sql}");
     }
 }
 
@@ -245,7 +245,10 @@ fn test_postgresql_unsupported_admin_commands() {
     for sql in queries {
         let result = parse(sql);
         // These may or may not fail depending on implementation - document behavior
-        println!("Testing admin command: {} -> {}", sql, if result.is_ok() { "OK" } else { "FAIL" });
+        {
+            let status = if result.is_ok() { "OK" } else { "FAIL" };
+            println!("Testing admin command: {sql} -> {status}");
+        }
     }
 }
 
@@ -259,6 +262,6 @@ fn test_invalid_operators() {
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should fail to parse invalid operator: {}", sql);
+        assert!(parse(sql).is_err(), "Should fail to parse invalid operator: {sql}");
     }
 }

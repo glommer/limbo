@@ -20,9 +20,9 @@ fn test_postgres_pg_namespace(db: TempDatabase) {
             StepResult::Row => {
                 let row = stmt.row().unwrap();
                 if let Value::Text(nspname) = row.get_value(1) {
-                    if nspname == "pg_catalog" {
+                    if nspname.as_str() == "pg_catalog" {
                         found_pg_catalog = true;
-                    } else if nspname == "public" {
+                    } else if nspname.as_str() == "public" {
                         found_public = true;
                     }
                 }
@@ -50,15 +50,15 @@ fn test_postgres_pg_class(db: TempDatabase) {
     let mut stmt = conn.prepare("SELECT relname, relkind FROM pg_class WHERE relkind = 'r'").unwrap();
 
     // Should see our users table (once we implement the mapping)
-    let mut found_users_table = false;
+    let mut _found_users_table = false;
     loop {
         match stmt.step().unwrap() {
             StepResult::Row => {
                 let row = stmt.row().unwrap();
                 if let (Value::Text(relname), Value::Text(relkind)) =
                     (row.get_value(0), row.get_value(1)) {
-                    if relname == "users" && relkind == "r" {
-                        found_users_table = true;
+                    if relname.as_str() == "users" && relkind.as_str() == "r" {
+                        _found_users_table = true;
                     }
                 }
             }

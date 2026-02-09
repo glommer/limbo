@@ -47,7 +47,7 @@ fn test_postgresql_system_table_mapping() {
         },
         Err(e) => {
             // This might fail if the translator hasn't been fully implemented yet
-            println!("pg_tables translation failed (this may be expected): {}", e);
+            println!("pg_tables translation failed (this may be expected): {e}");
         }
     }
 }

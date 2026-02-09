@@ -14,7 +14,7 @@ fn test_basic_select() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -30,7 +30,7 @@ fn test_dollar_parameters() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -50,7 +50,7 @@ fn test_type_casting() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -65,7 +65,7 @@ fn test_dollar_quoted_strings() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -85,7 +85,7 @@ fn test_arrays() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -105,7 +105,7 @@ fn test_json_jsonb_operators() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -119,7 +119,7 @@ fn test_distinct_on() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -135,7 +135,7 @@ fn test_returning_clause() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -150,7 +150,7 @@ fn test_on_conflict() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -167,7 +167,7 @@ fn test_window_functions() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -181,7 +181,7 @@ fn test_cte_with_recursive() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -195,7 +195,7 @@ fn test_case_expressions() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -213,7 +213,7 @@ fn test_joins() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -226,7 +226,7 @@ fn test_lateral_joins() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -242,7 +242,7 @@ fn test_for_update() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -256,7 +256,7 @@ fn test_nulls_ordering() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -270,7 +270,7 @@ fn test_regex_operators() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -282,7 +282,7 @@ fn test_similar_to() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -294,7 +294,7 @@ fn test_exists_subqueries() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -308,7 +308,7 @@ fn test_in_subqueries() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -322,7 +322,7 @@ fn test_set_operations() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -341,7 +341,7 @@ fn test_aggregate_functions() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -357,7 +357,7 @@ fn test_create_table() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -372,7 +372,7 @@ fn test_create_index() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -388,7 +388,7 @@ fn test_alter_table() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -407,7 +407,7 @@ fn test_transactions() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -456,7 +456,7 @@ fn test_postgresql_types() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -472,7 +472,7 @@ fn test_explain_statements() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -487,7 +487,7 @@ fn test_copy_statements() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -501,7 +501,7 @@ fn test_analyze_statements() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -518,7 +518,7 @@ fn test_set_statements() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -532,7 +532,7 @@ fn test_show_statements() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -547,7 +547,7 @@ fn test_row_constructors() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -560,7 +560,7 @@ fn test_order_by_using() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -574,7 +574,7 @@ fn test_generate_series() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -589,7 +589,7 @@ fn test_array_literals() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -602,7 +602,7 @@ fn test_bit_string_literals() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -616,7 +616,7 @@ fn test_table_functions() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -629,7 +629,7 @@ fn test_create_temporary_table() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -642,7 +642,7 @@ fn test_grouping_sets() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -655,7 +655,7 @@ fn test_filter_aggregates() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -668,7 +668,7 @@ fn test_over_clause_ranges() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -684,7 +684,7 @@ fn test_update_tuple_assignment() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -699,7 +699,7 @@ fn test_insert_array_element_columns() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -714,7 +714,7 @@ fn test_insert_field_access_columns() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -728,7 +728,7 @@ fn test_insert_complex_column_access() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -741,7 +741,7 @@ fn test_update_array_element_assignment() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -754,7 +754,7 @@ fn test_update_field_assignment() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -767,7 +767,7 @@ fn test_update_complex_assignment() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -783,7 +783,7 @@ fn test_create_table_partition() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }
 
@@ -799,6 +799,6 @@ fn test_alter_table_attach_partition() {
     ];
 
     for sql in queries {
-        parse(sql).expect(&format!("Failed to parse: {}", sql));
+        assert!(parse(sql).is_ok(), "Failed to parse: {sql}");
     }
 }

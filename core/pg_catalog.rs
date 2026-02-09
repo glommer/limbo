@@ -137,11 +137,8 @@ impl PgClassCursor {
                 Table::BTree(btree_table) => {
                     ("r", btree_table.columns.len() as i64) // r = regular table
                 }
-                Table::Virtual(_) => {
-                    ("v", 0) // v = view (virtual tables treated as views)
-                }
-                Table::FromClauseSubquery(_) => {
-                    continue; // Skip subqueries
+                Table::Virtual(_) | Table::FromClauseSubquery(_) => {
+                    continue; // Skip virtual tables and subqueries
                 }
             };
 
@@ -594,10 +591,11 @@ impl PgGetTableDefCursor {
 
         if let Some(table) = schema.tables.get(table_name) {
             if let Table::BTree(btree_table) = table.as_ref() {
-                let mut ddl = format!("CREATE TABLE {} (", table_name);
+                let mut ddl = format!("CREATE TABLE {table_name} (");
                 let cols: Vec<String> = btree_table.columns.iter().map(|col| {
                     let col_name = col.name.as_deref().unwrap_or("unnamed");
-                    let mut col_def = format!("{} {}", col_name, col.ty_str);
+                    let ty_str = &col.ty_str;
+                    let mut col_def = format!("{col_name} {ty_str}");
 
                     // Check if this column is a primary key
                     for (pk_col, _) in &btree_table.primary_key_columns {
@@ -624,7 +622,7 @@ impl PgGetTableDefCursor {
                 return Ok(ddl);
             }
         }
-        Ok(format!("CREATE TABLE {} (...)", table_name))
+        Ok(format!("CREATE TABLE {table_name} (...)"))
     }
 
     fn convert_to_postgres_ddl(&self, sqlite_ddl: &str) -> String {
@@ -656,12 +654,6 @@ impl PgGetTableDefCursor {
 
         // Remove SQLite-specific features
         postgres_ddl = postgres_ddl.replace(" WITHOUT ROWID", "");
-
-        // Ensure proper formatting - PostgreSQL conventionally uses lowercase
-        // Convert CREATE TABLE to proper case
-        if postgres_ddl.starts_with("CREATE TABLE") {
-            postgres_ddl = postgres_ddl.replacen("CREATE TABLE", "CREATE TABLE", 1);
-        }
 
         postgres_ddl
     }

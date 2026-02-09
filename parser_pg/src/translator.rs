@@ -8,24 +8,27 @@ use crate::ParseError;
 use turso_parser::ast;
 
 /// Translates a PostgreSQL query into Turso's AST
+#[derive(Default)]
 pub struct PostgreSQLTranslator {
     // TODO: Add schema information, type mappings, etc.
 }
 
 impl PostgreSQLTranslator {
     pub fn new() -> Self {
-        PostgreSQLTranslator {}
+        Self::default()
     }
 
-    /// Maps PostgreSQL system table names to SQLite equivalents
+    /// Maps PostgreSQL system table names to their Turso equivalents.
+    /// pg_class, pg_namespace, and pg_attribute have virtual table implementations
+    /// and are passed through as-is. Other information_schema names are mapped
+    /// to SQLite equivalents.
     fn map_table_name(&self, table_name: &str) -> String {
         match table_name.to_lowercase().as_str() {
-            // PostgreSQL information schema mappings
+            // These have virtual table implementations in pg_catalog.rs - pass through
+            "pg_class" | "pg_namespace" | "pg_attribute" => table_name.to_string(),
+            // PostgreSQL information schema mappings (no virtual table yet)
             "pg_tables" => "sqlite_master".to_string(),
             "information_schema.tables" => "sqlite_master".to_string(),
-            "pg_class" => "sqlite_master".to_string(),
-            "pg_namespace" => "sqlite_master".to_string(),
-            "pg_attribute" => "pragma_table_info".to_string(),
             "information_schema.columns" => "pragma_table_info".to_string(),
             // Default: keep original name
             _ => table_name.to_string(),
@@ -87,6 +90,9 @@ impl PostgreSQLTranslator {
             None
         };
 
+        // 4. Handle ORDER BY clause
+        let order_by = self.translate_order_by(&select.sort_clause)?;
+
         // Build the SELECT AST
         let one_select = ast::OneSelect::Select {
             distinctness: None,
@@ -105,7 +111,7 @@ impl PostgreSQLTranslator {
         let select_ast = ast::Select {
             with: None,
             body: select_body,
-            order_by: vec![],
+            order_by,
             limit: None,
         };
 
@@ -211,9 +217,9 @@ impl PostgreSQLTranslator {
                         }
                         Some(pg_query::protobuf::node::Node::AStar(_)) => {
                             // SELECT * case - should be handled in translate_target_list, not here
-                            return Err(ParseError::ParseError("AStar should be handled in target list, not as expression".to_string()));
+                            Err(ParseError::ParseError("AStar should be handled in target list, not as expression".to_string()))
                         }
-                        _ => Err(ParseError::ParseError(format!("Invalid column reference, expected String or AStar but got: {:?}", field.node))),
+                        other => Err(ParseError::ParseError(format!("Invalid column reference, expected String or AStar but got: {other:?}"))),
                     }
                 } else {
                     Err(ParseError::ParseError("Empty column reference".to_string()))
@@ -228,9 +234,12 @@ impl PostgreSQLTranslator {
             Some(pg_query::protobuf::node::Node::BoolExpr(bool_expr)) => {
                 self.translate_bool_expr(bool_expr)
             }
+            Some(pg_query::protobuf::node::Node::FuncCall(func_call)) => {
+                self.translate_func_call(func_call)
+            }
             Some(pg_query::protobuf::node::Node::AStar(_)) => {
                 // SELECT * - this should be handled as ResultColumn::Star in translate_target_list
-                return Err(ParseError::ParseError("AStar should not be translated as expression".to_string()));
+                Err(ParseError::ParseError("AStar should not be translated as expression".to_string()))
             }
             _ => Err(ParseError::ParseError(format!(
                 "Unsupported expression type: {:?}",
@@ -246,7 +255,10 @@ impl PostgreSQLTranslator {
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(i.ival.to_string())))
                 }
                 pg_query::protobuf::a_const::Val::Sval(s) => {
-                    Ok(ast::Expr::Literal(ast::Literal::String(s.sval.clone())))
+                    // Turso's AST expects string literals to include surrounding single quotes
+                    // (sanitize_string strips them during bytecode emission)
+                    let quoted = format!("'{}'", s.sval.replace('\'', "''"));
+                    Ok(ast::Expr::Literal(ast::Literal::String(quoted)))
                 }
                 pg_query::protobuf::a_const::Val::Fval(f) => {
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(f.fval.clone())))
@@ -306,7 +318,7 @@ impl PostgreSQLTranslator {
             "/" => ast::Operator::Divide,
             "AND" => ast::Operator::And,
             "OR" => ast::Operator::Or,
-            _ => return Err(ParseError::ParseError(format!("Unsupported operator: {}", op_name))),
+            _ => return Err(ParseError::ParseError(format!("Unsupported operator: {op_name}"))),
         };
 
         // Translate left and right expressions
@@ -352,10 +364,7 @@ impl PostgreSQLTranslator {
         // Check if it's NOT IN
         let not = a_expr.name.first()
             .and_then(|name| name.node.as_ref())
-            .and_then(|node| match node {
-                pg_query::protobuf::node::Node::String(s) if s.sval == "<>" => Some(true),
-                _ => Some(false),
-            })
+            .map(|node| matches!(node, pg_query::protobuf::node::Node::String(s) if s.sval == "<>"))
             .unwrap_or(false);
 
         Ok(ast::Expr::InList {
@@ -380,7 +389,7 @@ impl PostgreSQLTranslator {
         let not = match op_name.as_str() {
             "~~" => false,    // LIKE
             "!~~" => true,    // NOT LIKE
-            _ => return Err(ParseError::ParseError(format!("Unsupported LIKE operator: {}", op_name))),
+            _ => return Err(ParseError::ParseError(format!("Unsupported LIKE operator: {op_name}"))),
         };
 
         // Get left and right expressions
@@ -403,6 +412,83 @@ impl PostgreSQLTranslator {
             rhs,
             escape: None,
         })
+    }
+
+    fn translate_func_call(&self, func_call: &pg_query::protobuf::FuncCall) -> Result<ast::Expr, ParseError> {
+        // Extract function name
+        let func_name = func_call.funcname.iter()
+            .filter_map(|node| {
+                if let Some(pg_query::protobuf::node::Node::String(s)) = &node.node {
+                    Some(s.sval.clone())
+                } else {
+                    None
+                }
+            })
+            .next_back()
+            .ok_or_else(|| ParseError::ParseError("Missing function name".to_string()))?;
+
+        let filter_over = ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        };
+
+        // COUNT(*) and similar aggregate star calls
+        if func_call.agg_star {
+            return Ok(ast::Expr::FunctionCallStar {
+                name: ast::Name::from_string(func_name),
+                filter_over,
+            });
+        }
+
+        // Translate function arguments
+        let args = func_call.args.iter()
+            .map(|arg| Ok(Box::new(self.translate_expr(arg)?)))
+            .collect::<Result<Vec<_>, ParseError>>()?;
+
+        let distinctness = if func_call.agg_distinct {
+            Some(ast::Distinctness::Distinct)
+        } else {
+            None
+        };
+
+        Ok(ast::Expr::FunctionCall {
+            name: ast::Name::from_string(func_name),
+            distinctness,
+            args,
+            order_by: vec![],
+            filter_over,
+        })
+    }
+
+    fn translate_order_by(&self, sort_clause: &[pg_query::protobuf::Node]) -> Result<Vec<ast::SortedColumn>, ParseError> {
+        let mut sorted_columns = Vec::new();
+        for node in sort_clause {
+            match &node.node {
+                Some(pg_query::protobuf::node::Node::SortBy(sort_by)) => {
+                    let expr = if let Some(ref sort_node) = sort_by.node {
+                        Box::new(self.translate_expr(sort_node)?)
+                    } else {
+                        return Err(ParseError::ParseError("Missing sort expression".to_string()));
+                    };
+
+                    let order = match pg_query::protobuf::SortByDir::try_from(sort_by.sortby_dir) {
+                        Ok(pg_query::protobuf::SortByDir::SortbyAsc) => Some(ast::SortOrder::Asc),
+                        Ok(pg_query::protobuf::SortByDir::SortbyDesc) => Some(ast::SortOrder::Desc),
+                        _ => None, // Default or undefined
+                    };
+
+                    sorted_columns.push(ast::SortedColumn {
+                        expr,
+                        order,
+                        nulls: None,
+                    });
+                }
+                _ => return Err(ParseError::ParseError(format!(
+                    "Unsupported ORDER BY clause item: {:?}", node.node
+                ))),
+            }
+        }
+        Ok(sorted_columns)
     }
 
     fn translate_bool_expr(&self, bool_expr: &pg_query::protobuf::BoolExpr) -> Result<ast::Expr, ParseError> {
@@ -614,7 +700,7 @@ mod tests {
 
                 // First column should be 'id'
                 if let ast::ResultColumn::Expr(expr, alias) = &columns[0] {
-                    assert!(matches!(**expr, ast::Expr::Name(_)), "Expected Name expression but got {:?}", expr);
+                    assert!(matches!(**expr, ast::Expr::Name(_)), "Expected Name expression but got {expr:?}");
                     if let ast::Expr::Name(name) = &**expr {
                         assert_eq!(name.as_str(), "id");
                     }
@@ -625,7 +711,7 @@ mod tests {
 
                 // Second column should be 'name'
                 if let ast::ResultColumn::Expr(expr, alias) = &columns[1] {
-                    assert!(matches!(**expr, ast::Expr::Name(_)), "Expected Name expression but got {:?}", expr);
+                    assert!(matches!(**expr, ast::Expr::Name(_)), "Expected Name expression but got {expr:?}");
                     if let ast::Expr::Name(name) = &**expr {
                         assert_eq!(name.as_str(), "name");
                     }
@@ -659,7 +745,7 @@ mod tests {
 
                 // First column should be 'users.id'
                 if let ast::ResultColumn::Expr(expr, alias) = &columns[0] {
-                    assert!(matches!(**expr, ast::Expr::Qualified(_, _)), "Expected Qualified expression but got {:?}", expr);
+                    assert!(matches!(**expr, ast::Expr::Qualified(_, _)), "Expected Qualified expression but got {expr:?}");
                     if let ast::Expr::Qualified(table_name, col_name) = &**expr {
                         assert_eq!(table_name.as_str(), "users");
                         assert_eq!(col_name.as_str(), "id");
@@ -671,7 +757,7 @@ mod tests {
 
                 // Second column should be 't.name'
                 if let ast::ResultColumn::Expr(expr, alias) = &columns[1] {
-                    assert!(matches!(**expr, ast::Expr::Qualified(_, _)), "Expected Qualified expression but got {:?}", expr);
+                    assert!(matches!(**expr, ast::Expr::Qualified(_, _)), "Expected Qualified expression but got {expr:?}");
                     if let ast::Expr::Qualified(table_name, col_name) = &**expr {
                         assert_eq!(table_name.as_str(), "t");
                         assert_eq!(col_name.as_str(), "name");
@@ -712,7 +798,7 @@ mod tests {
                 assert!(where_clause.is_some());
                 if let Some(where_expr) = where_clause {
                     // WHERE id = 1 should be a binary expression
-                    assert!(matches!(**where_expr, ast::Expr::Binary(_, _, _)), "Expected Binary expression but got {:?}", where_expr);
+                    assert!(matches!(**where_expr, ast::Expr::Binary(_, _, _)), "Expected Binary expression but got {where_expr:?}");
                     if let ast::Expr::Binary(left, op, right) = &**where_expr {
                         // Left side should be column 'id'
                         assert!(matches!(**left, ast::Expr::Name(_)), "Expected Name expression for left side");
@@ -754,18 +840,18 @@ mod tests {
         ];
 
         for (sql, description) in test_cases {
-            println!("Testing: {}", description);
+            println!("Testing: {description}");
             let parse_result = crate::parse(sql).unwrap();
             let translated = translator.translate(&parse_result);
-            assert!(translated.is_ok(), "Failed to translate: {} ({})", sql, description);
+            assert!(translated.is_ok(), "Failed to translate: {sql} ({description})");
 
             if let Ok(ast::Stmt::Select(select)) = translated {
                 // Verify it's a valid Select AST
                 match &select.body.select {
                     ast::OneSelect::Select { columns, .. } => {
-                        assert!(!columns.is_empty(), "No columns in result for: {}", sql);
+                        assert!(!columns.is_empty(), "No columns in result for: {sql}");
                     }
-                    _ => panic!("Expected OneSelect::Select for: {}", sql),
+                    _ => panic!("Expected OneSelect::Select for: {sql}"),
                 }
             }
         }
@@ -783,10 +869,10 @@ mod tests {
             if let ast::OneSelect::Select { columns, .. } = &select.body.select {
                 assert_eq!(columns.len(), 3);
 
-                // Check string literal
+                // Check string literal (wrapped in single quotes for Turso AST convention)
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
                     if let ast::Expr::Literal(ast::Literal::String(s)) = &**expr {
-                        assert_eq!(s, "hello");
+                        assert_eq!(s, "'hello'");
                     } else {
                         panic!("Expected string literal");
                     }
@@ -886,7 +972,7 @@ mod tests {
                             assert!(matches!(**value, ast::Expr::Literal(_)), "IN list values should be literals");
                         }
                     } else {
-                        panic!("Expected InList expression but got: {:?}", where_expr);
+                        panic!("Expected InList expression but got: {where_expr:?}");
                     }
                 }
             }
@@ -915,7 +1001,7 @@ mod tests {
                         assert!(matches!(**lhs, ast::Expr::Name(_)), "Left side should be column name");
                         assert!(matches!(**rhs, ast::Expr::Literal(_)), "Right side should be literal");
                     } else {
-                        panic!("Expected Like expression but got: {:?}", where_expr);
+                        panic!("Expected Like expression but got: {where_expr:?}");
                     }
                 }
             }
@@ -944,7 +1030,7 @@ mod tests {
                         assert!(matches!(**lhs, ast::Expr::Name(_)), "Left side should be column name");
                         assert!(matches!(**rhs, ast::Expr::Literal(_)), "Right side should be literal");
                     } else {
-                        panic!("Expected Like expression but got: {:?}", where_expr);
+                        panic!("Expected Like expression but got: {where_expr:?}");
                     }
                 }
             }
