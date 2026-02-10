@@ -5111,6 +5111,14 @@ pub fn op_function(
                     }
                 }
             }
+            // FIXME: Temporary REGEXP implementation to unblock the psql \dt query
+            // which uses the !~ operator (translated to LikeOperator::Regexp).
+            // The \dt query contains: n.nspname !~ '^pg_toast'
+            //
+            // REGEXP should be implemented properly as a SQLite-compatible feature
+            // first (SQLite supports REGEXP via a user-defined function), tested
+            // against SQLite's behavior, and only then used here. This was added
+            // as a shortcut and needs to be replaced with a proper implementation.
             ScalarFunc::Regexp => {
                 let pattern_value = state.registers[*start_reg].get_value();
                 let text_value = state.registers[*start_reg + 1].get_value();
@@ -5128,11 +5136,30 @@ pub fn op_function(
                         Register::Value(Value::Integer(matches as i64));
                 }
             }
+            // FIXME: These are temporary stubs to unblock the psql \dt query:
+            //
+            //   SELECT n.nspname as "Schema",
+            //     c.relname as "Name",
+            //     CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' ...
+            //     pg_catalog.pg_get_userbyid(c.relowner) as "Owner"
+            //   FROM pg_catalog.pg_class c
+            //        LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            //        LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
+            //   WHERE c.relkind IN ('r','p','')
+            //     AND n.nspname <> 'pg_catalog'
+            //     AND n.nspname !~ '^pg_toast'
+            //     AND n.nspname <> 'information_schema'
+            //     AND pg_catalog.pg_table_is_visible(c.oid)
+            //   ORDER BY 1,2;
+            //
+            // pg_get_userbyid and pg_table_is_visible are PostgreSQL catalog functions
+            // that have no SQLite equivalent. They should NOT live in the core VDBE long
+            // term. These pg-specific stubs should be moved behind a postgres feature
+            // gate or into a pg-specific execution layer.
             ScalarFunc::PgGetUserById => {
                 state.registers[*dest] = Register::Value(Value::build_text("turso"));
             }
             ScalarFunc::PgTableIsVisible => {
-                // Stub: all tables are visible (single-schema database)
                 state.registers[*dest] = Register::Value(Value::Integer(1));
             }
             ScalarFunc::Abs

@@ -3650,6 +3650,9 @@ fn translate_like_base(
         ast::LikeOperator::Match => {
             crate::bail_parse_error!("MATCH requires the 'fts' feature to be enabled")
         }
+        // FIXME: Temporary REGEXP translation to unblock psql \dt query (n.nspname !~ '^pg_toast').
+        // Previously this arm returned: bail_parse_error!("REGEXP in LIKE is not supported")
+        // REGEXP should be implemented properly as a SQLite-compatible feature first, then reused here.
         ast::LikeOperator::Regexp => {
             let arg_count = 2;
             let start_reg = program.alloc_registers(arg_count);
