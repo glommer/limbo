@@ -19,18 +19,25 @@ use pgwire::tokio::process_socket;
 
 pub struct TursoPgServer {
     address: String,
+    db_file: String,
     conn: Arc<Mutex<Arc<Connection>>>,
     interrupt_count: Arc<AtomicUsize>,
 }
 
 impl TursoPgServer {
-    pub fn new(address: String, conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>) -> Self {
+    pub fn new(
+        address: String,
+        db_file: String,
+        conn: Arc<Connection>,
+        interrupt_count: Arc<AtomicUsize>,
+    ) -> Self {
         // Set postgres dialect on the connection
         conn.execute("PRAGMA sql_dialect = 'postgres'")
             .expect("failed to set postgres dialect");
 
         Self {
             address,
+            db_file,
             conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
         }
@@ -43,7 +50,10 @@ impl TursoPgServer {
 
     async fn run_async(&self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(&self.address).await?;
-        info!("PostgreSQL server listening on {}", self.address);
+        println!(
+            "PostgreSQL server listening on {} (database: {})",
+            self.address, self.db_file
+        );
 
         let factory = Arc::new(TursoPgFactory {
             handler: Arc::new(TursoPgHandler {
@@ -52,24 +62,32 @@ impl TursoPgServer {
         });
 
         loop {
-            if self.interrupt_count.load(Ordering::SeqCst) > 0 {
-                info!("Shutdown signal received, stopping PostgreSQL server");
-                break;
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((socket, addr)) => {
+                            info!("PostgreSQL client connected from {}", addr);
+                            let factory_ref = factory.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = process_socket(socket, None, factory_ref).await {
+                                    error!("Error processing connection from {}: {}", addr, e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Error accepting connection: {}", e);
+                        }
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\nShutting down PostgreSQL server...");
+                    break;
+                }
             }
 
-            match listener.accept().await {
-                Ok((socket, addr)) => {
-                    info!("PostgreSQL client connected from {}", addr);
-                    let factory_ref = factory.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = process_socket(socket, None, factory_ref).await {
-                            error!("Error processing connection from {}: {}", addr, e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Error accepting connection: {}", e);
-                }
+            if self.interrupt_count.load(Ordering::SeqCst) > 0 {
+                println!("Shutting down PostgreSQL server...");
+                break;
             }
         }
 

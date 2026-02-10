@@ -48,9 +48,10 @@ fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
 
 fn run_pg_server(app: app::Limbo) -> anyhow::Result<()> {
     let address = app.opts.pg_server_address.clone().unwrap();
+    let db_file = app.opts.db_file.clone();
     let conn = app.get_connection();
     let interrupt_count = app.get_interrupt_count();
-    let server = TursoPgServer::new(address, conn, interrupt_count);
+    let server = TursoPgServer::new(address, db_file, conn, interrupt_count);
     server.run()
 }
 
