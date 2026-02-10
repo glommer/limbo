@@ -385,6 +385,7 @@ pub enum ScalarFunc {
     Unlikely,
     Regexp,
     PgGetUserById,
+    PgTableIsVisible,
     StatInit,
     StatPush,
     StatGet,
@@ -454,6 +455,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Unlikely => true,
             ScalarFunc::Regexp => true,
             ScalarFunc::PgGetUserById => true,
+            ScalarFunc::PgTableIsVisible => true,
             ScalarFunc::StatInit => false, // internal ANALYZE function
             ScalarFunc::StatPush => false, // internal ANALYZE function
             ScalarFunc::StatGet => false,  // internal ANALYZE function
@@ -525,6 +527,7 @@ impl Display for ScalarFunc {
             Self::Unlikely => "unlikely",
             Self::Regexp => "regexp",
             Self::PgGetUserById => "pg_get_userbyid",
+            Self::PgTableIsVisible => "pg_table_is_visible",
             Self::StatInit => "stat_init",
             Self::StatPush => "stat_push",
             Self::StatGet => "stat_get",
@@ -852,6 +855,7 @@ impl Func {
             "like" => Ok(Self::Scalar(ScalarFunc::Like)),
             "regexp" => Ok(Self::Scalar(ScalarFunc::Regexp)),
             "pg_get_userbyid" => Ok(Self::Scalar(ScalarFunc::PgGetUserById)),
+            "pg_table_is_visible" => Ok(Self::Scalar(ScalarFunc::PgTableIsVisible)),
             "abs" => Ok(Self::Scalar(ScalarFunc::Abs)),
             "upper" => Ok(Self::Scalar(ScalarFunc::Upper)),
             "lower" => Ok(Self::Scalar(ScalarFunc::Lower)),

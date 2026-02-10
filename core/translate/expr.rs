@@ -2183,7 +2183,7 @@ pub fn translate_expr(
                                 func_ctx,
                             )
                         }
-                        ScalarFunc::PgGetUserById => {
+                        ScalarFunc::PgGetUserById | ScalarFunc::PgTableIsVisible => {
                             let args = expect_arguments_exact!(args, 1, srf);
                             translate_function(
                                 program,

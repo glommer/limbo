@@ -5131,6 +5131,10 @@ pub fn op_function(
             ScalarFunc::PgGetUserById => {
                 state.registers[*dest] = Register::Value(Value::build_text("turso"));
             }
+            ScalarFunc::PgTableIsVisible => {
+                // Stub: all tables are visible (single-schema database)
+                state.registers[*dest] = Register::Value(Value::Integer(1));
+            }
             ScalarFunc::Abs
             | ScalarFunc::Lower
             | ScalarFunc::Upper

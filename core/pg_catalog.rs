@@ -605,6 +605,118 @@ impl InternalVirtualTableCursor for PgRolesCursor {
     }
 }
 
+/// Virtual table implementation for pg_catalog.pg_am
+/// Stub: returns two access methods (heap and btree).
+#[derive(Debug)]
+pub struct PgAmTable;
+
+impl PgAmTable {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn rows() -> Vec<Vec<Value>> {
+        vec![
+            vec![
+                Value::Integer(2),                // oid
+                Value::build_text("heap"),        // amname
+                Value::build_text("heap_tableam_handler"), // amhandler
+                Value::build_text("t"),           // amtype (table)
+            ],
+            vec![
+                Value::Integer(403),              // oid
+                Value::build_text("btree"),       // amname
+                Value::build_text("bthandler"),   // amhandler
+                Value::build_text("i"),           // amtype (index)
+            ],
+        ]
+    }
+}
+
+impl InternalVirtualTable for PgAmTable {
+    fn name(&self) -> String {
+        "pg_am".to_string()
+    }
+
+    fn open(
+        &self,
+        _conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgAmCursor {
+            rows: Vec::new(),
+            current_row: 0,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 10.0,
+            estimated_rows: 2,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE pg_am (
+            oid INTEGER,
+            amname TEXT,
+            amhandler TEXT,
+            amtype TEXT
+        )"
+        .to_string()
+    }
+}
+
+struct PgAmCursor {
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl InternalVirtualTableCursor for PgAmCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        self.rows = PgAmTable::rows();
+        Ok(!self.rows.is_empty())
+    }
+}
+
 /// Create PostgreSQL system catalog virtual tables
 pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
     use crate::vtab::VirtualTable;
@@ -649,6 +761,16 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
                 Arc::new(RwLock::new(PgRolesTable::new())),
             )
             .expect("pg_roles virtual table creation should not fail"),
+        ),
+        // pg_am virtual table
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_am".to_string(),
+                PgAmTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgAmTable::new())),
+            )
+            .expect("pg_am virtual table creation should not fail"),
         ),
         // pg_get_tabledef virtual table (custom extension for getting PostgreSQL DDL)
         Arc::new(

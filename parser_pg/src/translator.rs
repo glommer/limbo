@@ -4,6 +4,7 @@
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
 use crate::ParseError;
+use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
 use turso_parser::ast;
 
@@ -25,7 +26,9 @@ impl PostgreSQLTranslator {
     fn map_table_name(&self, table_name: &str) -> String {
         match table_name.to_lowercase().as_str() {
             // These have virtual table implementations in pg_catalog.rs - pass through
-            "pg_class" | "pg_namespace" | "pg_attribute" | "pg_roles" => table_name.to_string(),
+            "pg_class" | "pg_namespace" | "pg_attribute" | "pg_roles" | "pg_am" => {
+                table_name.to_string()
+            }
             // PostgreSQL information schema mappings (no virtual table yet)
             "pg_tables" => "sqlite_master".to_string(),
             "information_schema.tables" => "sqlite_master".to_string(),
@@ -135,28 +138,142 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::FromClause, ParseError> {
         match &from_item.node {
             Some(pg_query::protobuf::node::Node::RangeVar(range_var)) => {
-                let table_name = &range_var.relname;
-                let mapped_name = self.map_table_name(table_name);
-
-                let qualified_name =
-                    ast::QualifiedName::single(ast::Name::from_string(mapped_name));
-                let alias = range_var
-                    .alias
-                    .as_ref()
-                    .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
-
-                let select_table = ast::SelectTable::Table(qualified_name, alias, None);
+                let select_table = self.translate_range_var(range_var)?;
 
                 Ok(ast::FromClause {
                     select: Box::new(select_table),
                     joins: vec![],
                 })
             }
+            Some(pg_query::protobuf::node::Node::JoinExpr(join_expr)) => {
+                self.translate_join_expr(join_expr)
+            }
             _ => Err(ParseError::ParseError(format!(
                 "Unsupported FROM clause type: {:?}",
                 from_item.node
             ))),
         }
+    }
+
+    fn translate_range_var(
+        &self,
+        range_var: &pg_query::protobuf::RangeVar,
+    ) -> Result<ast::SelectTable, ParseError> {
+        let table_name = &range_var.relname;
+        let mapped_name = self.map_table_name(table_name);
+
+        let qualified_name = ast::QualifiedName::single(ast::Name::from_string(mapped_name));
+        let alias = range_var
+            .alias
+            .as_ref()
+            .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
+
+        Ok(ast::SelectTable::Table(qualified_name, alias, None))
+    }
+
+    fn translate_join_expr(
+        &self,
+        join_expr: &pg_query::protobuf::JoinExpr,
+    ) -> Result<ast::FromClause, ParseError> {
+        // Flatten the left-deep join tree: collect the primary table and all joins
+        let mut joins = Vec::new();
+        let primary_table = self.flatten_join_tree(join_expr, &mut joins)?;
+
+        Ok(ast::FromClause {
+            select: Box::new(primary_table),
+            joins,
+        })
+    }
+
+    fn flatten_join_tree(
+        &self,
+        join_expr: &pg_query::protobuf::JoinExpr,
+        joins: &mut Vec<ast::JoinedSelectTable>,
+    ) -> Result<ast::SelectTable, ParseError> {
+        // Recursively process the left side
+        let primary_table = if let Some(larg) = &join_expr.larg {
+            match &larg.node {
+                Some(pg_query::protobuf::node::Node::RangeVar(range_var)) => {
+                    self.translate_range_var(range_var)?
+                }
+                Some(pg_query::protobuf::node::Node::JoinExpr(nested_join)) => {
+                    self.flatten_join_tree(nested_join, joins)?
+                }
+                _ => {
+                    return Err(ParseError::ParseError(format!(
+                        "Unsupported left side of JOIN: {:?}",
+                        larg.node
+                    )))
+                }
+            }
+        } else {
+            return Err(ParseError::ParseError(
+                "Missing left side of JOIN".to_string(),
+            ));
+        };
+
+        // Process the right side
+        let right_table = if let Some(rarg) = &join_expr.rarg {
+            match &rarg.node {
+                Some(pg_query::protobuf::node::Node::RangeVar(range_var)) => {
+                    self.translate_range_var(range_var)?
+                }
+                Some(pg_query::protobuf::node::Node::JoinExpr(nested_join)) => {
+                    // Nested join on the right side: wrap as a subquery-like structure
+                    // For now, flatten it too (handles chained joins)
+                    let mut right_joins = Vec::new();
+                    let right_primary = self.flatten_join_tree(nested_join, &mut right_joins)?;
+                    // Add the right-side joins first, then the right primary becomes a joined table
+                    joins.extend(right_joins);
+                    right_primary
+                }
+                _ => {
+                    return Err(ParseError::ParseError(format!(
+                        "Unsupported right side of JOIN: {:?}",
+                        rarg.node
+                    )))
+                }
+            }
+        } else {
+            return Err(ParseError::ParseError(
+                "Missing right side of JOIN".to_string(),
+            ));
+        };
+
+        // Map pg_query JoinType to Turso JoinOperator
+        let join_type = PgJoinType::try_from(join_expr.jointype).unwrap_or(PgJoinType::Undefined);
+        let operator = match join_type {
+            PgJoinType::JoinInner => {
+                ast::JoinOperator::TypedJoin(Some(ast::JoinType::INNER))
+            }
+            PgJoinType::JoinLeft => {
+                ast::JoinOperator::TypedJoin(Some(ast::JoinType::LEFT | ast::JoinType::OUTER))
+            }
+            PgJoinType::JoinRight => {
+                ast::JoinOperator::TypedJoin(Some(ast::JoinType::RIGHT | ast::JoinType::OUTER))
+            }
+            PgJoinType::JoinFull => ast::JoinOperator::TypedJoin(Some(
+                ast::JoinType::LEFT | ast::JoinType::RIGHT | ast::JoinType::OUTER,
+            )),
+            _ => ast::JoinOperator::TypedJoin(None), // Default to plain JOIN
+        };
+
+        // Translate ON condition
+        let constraint = if let Some(quals) = &join_expr.quals {
+            Some(ast::JoinConstraint::On(Box::new(
+                self.translate_expr(quals)?,
+            )))
+        } else {
+            None
+        };
+
+        joins.push(ast::JoinedSelectTable {
+            operator,
+            table: Box::new(right_table),
+            constraint,
+        });
+
+        Ok(primary_table)
     }
 
     fn translate_target_list(
@@ -267,6 +384,9 @@ impl PostgreSQLTranslator {
             }
             Some(pg_query::protobuf::node::Node::FuncCall(func_call)) => {
                 self.translate_func_call(func_call)
+            }
+            Some(pg_query::protobuf::node::Node::CaseExpr(case_expr)) => {
+                self.translate_case_expr(case_expr)
             }
             Some(pg_query::protobuf::node::Node::AStar(_)) => {
                 // SELECT * - this should be handled as ResultColumn::Star in translate_target_list
@@ -565,6 +685,60 @@ impl PostgreSQLTranslator {
             args,
             order_by: vec![],
             filter_over,
+        })
+    }
+
+    fn translate_case_expr(
+        &self,
+        case_expr: &pg_query::protobuf::CaseExpr,
+    ) -> Result<ast::Expr, ParseError> {
+        // Translate optional base expression (CASE <expr> WHEN ...)
+        let base = if let Some(arg) = &case_expr.arg {
+            Some(Box::new(self.translate_expr(arg)?))
+        } else {
+            None
+        };
+
+        // Translate WHEN/THEN pairs
+        let mut when_then_pairs = Vec::new();
+        for arg in &case_expr.args {
+            match &arg.node {
+                Some(pg_query::protobuf::node::Node::CaseWhen(case_when)) => {
+                    let when_expr = if let Some(expr) = &case_when.expr {
+                        Box::new(self.translate_expr(expr)?)
+                    } else {
+                        return Err(ParseError::ParseError(
+                            "CASE WHEN missing condition".to_string(),
+                        ));
+                    };
+                    let then_expr = if let Some(result) = &case_when.result {
+                        Box::new(self.translate_expr(result)?)
+                    } else {
+                        return Err(ParseError::ParseError(
+                            "CASE WHEN missing THEN result".to_string(),
+                        ));
+                    };
+                    when_then_pairs.push((when_expr, then_expr));
+                }
+                _ => {
+                    return Err(ParseError::ParseError(
+                        "Expected CaseWhen node in CASE expression".to_string(),
+                    ))
+                }
+            }
+        }
+
+        // Translate optional ELSE expression
+        let else_expr = if let Some(defresult) = &case_expr.defresult {
+            Some(Box::new(self.translate_expr(defresult)?))
+        } else {
+            None
+        };
+
+        Ok(ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
         })
     }
 
