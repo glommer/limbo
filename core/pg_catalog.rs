@@ -480,6 +480,131 @@ impl InternalVirtualTableCursor for PgAttributeCursor {
     }
 }
 
+/// Virtual table implementation for pg_catalog.pg_roles
+/// Stub: returns a single hardcoded "turso" superuser role.
+/// TODO: replace with real role data when authentication is implemented.
+#[derive(Debug)]
+pub struct PgRolesTable;
+
+impl PgRolesTable {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Stub: returns a single default superuser role.
+    /// Replace this method with real role lookup when auth is implemented.
+    fn roles() -> Vec<Vec<Value>> {
+        vec![vec![
+            Value::Integer(10),              // oid
+            Value::build_text("turso"),      // rolname
+            Value::Integer(1),               // rolsuper
+            Value::Integer(1),               // rolinherit
+            Value::Integer(1),               // rolcreaterole
+            Value::Integer(1),               // rolcreatedb
+            Value::Integer(1),               // rolcanlogin
+            Value::Integer(1),               // rolreplication
+            Value::Integer(-1),              // rolconnlimit (-1 = no limit)
+            Value::Null,                     // rolpassword (never exposed)
+            Value::Null,                     // rolvaliduntil
+            Value::Integer(1),               // rolbypassrls
+            Value::Null,                     // rolconfig
+        ]]
+    }
+}
+
+impl InternalVirtualTable for PgRolesTable {
+    fn name(&self) -> String {
+        "pg_roles".to_string()
+    }
+
+    fn open(
+        &self,
+        _conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgRolesCursor {
+            rows: Vec::new(),
+            current_row: 0,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 10.0,
+            estimated_rows: 1,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE pg_roles (
+            oid INTEGER,
+            rolname TEXT,
+            rolsuper INTEGER,
+            rolinherit INTEGER,
+            rolcreaterole INTEGER,
+            rolcreatedb INTEGER,
+            rolcanlogin INTEGER,
+            rolreplication INTEGER,
+            rolconnlimit INTEGER,
+            rolpassword TEXT,
+            rolvaliduntil TEXT,
+            rolbypassrls INTEGER,
+            rolconfig TEXT
+        )"
+        .to_string()
+    }
+}
+
+struct PgRolesCursor {
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl InternalVirtualTableCursor for PgRolesCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        self.rows = PgRolesTable::roles();
+        Ok(!self.rows.is_empty())
+    }
+}
+
 /// Create PostgreSQL system catalog virtual tables
 pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
     use crate::vtab::VirtualTable;
@@ -514,6 +639,16 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
                 Arc::new(RwLock::new(PgAttributeTable::new())),
             )
             .expect("pg_attribute virtual table creation should not fail"),
+        ),
+        // pg_roles virtual table
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_roles".to_string(),
+                PgRolesTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgRolesTable::new())),
+            )
+            .expect("pg_roles virtual table creation should not fail"),
         ),
         // pg_get_tabledef virtual table (custom extension for getting PostgreSQL DDL)
         Arc::new(

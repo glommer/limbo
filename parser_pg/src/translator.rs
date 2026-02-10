@@ -25,7 +25,7 @@ impl PostgreSQLTranslator {
     fn map_table_name(&self, table_name: &str) -> String {
         match table_name.to_lowercase().as_str() {
             // These have virtual table implementations in pg_catalog.rs - pass through
-            "pg_class" | "pg_namespace" | "pg_attribute" => table_name.to_string(),
+            "pg_class" | "pg_namespace" | "pg_attribute" | "pg_roles" => table_name.to_string(),
             // PostgreSQL information schema mappings (no virtual table yet)
             "pg_tables" => "sqlite_master".to_string(),
             "information_schema.tables" => "sqlite_master".to_string(),
