@@ -89,6 +89,11 @@ pub struct Opts {
     pub experimental_attach: bool,
     #[clap(long, help = "Enable experimental PostgreSQL dialect")]
     pub experimental_postgres: bool,
+    #[clap(
+        long,
+        help = "Start PostgreSQL wire protocol server at given address (e.g. 0.0.0.0:5432)"
+    )]
+    pub pg_server: Option<String>,
 }
 
 const PROMPT: &str = "turso> ";
@@ -204,6 +209,7 @@ impl Limbo {
             .as_ref()
             .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
 
+        let enable_postgres = opts.experimental_postgres || opts.pg_server.is_some();
         let db_opts = turso_core::DatabaseOpts::new()
             .with_views(opts.experimental_views)
             .with_strict(opts.experimental_strict)
@@ -212,7 +218,7 @@ impl Limbo {
             .with_autovacuum(opts.experimental_autovacuum)
             .with_triggers(opts.experimental_triggers)
             .with_attach(opts.experimental_attach)
-            .with_postgres(opts.experimental_postgres);
+            .with_postgres(enable_postgres);
 
         let (io, conn) = if db_file.contains([':', '?', '&', '#']) {
             Connection::from_uri(&db_file, db_opts)?
@@ -287,8 +293,8 @@ impl Limbo {
     }
 
     fn first_run(&mut self, has_sql: bool, quiet: bool) -> Result<(), LimboError> {
-        // Skip startup messages and SQL execution in MCP/SyncServer mode
-        if self.is_mcp_mode() || self.is_sync_server_mode() {
+        // Skip startup messages and SQL execution in server modes
+        if self.is_mcp_mode() || self.is_sync_server_mode() || self.is_pg_server_mode() {
             return Ok(());
         }
 
@@ -406,6 +412,10 @@ impl Limbo {
 
     pub fn is_sync_server_mode(&self) -> bool {
         self.opts.sync_server_address.is_some()
+    }
+
+    pub fn is_pg_server_mode(&self) -> bool {
+        self.opts.pg_server_address.is_some()
     }
 
     pub fn get_interrupt_count(&self) -> Arc<AtomicUsize> {

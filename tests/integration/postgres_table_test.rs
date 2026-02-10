@@ -116,7 +116,10 @@ fn test_postgres_where_clause(db: TempDatabase) {
     conn.execute("PRAGMA sql_dialect = postgres").unwrap();
 
     // Select with WHERE clause
-    let mut rows = conn.query("SELECT name FROM users WHERE id = 1").unwrap().unwrap();
+    let mut rows = conn
+        .query("SELECT name FROM users WHERE id = 1")
+        .unwrap()
+        .unwrap();
 
     let StepResult::Row = rows.step().unwrap() else {
         panic!("expected row");

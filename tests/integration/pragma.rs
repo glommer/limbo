@@ -382,7 +382,11 @@ fn test_pragma_sql_dialect(db: TempDatabase) {
     let Value::Text(dialect) = row.get_value(0) else {
         panic!("expected text value");
     };
-    assert_eq!(dialect.as_str(), "sqlite", "default dialect should be sqlite");
+    assert_eq!(
+        dialect.as_str(),
+        "sqlite",
+        "default dialect should be sqlite"
+    );
 
     // Test setting to postgres
     conn.execute("PRAGMA sql_dialect = postgres;").unwrap();
@@ -395,7 +399,11 @@ fn test_pragma_sql_dialect(db: TempDatabase) {
     let Value::Text(dialect) = row.get_value(0) else {
         panic!("expected text value");
     };
-    assert_eq!(dialect.as_str(), "postgres", "dialect should be postgres after setting");
+    assert_eq!(
+        dialect.as_str(),
+        "postgres",
+        "dialect should be postgres after setting"
+    );
 
     // Test setting back to sqlite
     conn.execute("PRAGMA sql_dialect = sqlite;").unwrap();
@@ -408,7 +416,11 @@ fn test_pragma_sql_dialect(db: TempDatabase) {
     let Value::Text(dialect) = row.get_value(0) else {
         panic!("expected text value");
     };
-    assert_eq!(dialect.as_str(), "sqlite", "dialect should be sqlite after setting back");
+    assert_eq!(
+        dialect.as_str(),
+        "sqlite",
+        "dialect should be sqlite after setting back"
+    );
 
     // Test postgresql alias
     conn.execute("PRAGMA sql_dialect = postgresql;").unwrap();
@@ -421,5 +433,9 @@ fn test_pragma_sql_dialect(db: TempDatabase) {
     let Value::Text(dialect) = row.get_value(0) else {
         panic!("expected text value");
     };
-    assert_eq!(dialect.as_str(), "postgres", "postgresql should be normalized to postgres");
+    assert_eq!(
+        dialect.as_str(),
+        "postgres",
+        "postgresql should be normalized to postgres"
+    );
 }

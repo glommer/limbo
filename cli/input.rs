@@ -87,6 +87,7 @@ pub struct Settings {
     pub headers: bool,
     pub mcp: bool,
     pub sync_server_address: Option<String>,
+    pub pg_server_address: Option<String>,
     pub stats: bool,
 }
 
@@ -114,6 +115,7 @@ impl From<Opts> for Settings {
             headers: false,
             mcp: opts.mcp,
             sync_server_address: opts.sync_server,
+            pg_server_address: opts.pg_server,
             stats: false,
         }
     }

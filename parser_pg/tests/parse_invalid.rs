@@ -24,7 +24,7 @@ fn test_invalid_syntax() {
 #[test]
 fn test_invalid_dollar_parameters() {
     let queries = vec![
-        "SELECT * FROM users WHERE id = $",    // Missing parameter number
+        "SELECT * FROM users WHERE id = $", // Missing parameter number
         // Note: $0 is valid in PostgreSQL (it refers to the function's own return value in PL/pgSQL)
         "SELECT * FROM users WHERE id = $abc", // Non-numeric parameter
         "SELECT * FROM users WHERE id = $-1",  // Negative parameter
@@ -150,10 +150,10 @@ fn test_invalid_case() {
 #[test]
 fn test_invalid_create_table() {
     let queries = vec![
-        "CREATE TABLE users",                    // Missing columns
+        "CREATE TABLE users", // Missing columns
         // Note: "CREATE TABLE users ()" is valid PostgreSQL (creates table with no columns)
-        "CREATE TABLE users (id INTEGER,)",      // Trailing comma
-        // Note: "CREATE TABLE users (PRIMARY KEY (id))" is valid PostgreSQL (table constraint only)
+        "CREATE TABLE users (id INTEGER,)", // Trailing comma
+                                            // Note: "CREATE TABLE users (PRIMARY KEY (id))" is valid PostgreSQL (table constraint only)
     ];
 
     for sql in queries {
@@ -204,14 +204,17 @@ fn test_sqlite_specific_syntax() {
 fn test_missing_statement_features() {
     // These should fail because they use features not yet implemented
     let queries = vec![
-        "\\getenv var value",  // psql meta-commands should not parse as SQL
-        "COPY users FROM :'variable'",  // Variable interpolation
-        "\\set var value",     // psql commands
-        "\\d users",          // psql describe
+        "\\getenv var value",          // psql meta-commands should not parse as SQL
+        "COPY users FROM :'variable'", // Variable interpolation
+        "\\set var value",             // psql commands
+        "\\d users",                   // psql describe
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should fail to parse psql command: {sql}");
+        assert!(
+            parse(sql).is_err(),
+            "Should fail to parse psql command: {sql}"
+        );
     }
 }
 
@@ -220,13 +223,16 @@ fn test_complex_invalid_syntax() {
     let queries = vec![
         "SELECT max(row(a,b)) FROM", // Incomplete FROM
         // Note: "explain (verbose, costs off) select" is valid PostgreSQL (EXPLAIN of a SELECT with no target list)
-        "array(select sum(x+y) s", // Incomplete array expression
-        "SELECT '{1,2,3}'::int[", // Incomplete array cast
+        "array(select sum(x+y) s",  // Incomplete array expression
+        "SELECT '{1,2,3}'::int[",   // Incomplete array cast
         "CREATE TEMPORARY TABLE (", // Incomplete CREATE
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should fail to parse invalid syntax: {sql}");
+        assert!(
+            parse(sql).is_err(),
+            "Should fail to parse invalid syntax: {sql}"
+        );
     }
 }
 
@@ -257,10 +263,13 @@ fn test_invalid_operators() {
         // Note: "SELECT 1 ++ 2" is valid PostgreSQL (unary + applied to +2)
         // Note: "SELECT 1 <=> 2" parses in PostgreSQL (spaceship-like operator syntax is accepted)
         // Note: "SELECT name ~~ pattern" is valid PostgreSQL (~~ is the internal LIKE operator)
-        "SELECT array @>",         // Incomplete operator
+        "SELECT array @>", // Incomplete operator
     ];
 
     for sql in queries {
-        assert!(parse(sql).is_err(), "Should fail to parse invalid operator: {sql}");
+        assert!(
+            parse(sql).is_err(),
+            "Should fail to parse invalid operator: {sql}"
+        );
     }
 }

@@ -20,7 +20,8 @@ use crate::{
     CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion, ConnectionMetrics, Database,
     DatabaseCatalog, DatabaseOpts, Duration, EncryptionKey, EncryptionOpts, IndexMethod,
     LimboError, MvStore, OpenFlags, PageSize, Pager, Parser, QueryMode, QueryRunner, Result,
-    Schema, SqlDialect, Statement, SyncMode, TransactionMode, TransactionState, Trigger, Value, VirtualTable,
+    Schema, SqlDialect, Statement, SyncMode, TransactionMode, TransactionState, Trigger, Value,
+    VirtualTable,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -229,9 +230,7 @@ impl Connection {
                 // PRAGMA sql_dialect must work in postgres mode
                 // (it's the only way to switch dialects back)
                 let trimmed = sql.trim();
-                if trimmed.len() >= 6
-                    && trimmed[..6].eq_ignore_ascii_case("PRAGMA")
-                {
+                if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("PRAGMA") {
                     // Only allow PRAGMA sql_dialect through
                     let rest = trimmed[6..].trim_start();
                     if rest.starts_with("sql_dialect") {
@@ -256,7 +255,8 @@ impl Connection {
 
         // Translate to Turso AST
         let translator = turso_parser_pg::translator::PostgreSQLTranslator::new();
-        let stmt = translator.translate(&parse_result)
+        let stmt = translator
+            .translate(&parse_result)
             .map_err(|e| LimboError::ParseError(format!("PostgreSQL translation error: {e}")))?;
 
         // Wrap in Cmd
@@ -510,7 +510,7 @@ impl Connection {
                     )?;
                     Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
                 }
-            },
+            }
             SqlDialect::Postgres => {
                 // For PostgreSQL, parse single statement
                 let (cmd, byte_offset_end) = self.parse_sql(sql)?;
@@ -619,7 +619,7 @@ impl Connection {
                     )?;
                     Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
                 }
-            },
+            }
             SqlDialect::Postgres => {
                 // For PostgreSQL, parse single statement
                 let (cmd, byte_offset_end) = self.parse_sql(sql)?;

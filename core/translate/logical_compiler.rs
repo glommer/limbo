@@ -18,9 +18,9 @@
 #![allow(dead_code)]
 #![allow(clippy::only_used_in_recursion)]
 
-use crate::schema::{Table};
+use crate::schema::Table;
 use crate::translate::emitter::Resolver;
-use crate::translate::logical::{LogicalPlan, TableScan, Filter, Projection, LogicalExpr};
+use crate::translate::logical::{Filter, LogicalExpr, LogicalPlan, Projection, TableScan};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::{BranchOffset, CursorID};
@@ -52,17 +52,30 @@ impl<'a> LogicalCompiler<'a> {
     /// Generates: OpenRead → Rewind → [loop: Column reads] → Next → [loop end]
     fn compile_table_scan(&mut self, table_scan: &TableScan) -> Result<CompilationResult> {
         // Look up the table in the schema
-        let table = self.resolver.schema.tables.get(&table_scan.table_name)
-            .ok_or_else(|| crate::LimboError::ParseError(format!("Table not found: {}", table_scan.table_name)))?;
+        let table = self
+            .resolver
+            .schema
+            .tables
+            .get(&table_scan.table_name)
+            .ok_or_else(|| {
+                crate::LimboError::ParseError(format!("Table not found: {}", table_scan.table_name))
+            })?;
 
         // Get the BTreeTable from the Table enum
         let btree_table = match table.as_ref() {
             Table::BTree(btree) => btree.clone(),
-            _ => return Err(crate::LimboError::ParseError(format!("Table {} is not a B-tree table", table_scan.table_name))),
+            _ => {
+                return Err(crate::LimboError::ParseError(format!(
+                    "Table {} is not a B-tree table",
+                    table_scan.table_name
+                )))
+            }
         };
 
         // Allocate a cursor for the table
-        let cursor_id = self.program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
+        let cursor_id = self
+            .program
+            .alloc_cursor_id(CursorType::BTreeTable(btree_table));
 
         // Open the table for reading
         self.program.emit_insn(Insn::OpenRead {
@@ -112,7 +125,10 @@ impl<'a> LogicalCompiler<'a> {
         }
 
         // Output the row
-        let output_count = table_scan.projection.as_ref().map_or(num_columns, |p| p.len());
+        let output_count = table_scan
+            .projection
+            .as_ref()
+            .map_or(num_columns, |p| p.len());
         self.program.emit_insn(Insn::ResultRow {
             start_reg: result_start_reg,
             count: output_count,
@@ -169,17 +185,30 @@ impl<'a> LogicalCompiler<'a> {
         predicate: &LogicalExpr,
     ) -> Result<CompilationResult> {
         // Look up the table in the schema
-        let table = self.resolver.schema.tables.get(&table_scan.table_name)
-            .ok_or_else(|| crate::LimboError::ParseError(format!("Table not found: {}", table_scan.table_name)))?;
+        let table = self
+            .resolver
+            .schema
+            .tables
+            .get(&table_scan.table_name)
+            .ok_or_else(|| {
+                crate::LimboError::ParseError(format!("Table not found: {}", table_scan.table_name))
+            })?;
 
         // Get the BTreeTable from the Table enum
         let btree_table = match table.as_ref() {
             Table::BTree(btree) => btree.clone(),
-            _ => return Err(crate::LimboError::ParseError(format!("Table {} is not a B-tree table", table_scan.table_name))),
+            _ => {
+                return Err(crate::LimboError::ParseError(format!(
+                    "Table {} is not a B-tree table",
+                    table_scan.table_name
+                )))
+            }
         };
 
         // Allocate a cursor for the table
-        let cursor_id = self.program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
+        let cursor_id = self
+            .program
+            .alloc_cursor_id(CursorType::BTreeTable(btree_table));
 
         // Open the table for reading
         self.program.emit_insn(Insn::OpenRead {
@@ -243,7 +272,10 @@ impl<'a> LogicalCompiler<'a> {
         });
 
         // Output the row if predicate is true
-        let output_count = table_scan.projection.as_ref().map_or(num_columns, |p| p.len());
+        let output_count = table_scan
+            .projection
+            .as_ref()
+            .map_or(num_columns, |p| p.len());
         self.program.emit_insn(Insn::ResultRow {
             start_reg: result_start_reg,
             count: output_count,
@@ -275,19 +307,22 @@ impl<'a> LogicalCompiler<'a> {
         match &*projection.input {
             LogicalPlan::TableScan(table_scan) => {
                 // For table scan + projection, we can generate an optimized version
-                self.compile_table_scan_with_projection(table_scan, &projection.exprs, &projection.schema)
+                self.compile_table_scan_with_projection(
+                    table_scan,
+                    &projection.exprs,
+                    &projection.schema,
+                )
             }
             LogicalPlan::Filter(filter) => {
                 // Handle Filter + Projection by combining them
                 match &*filter.input {
-                    LogicalPlan::TableScan(table_scan) => {
-                        self.compile_table_scan_with_filter_and_projection(
+                    LogicalPlan::TableScan(table_scan) => self
+                        .compile_table_scan_with_filter_and_projection(
                             table_scan,
                             &filter.predicate,
                             &projection.exprs,
                             &projection.schema,
-                        )
-                    }
+                        ),
                     _ => {
                         todo!("Complex projection over filtered non-table-scan not yet implemented")
                     }
@@ -311,17 +346,30 @@ impl<'a> LogicalCompiler<'a> {
         _output_schema: &crate::translate::logical::SchemaRef,
     ) -> Result<CompilationResult> {
         // Look up the table in the schema
-        let table = self.resolver.schema.tables.get(&table_scan.table_name)
-            .ok_or_else(|| crate::LimboError::ParseError(format!("Table not found: {}", table_scan.table_name)))?;
+        let table = self
+            .resolver
+            .schema
+            .tables
+            .get(&table_scan.table_name)
+            .ok_or_else(|| {
+                crate::LimboError::ParseError(format!("Table not found: {}", table_scan.table_name))
+            })?;
 
         // Get the BTreeTable from the Table enum
         let btree_table = match table.as_ref() {
             Table::BTree(btree) => btree.clone(),
-            _ => return Err(crate::LimboError::ParseError(format!("Table {} is not a B-tree table", table_scan.table_name))),
+            _ => {
+                return Err(crate::LimboError::ParseError(format!(
+                    "Table {} is not a B-tree table",
+                    table_scan.table_name
+                )))
+            }
         };
 
         // Allocate a cursor for the table
-        let cursor_id = self.program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
+        let cursor_id = self
+            .program
+            .alloc_cursor_id(CursorType::BTreeTable(btree_table));
 
         // Open the table for reading
         self.program.emit_insn(Insn::OpenRead {
@@ -362,7 +410,12 @@ impl<'a> LogicalCompiler<'a> {
 
         // Evaluate projection expressions
         for (expr_idx, expr) in projection_exprs.iter().enumerate() {
-            self.compile_logical_expr(expr, projection_output_regs + expr_idx, &table_column_regs, cursor_id)?;
+            self.compile_logical_expr(
+                expr,
+                projection_output_regs + expr_idx,
+                &table_column_regs,
+                cursor_id,
+            )?;
         }
 
         // Output the projected row
@@ -396,17 +449,30 @@ impl<'a> LogicalCompiler<'a> {
         _output_schema: &crate::translate::logical::SchemaRef,
     ) -> Result<CompilationResult> {
         // Look up the table in the schema
-        let table = self.resolver.schema.tables.get(&table_scan.table_name)
-            .ok_or_else(|| crate::LimboError::ParseError(format!("Table not found: {}", table_scan.table_name)))?;
+        let table = self
+            .resolver
+            .schema
+            .tables
+            .get(&table_scan.table_name)
+            .ok_or_else(|| {
+                crate::LimboError::ParseError(format!("Table not found: {}", table_scan.table_name))
+            })?;
 
         // Get the BTreeTable from the Table enum
         let btree_table = match table.as_ref() {
             Table::BTree(btree) => btree.clone(),
-            _ => return Err(crate::LimboError::ParseError(format!("Table {} is not a B-tree table", table_scan.table_name))),
+            _ => {
+                return Err(crate::LimboError::ParseError(format!(
+                    "Table {} is not a B-tree table",
+                    table_scan.table_name
+                )))
+            }
         };
 
         // Allocate a cursor for the table
-        let cursor_id = self.program.alloc_cursor_id(CursorType::BTreeTable(btree_table));
+        let cursor_id = self
+            .program
+            .alloc_cursor_id(CursorType::BTreeTable(btree_table));
 
         // Open the table for reading
         self.program.emit_insn(Insn::OpenRead {
@@ -459,7 +525,12 @@ impl<'a> LogicalCompiler<'a> {
 
         // Evaluate projection expressions
         for (expr_idx, expr) in projection_exprs.iter().enumerate() {
-            self.compile_logical_expr(expr, projection_output_regs + expr_idx, &table_column_regs, cursor_id)?;
+            self.compile_logical_expr(
+                expr,
+                projection_output_regs + expr_idx,
+                &table_column_regs,
+                cursor_id,
+            )?;
         }
 
         // Output the projected row if predicate is true

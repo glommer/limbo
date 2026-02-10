@@ -303,10 +303,11 @@ impl Schema {
             );
         }
         // PostgreSQL catalog tables are registered separately
-        let postgres_catalog_tables: HashMap<String, Arc<Table>> = VirtualTable::postgres_catalog_tables()
-            .into_iter()
-            .map(|vtab| (vtab.name.clone(), Arc::new(Table::Virtual(vtab))))
-            .collect();
+        let postgres_catalog_tables: HashMap<String, Arc<Table>> =
+            VirtualTable::postgres_catalog_tables()
+                .into_iter()
+                .map(|vtab| (vtab.name.clone(), Arc::new(Table::Virtual(vtab))))
+                .collect();
         let materialized_view_names = HashSet::default();
         let materialized_view_sql = HashMap::default();
         let incremental_views = HashMap::default();
@@ -550,7 +551,11 @@ impl Schema {
         self.get_table_with_dialect(name, crate::SqlDialect::Sqlite)
     }
 
-    pub fn get_table_with_dialect(&self, name: &str, dialect: crate::SqlDialect) -> Option<Arc<Table>> {
+    pub fn get_table_with_dialect(
+        &self,
+        name: &str,
+        dialect: crate::SqlDialect,
+    ) -> Option<Arc<Table>> {
         let name = normalize_ident(name);
         let name = if name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT) {
             SCHEMA_TABLE_NAME

@@ -21,6 +21,7 @@ pub mod json;
 mod json;
 pub mod mvcc;
 mod parameters;
+mod pg_catalog;
 mod pragma;
 mod pseudo;
 pub mod schema;
@@ -44,7 +45,6 @@ pub mod vdbe;
 mod vdbe;
 pub mod vector;
 mod vtab;
-mod pg_catalog;
 
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;

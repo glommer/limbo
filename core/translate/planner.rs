@@ -469,7 +469,11 @@ pub fn plan_ctes_as_outer_refs(
 
         // Check if CTE name conflicts with catalog table
         let sql_dialect = connection.get_sql_dialect();
-        if resolver.schema.get_table_with_dialect(&cte_name, sql_dialect).is_some() {
+        if resolver
+            .schema
+            .get_table_with_dialect(&cte_name, sql_dialect)
+            .is_some()
+        {
             crate::bail_parse_error!(
                 "CTE name {} conflicts with catalog table name",
                 cte.tbl_name.as_str()
@@ -741,7 +745,9 @@ fn parse_table(
 
     // Resolve table using connection's with_schema method with dialect awareness
     let sql_dialect = connection.get_sql_dialect();
-    let table = connection.with_schema(database_id, |schema| schema.get_table_with_dialect(table_name.as_str(), sql_dialect));
+    let table = connection.with_schema(database_id, |schema| {
+        schema.get_table_with_dialect(table_name.as_str(), sql_dialect)
+    });
 
     if let Some(table) = table {
         let alias = maybe_alias
@@ -1006,7 +1012,11 @@ pub fn parse_from(
             }
 
             let sql_dialect = connection.get_sql_dialect();
-            if resolver.schema.get_table_with_dialect(&cte_name_normalized, sql_dialect).is_some() {
+            if resolver
+                .schema
+                .get_table_with_dialect(&cte_name_normalized, sql_dialect)
+                .is_some()
+            {
                 crate::bail_parse_error!(
                     "CTE name {} conflicts with catalog table name",
                     cte.tbl_name.as_str()

@@ -36,7 +36,7 @@ impl InternalVirtualTable for PgClassTable {
         let constraint_usages = constraints
             .iter()
             .map(|_constraint| turso_ext::ConstraintUsage {
-                argv_index: None,  // We'll handle filtering ourselves
+                argv_index: None, // We'll handle filtering ourselves
                 omit: false,
             })
             .collect();
@@ -129,7 +129,10 @@ impl PgClassCursor {
             }
 
             // Skip other SQLite-specific virtual tables
-            if table_name.starts_with("pragma_") || table_name.starts_with("json_") || table_name == "sqlite_dbpage" {
+            if table_name.starts_with("pragma_")
+                || table_name.starts_with("json_")
+                || table_name == "sqlite_dbpage"
+            {
                 continue;
             }
 
@@ -144,39 +147,39 @@ impl PgClassCursor {
 
             // Create a row for this table
             self.rows.push(vec![
-                Value::Integer(oid_counter),           // oid
+                Value::Integer(oid_counter),            // oid
                 Value::Text(table_name.clone().into()), // relname
-                Value::Integer(2200),                  // relnamespace (public schema)
-                Value::Integer(0),                     // reltype
-                Value::Integer(0),                     // reloftype
-                Value::Integer(10),                    // relowner
-                Value::Integer(0),                     // relam
-                Value::Integer(0),                     // relfilenode
-                Value::Integer(0),                     // reltablespace
-                Value::Integer(1),                     // relpages
-                Value::Float(0.0),                     // reltuples
-                Value::Integer(0),                     // relallvisible
-                Value::Integer(0),                     // reltoastrelid
-                Value::Integer(0),                     // relhasindex
-                Value::Integer(0),                     // relisshared
-                Value::Text("p".into()),               // relpersistence (permanent)
-                Value::Text(relkind.into()),           // relkind
-                Value::Integer(relnatts),              // relnatts (number of attributes)
-                Value::Integer(0),                     // relchecks
-                Value::Integer(0),                     // relhasrules
-                Value::Integer(0),                     // relhastriggers
-                Value::Integer(0),                     // relhassubclass
-                Value::Integer(0),                     // relrowsecurity
-                Value::Integer(0),                     // relforcerowsecurity
-                Value::Integer(1),                     // relispopulated
-                Value::Text("d".into()),               // relreplident
-                Value::Integer(0),                     // relispartition
-                Value::Integer(0),                     // relrewrite
-                Value::Integer(0),                     // relfrozenxid
-                Value::Integer(0),                     // relminmxid
-                Value::Null,                           // relacl
-                Value::Null,                           // reloptions
-                Value::Null,                           // relpartbound
+                Value::Integer(2200),                   // relnamespace (public schema)
+                Value::Integer(0),                      // reltype
+                Value::Integer(0),                      // reloftype
+                Value::Integer(10),                     // relowner
+                Value::Integer(0),                      // relam
+                Value::Integer(0),                      // relfilenode
+                Value::Integer(0),                      // reltablespace
+                Value::Integer(1),                      // relpages
+                Value::Float(0.0),                      // reltuples
+                Value::Integer(0),                      // relallvisible
+                Value::Integer(0),                      // reltoastrelid
+                Value::Integer(0),                      // relhasindex
+                Value::Integer(0),                      // relisshared
+                Value::Text("p".into()),                // relpersistence (permanent)
+                Value::Text(relkind.into()),            // relkind
+                Value::Integer(relnatts),               // relnatts (number of attributes)
+                Value::Integer(0),                      // relchecks
+                Value::Integer(0),                      // relhasrules
+                Value::Integer(0),                      // relhastriggers
+                Value::Integer(0),                      // relhassubclass
+                Value::Integer(0),                      // relrowsecurity
+                Value::Integer(0),                      // relforcerowsecurity
+                Value::Integer(1),                      // relispopulated
+                Value::Text("d".into()),                // relreplident
+                Value::Integer(0),                      // relispartition
+                Value::Integer(0),                      // relrewrite
+                Value::Integer(0),                      // relfrozenxid
+                Value::Integer(0),                      // relminmxid
+                Value::Null,                            // relacl
+                Value::Null,                            // reloptions
+                Value::Null,                            // relpartbound
             ]);
 
             oid_counter += 1;
@@ -251,7 +254,7 @@ impl InternalVirtualTable for PgNamespaceTable {
         let constraint_usages = constraints
             .iter()
             .map(|_constraint| turso_ext::ConstraintUsage {
-                argv_index: None,  // We'll handle filtering ourselves
+                argv_index: None, // We'll handle filtering ourselves
                 omit: false,
             })
             .collect();
@@ -294,22 +297,22 @@ impl PgNamespaceCursor {
         // PostgreSQL standard namespaces
         self.rows = vec![
             vec![
-                Value::Integer(11),                    // oid
-                Value::Text("pg_catalog".into()),      // nspname
-                Value::Integer(10),                     // nspowner
-                Value::Null,                            // nspacl
+                Value::Integer(11),               // oid
+                Value::Text("pg_catalog".into()), // nspname
+                Value::Integer(10),               // nspowner
+                Value::Null,                      // nspacl
             ],
             vec![
-                Value::Integer(2200),                   // oid
-                Value::Text("public".into()),           // nspname
-                Value::Integer(10),                     // nspowner
-                Value::Null,                            // nspacl
+                Value::Integer(2200),         // oid
+                Value::Text("public".into()), // nspname
+                Value::Integer(10),           // nspowner
+                Value::Null,                  // nspacl
             ],
             vec![
-                Value::Integer(11394),                  // oid
+                Value::Integer(11394),                    // oid
                 Value::Text("information_schema".into()), // nspname
-                Value::Integer(10),                     // nspowner
-                Value::Null,                            // nspacl
+                Value::Integer(10),                       // nspowner
+                Value::Null,                              // nspacl
             ],
         ];
         Ok(())
@@ -378,7 +381,7 @@ impl InternalVirtualTable for PgAttributeTable {
         let constraint_usages = constraints
             .iter()
             .map(|_constraint| turso_ext::ConstraintUsage {
-                argv_index: None,  // We'll handle filtering ourselves
+                argv_index: None, // We'll handle filtering ourselves
                 omit: false,
             })
             .collect();
@@ -560,7 +563,10 @@ impl PgGetTableDefCursor {
         // Get DDL from sqlite_master for each user table
         for (table_name, table) in &schema.tables {
             // Skip system tables (sqlite_master, sqlite_schema, etc.)
-            if table_name.starts_with("sqlite_") || table_name == "sqlite_master" || table_name == "sqlite_schema" {
+            if table_name.starts_with("sqlite_")
+                || table_name == "sqlite_master"
+                || table_name == "sqlite_schema"
+            {
                 continue;
             }
 
@@ -574,7 +580,7 @@ impl PgGetTableDefCursor {
             let postgres_ddl = self.convert_to_postgres_ddl(&sqlite_ddl);
 
             self.rows.push(vec![
-                Value::Text("public".into()),  // schema_name (PostgreSQL default)
+                Value::Text("public".into()), // schema_name (PostgreSQL default)
                 Value::Text(table_name.clone().into()),
                 Value::Text(postgres_ddl.into()),
             ]);
@@ -592,31 +598,35 @@ impl PgGetTableDefCursor {
         if let Some(table) = schema.tables.get(table_name) {
             if let Table::BTree(btree_table) = table.as_ref() {
                 let mut ddl = format!("CREATE TABLE {table_name} (");
-                let cols: Vec<String> = btree_table.columns.iter().map(|col| {
-                    let col_name = col.name.as_deref().unwrap_or("unnamed");
-                    let ty_str = &col.ty_str;
-                    let mut col_def = format!("{col_name} {ty_str}");
+                let cols: Vec<String> = btree_table
+                    .columns
+                    .iter()
+                    .map(|col| {
+                        let col_name = col.name.as_deref().unwrap_or("unnamed");
+                        let ty_str = &col.ty_str;
+                        let mut col_def = format!("{col_name} {ty_str}");
 
-                    // Check if this column is a primary key
-                    for (pk_col, _) in &btree_table.primary_key_columns {
-                        if pk_col == col_name {
-                            col_def.push_str(" PRIMARY KEY");
-                            break;
+                        // Check if this column is a primary key
+                        for (pk_col, _) in &btree_table.primary_key_columns {
+                            if pk_col == col_name {
+                                col_def.push_str(" PRIMARY KEY");
+                                break;
+                            }
                         }
-                    }
 
-                    // Add NOT NULL if column is not nullable
-                    if col.notnull() {
-                        col_def.push_str(" NOT NULL");
-                    }
+                        // Add NOT NULL if column is not nullable
+                        if col.notnull() {
+                            col_def.push_str(" NOT NULL");
+                        }
 
-                    // Add default value if present
-                    if col.default.is_some() {
-                        col_def.push_str(" DEFAULT ...");  // Simplified for now
-                    }
+                        // Add default value if present
+                        if col.default.is_some() {
+                            col_def.push_str(" DEFAULT ..."); // Simplified for now
+                        }
 
-                    col_def
-                }).collect();
+                        col_def
+                    })
+                    .collect();
                 ddl.push_str(&cols.join(", "));
                 ddl.push(')');
                 return Ok(ddl);
@@ -700,7 +710,8 @@ impl InternalVirtualTable for PgGetTableDefTable {
             schema_name TEXT,
             table_name TEXT,
             ddl TEXT
-        )".to_string()
+        )"
+        .to_string()
     }
 
     fn open(
@@ -735,12 +746,19 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    
+
     fn test_pg_namespace_query() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
+        let db = Database::open_file_with_flags(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_postgres(true),
+            None,
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
 
         // Switch to PostgreSQL dialect
@@ -773,28 +791,43 @@ mod tests {
 
         assert!(found_pg_catalog, "pg_catalog namespace not found");
         assert!(found_public, "public namespace not found");
-        assert!(found_information_schema, "information_schema namespace not found");
+        assert!(
+            found_information_schema,
+            "information_schema namespace not found"
+        );
     }
 
     #[test]
-    
+
     fn test_pg_class_lists_user_tables() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
+        let db = Database::open_file_with_flags(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_postgres(true),
+            None,
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
 
         // Create test tables in SQLite mode (default)
-        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
-        conn.execute("CREATE TABLE products (id INTEGER, title TEXT, price REAL)").unwrap();
-        conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, product_id INTEGER)").unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE products (id INTEGER, title TEXT, price REAL)")
+            .unwrap();
+        conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, product_id INTEGER)")
+            .unwrap();
 
         // Switch to PostgreSQL dialect
         conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
         // Query pg_class for regular tables
-        let mut stmt = conn.prepare("SELECT relname FROM pg_class WHERE relkind = 'r' AND relnamespace = 2200").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT relname FROM pg_class WHERE relkind = 'r' AND relnamespace = 2200")
+            .unwrap();
 
         let mut tables = Vec::new();
         loop {
@@ -811,44 +844,82 @@ mod tests {
         }
 
         // Should find our three tables
-        assert!(tables.contains(&"users".to_string()), "users table not found");
-        assert!(tables.contains(&"products".to_string()), "products table not found");
-        assert!(tables.contains(&"orders".to_string()), "orders table not found");
+        assert!(
+            tables.contains(&"users".to_string()),
+            "users table not found"
+        );
+        assert!(
+            tables.contains(&"products".to_string()),
+            "products table not found"
+        );
+        assert!(
+            tables.contains(&"orders".to_string()),
+            "orders table not found"
+        );
         assert_eq!(tables.len(), 3, "Expected exactly 3 tables");
     }
 
     #[test]
-    
+
     fn test_pg_class_table_details() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
+        let db = Database::open_file_with_flags(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_postgres(true),
+            None,
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
 
         // Create a test table with known columns
-        conn.execute("CREATE TABLE test_table (id INTEGER, name TEXT, value REAL)").unwrap();
+        conn.execute("CREATE TABLE test_table (id INTEGER, name TEXT, value REAL)")
+            .unwrap();
 
         // Switch to PostgreSQL dialect
         conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
         // Query pg_class for table details
-        let mut stmt = conn.prepare(
-            "SELECT oid, relname, relkind, relnatts
+        let mut stmt = conn
+            .prepare(
+                "SELECT oid, relname, relkind, relnatts
              FROM pg_class
-             WHERE relname = 'test_table'"
-        ).unwrap();
+             WHERE relname = 'test_table'",
+            )
+            .unwrap();
 
         if let StepResult::Row = stmt.step().unwrap() {
             let row = stmt.row().unwrap();
-            let oid = if let Value::Integer(v) = row.get_value(0) { *v } else { panic!("Expected OID") };
-            let relname = if let Value::Text(v) = row.get_value(1) { v } else { panic!("Expected relname") };
-            let relkind = if let Value::Text(v) = row.get_value(2) { v } else { panic!("Expected relkind") };
-            let relnatts = if let Value::Integer(v) = row.get_value(3) { *v } else { panic!("Expected relnatts") };
+            let oid = if let Value::Integer(v) = row.get_value(0) {
+                *v
+            } else {
+                panic!("Expected OID")
+            };
+            let relname = if let Value::Text(v) = row.get_value(1) {
+                v
+            } else {
+                panic!("Expected relname")
+            };
+            let relkind = if let Value::Text(v) = row.get_value(2) {
+                v
+            } else {
+                panic!("Expected relkind")
+            };
+            let relnatts = if let Value::Integer(v) = row.get_value(3) {
+                *v
+            } else {
+                panic!("Expected relnatts")
+            };
 
             assert!(oid >= 16384, "OID should be >= 16384 for user tables");
             assert_eq!(relname.value, "test_table", "Table name should match");
-            assert_eq!(relkind.value, "r", "relkind should be 'r' for regular table");
+            assert_eq!(
+                relkind.value, "r",
+                "relkind should be 'r' for regular table"
+            );
             assert_eq!(relnatts, 3, "Table should have 3 columns");
         } else {
             panic!("test_table not found in pg_class");
@@ -856,67 +927,107 @@ mod tests {
     }
 
     #[test]
-    
+
     fn test_sqlite_tables_hidden_in_postgres_mode() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
+        let db = Database::open_file_with_flags(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_postgres(true),
+            None,
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
 
         // Create a test table
-        conn.execute("CREATE TABLE test_table (id INTEGER)").unwrap();
+        conn.execute("CREATE TABLE test_table (id INTEGER)")
+            .unwrap();
 
         // Switch to PostgreSQL dialect
         conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
         // Try to query sqlite_master - should fail
         let result = conn.prepare("SELECT * FROM sqlite_master");
-        assert!(result.is_err(), "sqlite_master should not be accessible in PostgreSQL mode");
+        assert!(
+            result.is_err(),
+            "sqlite_master should not be accessible in PostgreSQL mode"
+        );
 
         // Try to query sqlite_schema - should also fail
         let result = conn.prepare("SELECT * FROM sqlite_schema");
-        assert!(result.is_err(), "sqlite_schema should not be accessible in PostgreSQL mode");
+        assert!(
+            result.is_err(),
+            "sqlite_schema should not be accessible in PostgreSQL mode"
+        );
     }
 
     #[test]
-    
+
     fn test_postgres_tables_hidden_in_sqlite_mode() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
+        let db = Database::open_file_with_flags(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_postgres(true),
+            None,
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
 
         // Default is SQLite mode
 
         // Try to query pg_class - should fail
         let result = conn.prepare("SELECT * FROM pg_class");
-        assert!(result.is_err(), "pg_class should not be accessible in SQLite mode");
+        assert!(
+            result.is_err(),
+            "pg_class should not be accessible in SQLite mode"
+        );
 
         // Try to query pg_namespace - should fail
         let result = conn.prepare("SELECT * FROM pg_namespace");
-        assert!(result.is_err(), "pg_namespace should not be accessible in SQLite mode");
+        assert!(
+            result.is_err(),
+            "pg_namespace should not be accessible in SQLite mode"
+        );
 
         // sqlite_master should work
         let result = conn.prepare("SELECT * FROM sqlite_master");
-        assert!(result.is_ok(), "sqlite_master should be accessible in SQLite mode");
+        assert!(
+            result.is_ok(),
+            "sqlite_master should be accessible in SQLite mode"
+        );
     }
 
     #[test]
-    
+
     fn test_dialect_switching() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
+        let db = Database::open_file_with_flags(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_postgres(true),
+            None,
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
 
         // Create a test table
-        conn.execute("CREATE TABLE users (id INTEGER, name TEXT)").unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+            .unwrap();
 
         // In SQLite mode, check sqlite_master
-        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap();
         let mut found = false;
         loop {
             match stmt.step().unwrap() {
@@ -938,7 +1049,9 @@ mod tests {
         conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
         // In PostgreSQL mode, check pg_class
-        let mut stmt = conn.prepare("SELECT relname FROM pg_class WHERE relkind = 'r'").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT relname FROM pg_class WHERE relkind = 'r'")
+            .unwrap();
         let mut found = false;
         loop {
             match stmt.step().unwrap() {
@@ -961,22 +1074,34 @@ mod tests {
 
         // sqlite_master should work again
         let result = conn.prepare("SELECT * FROM sqlite_master");
-        assert!(result.is_ok(), "sqlite_master should be accessible after switching back to SQLite mode");
+        assert!(
+            result.is_ok(),
+            "sqlite_master should be accessible after switching back to SQLite mode"
+        );
     }
 
     #[test]
-    
+
     fn test_pg_class_with_where_constraints() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
+        let db = Database::open_file_with_flags(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_postgres(true),
+            None,
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
 
         // Create multiple tables
         conn.execute("CREATE TABLE table1 (id INTEGER)").unwrap();
-        conn.execute("CREATE TABLE table2 (id INTEGER, name TEXT)").unwrap();
-        conn.execute("CREATE TABLE table3 (id INTEGER, name TEXT, value REAL)").unwrap();
+        conn.execute("CREATE TABLE table2 (id INTEGER, name TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE table3 (id INTEGER, name TEXT, value REAL)")
+            .unwrap();
 
         // Switch to PostgreSQL dialect
         conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
@@ -984,7 +1109,9 @@ mod tests {
         // Test various WHERE clause combinations
 
         // Test 1: Filter by relkind = 'r'
-        let mut stmt = conn.prepare("SELECT COUNT(*) FROM pg_class WHERE relkind = 'r'").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT COUNT(*) FROM pg_class WHERE relkind = 'r'")
+            .unwrap();
         match stmt.step().unwrap() {
             StepResult::Row => {
                 let row = stmt.row().unwrap();
@@ -996,7 +1123,9 @@ mod tests {
         }
 
         // Test 2: Filter by relnamespace = 2200 (public schema)
-        let mut stmt = conn.prepare("SELECT COUNT(*) FROM pg_class WHERE relnamespace = 2200").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT COUNT(*) FROM pg_class WHERE relnamespace = 2200")
+            .unwrap();
         match stmt.step().unwrap() {
             StepResult::Row => {
                 let row = stmt.row().unwrap();

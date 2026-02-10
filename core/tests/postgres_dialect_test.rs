@@ -19,12 +19,18 @@ fn test_postgresql_parser_integration() {
 
     // Parse using pg_query directly
     let parse_result = turso_parser_pg::parse(sql);
-    assert!(parse_result.is_ok(), "PostgreSQL parser should successfully parse simple SELECT");
+    assert!(
+        parse_result.is_ok(),
+        "PostgreSQL parser should successfully parse simple SELECT"
+    );
 
     // Test the translator
     let translator = turso_parser_pg::translator::PostgreSQLTranslator::new();
     let ast_result = translator.translate(&parse_result.unwrap());
-    assert!(ast_result.is_ok(), "Translator should successfully convert PostgreSQL AST to Turso AST");
+    assert!(
+        ast_result.is_ok(),
+        "Translator should successfully convert PostgreSQL AST to Turso AST"
+    );
 }
 
 #[test]
@@ -34,7 +40,10 @@ fn test_postgresql_system_table_mapping() {
 
     // Parse using pg_query
     let parse_result = turso_parser_pg::parse(sql);
-    assert!(parse_result.is_ok(), "PostgreSQL parser should parse pg_tables query");
+    assert!(
+        parse_result.is_ok(),
+        "PostgreSQL parser should parse pg_tables query"
+    );
 
     // Test the translator - it should map pg_tables to sqlite_master
     let translator = turso_parser_pg::translator::PostgreSQLTranslator::new();
@@ -44,7 +53,7 @@ fn test_postgresql_system_table_mapping() {
         Ok(_ast) => {
             // Test passed - we successfully parsed and translated
             println!("pg_tables query parsed and translated successfully");
-        },
+        }
         Err(e) => {
             // This might fail if the translator hasn't been fully implemented yet
             println!("pg_tables translation failed (this may be expected): {e}");

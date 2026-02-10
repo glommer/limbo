@@ -34,7 +34,10 @@ fn test_postgres_pragma(db: TempDatabase) {
 
     // Test that PostgreSQL parser rejects PRAGMA statements
     let result = conn.query("PRAGMA table_info(test)");
-    assert!(result.is_err(), "PostgreSQL parser should reject PRAGMA statements");
+    assert!(
+        result.is_err(),
+        "PostgreSQL parser should reject PRAGMA statements"
+    );
 }
 
 #[turso_macros::test(mvcc)]
@@ -55,7 +58,6 @@ fn test_postgres_simple_select_literal(db: TempDatabase) {
     };
     assert_eq!(*value, 1);
 }
-
 
 #[turso_macros::test(mvcc)]
 fn test_postgres_arithmetic_expression(db: TempDatabase) {
@@ -85,10 +87,16 @@ fn test_postgres_parser_integration(db: TempDatabase) {
 
     // Test that PostgreSQL parser rejects PRAGMA statements (PostgreSQL doesn't support them)
     let result = conn.query("PRAGMA table_info(test)");
-    assert!(result.is_err(), "PostgreSQL parser should reject PRAGMA statements");
+    assert!(
+        result.is_err(),
+        "PostgreSQL parser should reject PRAGMA statements"
+    );
 
     // But should accept PostgreSQL-style comments
-    let mut rows = conn.query("SELECT 42 -- PostgreSQL comment").unwrap().unwrap();
+    let mut rows = conn
+        .query("SELECT 42 -- PostgreSQL comment")
+        .unwrap()
+        .unwrap();
     let StepResult::Row = rows.step().unwrap() else {
         panic!("expected row");
     };

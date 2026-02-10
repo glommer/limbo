@@ -45,7 +45,7 @@ fn test_type_casting() {
         "SELECT '{1,2,3}'::int[]",
         "SELECT CAST('123' AS integer)",
         "SELECT CAST('3.14' AS double precision)",
-        "SELECT col::text::json",  // "column" is a reserved keyword in PostgreSQL
+        "SELECT col::text::json", // "column" is a reserved keyword in PostgreSQL
         "SELECT $1::text",
     ];
 
@@ -74,7 +74,7 @@ fn test_arrays() {
     let queries = vec![
         "SELECT ARRAY[1, 2, 3]",
         "SELECT ARRAY[]::integer[]",
-        "SELECT (ARRAY[1, 2, 3])[1]",  // Array subscript on constructor requires parentheses
+        "SELECT (ARRAY[1, 2, 3])[1]", // Array subscript on constructor requires parentheses
         "SELECT '{1,2,3}'::int[]",
         "SELECT array_column[1]",
         "SELECT array_column[1:3]",
@@ -596,11 +596,7 @@ fn test_array_literals() {
 
 #[test]
 fn test_bit_string_literals() {
-    let queries = vec![
-        "SELECT B'1010'",
-        "SELECT X'1F2E'",
-        "SELECT B'1010'::bit(4)",
-    ];
+    let queries = vec!["SELECT B'1010'", "SELECT X'1F2E'", "SELECT B'1010'::bit(4)"];
 
     for sql in queries {
         assert!(parse(sql).is_ok(), "Failed to parse: {sql}");

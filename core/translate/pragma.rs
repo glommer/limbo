@@ -417,7 +417,9 @@ fn update_pragma(
                     }
                     crate::SqlDialect::Postgres
                 }
-                _ => bail_parse_error!("Invalid SQL dialect. Supported values: 'sqlite', 'postgres'"),
+                _ => {
+                    bail_parse_error!("Invalid SQL dialect. Supported values: 'sqlite', 'postgres'")
+                }
             };
 
             connection.set_sql_dialect(dialect);

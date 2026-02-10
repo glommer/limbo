@@ -41,13 +41,16 @@ fn test_postgres_pg_class(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create a test table in SQLite dialect first
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
 
     // Switch to PostgreSQL dialect
     conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
     // Query pg_class virtual table
-    let mut stmt = conn.prepare("SELECT relname, relkind FROM pg_class WHERE relkind = 'r'").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT relname, relkind FROM pg_class WHERE relkind = 'r'")
+        .unwrap();
 
     // Should see our users table (once we implement the mapping)
     let mut _found_users_table = false;
@@ -56,7 +59,8 @@ fn test_postgres_pg_class(db: TempDatabase) {
             StepResult::Row => {
                 let row = stmt.row().unwrap();
                 if let (Value::Text(relname), Value::Text(relkind)) =
-                    (row.get_value(0), row.get_value(1)) {
+                    (row.get_value(0), row.get_value(1))
+                {
                     if relname.as_str() == "users" && relkind.as_str() == "r" {
                         _found_users_table = true;
                     }
