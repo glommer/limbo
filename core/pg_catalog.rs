@@ -1,8 +1,49 @@
-use crate::schema::Table;
+use crate::schema::{Schema, Table};
 use crate::sync::{Arc, RwLock};
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
 use crate::{Connection, LimboError, Value};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
+
+/// Starting OID for user tables (matches PostgreSQL convention)
+const USER_TABLE_OID_START: i64 = 16384;
+
+/// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
+/// Both pg_class and pg_attribute must use this function to ensure consistent OID assignment.
+fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
+    let mut tables: Vec<_> = schema
+        .tables
+        .iter()
+        .filter(|(name, table)| {
+            // Skip system tables
+            if *name == "sqlite_schema"
+                || *name == "sqlite_master"
+                || name.starts_with("pg_")
+                || name.starts_with("pragma_")
+                || name.starts_with("json_")
+                || *name == "sqlite_dbpage"
+            {
+                return false;
+            }
+            // Skip virtual tables and subqueries
+            matches!(table.as_ref(), Table::BTree(_))
+        })
+        .collect();
+    tables.sort_by_key(|(name, _)| *name);
+    tables
+}
+
+/// Map a SQLite type string to a PostgreSQL type OID.
+fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
+    match ty_str.to_uppercase().as_str() {
+        "INTEGER" | "INT" | "SMALLINT" | "BIGINT" | "TINYINT" | "MEDIUMINT" => 23, // int4
+        "TEXT" | "VARCHAR" | "CHAR" | "CLOB" | "NCHAR" | "NVARCHAR" => 25,         // text
+        "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT" => 701,                   // float8
+        "BLOB" => 17,                                                               // bytea
+        "NUMERIC" | "DECIMAL" => 1700,                                              // numeric
+        "BOOLEAN" | "BOOL" => 16,                                                   // bool
+        _ => 25,                                                                    // default to text
+    }
+}
 
 /// Virtual table implementation for pg_catalog.pg_class
 /// Maps SQLite's sqlite_master to PostgreSQL's pg_class system table
@@ -108,41 +149,15 @@ impl PgClassCursor {
     }
 
     fn load_from_sqlite_master(&mut self) -> Result<(), LimboError> {
-        // Query sqlite_master to get all tables, views, indexes and map to pg_class format
-
-        // Get the schema from connection (using SQLite dialect to access sqlite_master)
         let schema = self.conn.schema.read().clone();
         self.rows.clear();
 
-        let mut oid_counter = 16384; // Start PostgreSQL OIDs from a high number to avoid conflicts
+        let mut oid_counter = USER_TABLE_OID_START;
 
-        // Iterate through all tables in the schema
-        for (table_name, table) in &schema.tables {
-            // Skip SQLite system tables when in PostgreSQL mode
-            if table_name == "sqlite_schema" || table_name == "sqlite_master" {
-                continue;
-            }
-
-            // Skip PostgreSQL catalog tables (they have their own OIDs)
-            if table_name.starts_with("pg_") {
-                continue;
-            }
-
-            // Skip other SQLite-specific virtual tables
-            if table_name.starts_with("pragma_")
-                || table_name.starts_with("json_")
-                || table_name == "sqlite_dbpage"
-            {
-                continue;
-            }
-
-            let (relkind, relnatts) = match table.as_ref() {
-                Table::BTree(btree_table) => {
-                    ("r", btree_table.columns.len() as i64) // r = regular table
-                }
-                Table::Virtual(_) | Table::FromClauseSubquery(_) => {
-                    continue; // Skip virtual tables and subqueries
-                }
+        for (table_name, table) in user_tables_sorted(&schema) {
+            let relnatts = match table.as_ref() {
+                Table::BTree(btree_table) => btree_table.columns.len() as i64,
+                _ => continue,
             };
 
             // Create a row for this table
@@ -163,7 +178,7 @@ impl PgClassCursor {
                 Value::Integer(0),                      // relhasindex
                 Value::Integer(0),                      // relisshared
                 Value::Text("p".into()),                // relpersistence (permanent)
-                Value::Text(relkind.into()),            // relkind
+                Value::Text("r".into()),                // relkind (regular table)
                 Value::Integer(relnatts),               // relnatts (number of attributes)
                 Value::Integer(0),                      // relchecks
                 Value::Integer(0),                      // relhasrules
@@ -429,22 +444,68 @@ impl InternalVirtualTable for PgAttributeTable {
 }
 
 struct PgAttributeCursor {
+    conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
 }
 
 impl PgAttributeCursor {
-    fn new(_conn: Arc<Connection>) -> Self {
+    fn new(conn: Arc<Connection>) -> Self {
         Self {
+            conn,
             rows: Vec::new(),
             current_row: 0,
         }
     }
 
     fn load_attributes(&mut self) -> Result<(), LimboError> {
-        // This would query pragma_table_info for all tables to get column info
-        // For now, return empty to test structure
-        self.rows = Vec::new();
+        let schema = self.conn.schema.read().clone();
+        self.rows.clear();
+
+        let mut oid_counter = USER_TABLE_OID_START;
+
+        for (_, table) in user_tables_sorted(&schema) {
+            let table_oid = oid_counter;
+            oid_counter += 1;
+
+            let columns = table.columns();
+            for (i, col) in columns.iter().enumerate() {
+                let col_name = col.name.clone().unwrap_or_default();
+                let type_oid = sqlite_type_to_pg_oid(&col.ty_str);
+                let attnum = (i + 1) as i64; // 1-based
+                let notnull = if col.notnull() { 1i64 } else { 0i64 };
+                let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
+
+                self.rows.push(vec![
+                    Value::Integer(table_oid),            // attrelid
+                    Value::Text(col_name.into()),         // attname
+                    Value::Integer(type_oid),              // atttypid
+                    Value::Integer(-1),                    // attstattarget
+                    Value::Integer(-1),                    // attlen
+                    Value::Integer(attnum),                // attnum
+                    Value::Integer(0),                     // attndims
+                    Value::Integer(-1),                    // attcacheoff
+                    Value::Integer(-1),                    // atttypmod
+                    Value::Integer(1),                     // attbyval
+                    Value::Text("p".into()),               // attstorage (plain)
+                    Value::Text("i".into()),               // attalign (int)
+                    Value::Integer(notnull),               // attnotnull
+                    Value::Integer(has_def),               // atthasdef
+                    Value::Integer(0),                     // atthasmissing
+                    Value::Text("".into()),                // attidentity
+                    Value::Text("".into()),                // attgenerated
+                    Value::Integer(0),                     // attisdropped
+                    Value::Integer(1),                     // attislocal
+                    Value::Integer(0),                     // attinhcount
+                    Value::Integer(0),                     // attcollation
+                    Value::Null,                           // attacl
+                    Value::Null,                           // attoptions
+                    Value::Null,                           // attfdwoptions
+                    Value::Null,                           // attmissingval
+                ]);
+            }
+        }
+
         Ok(())
     }
 }
@@ -717,6 +778,92 @@ impl InternalVirtualTableCursor for PgAmCursor {
     }
 }
 
+/// Generic empty PG catalog table — always returns no rows.
+/// Used for catalog tables psql queries but we don't yet need real data for.
+#[derive(Debug)]
+struct EmptyPgCatalogTable {
+    name: String,
+    create_sql: String,
+}
+
+impl InternalVirtualTable for EmptyPgCatalogTable {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn open(
+        &self,
+        _conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(EmptyPgCatalogCursor)))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 10.0,
+            estimated_rows: 0,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        self.create_sql.clone()
+    }
+}
+
+struct EmptyPgCatalogCursor;
+
+impl InternalVirtualTableCursor for EmptyPgCatalogCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        Ok(false)
+    }
+    fn rowid(&self) -> i64 {
+        0
+    }
+    fn column(&self, _column: usize) -> Result<Value, LimboError> {
+        Ok(Value::Null)
+    }
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        Ok(false)
+    }
+}
+
+fn empty_catalog_table(name: &str, create_sql: &str) -> Arc<crate::vtab::VirtualTable> {
+    use crate::vtab::VirtualTable;
+    let table = EmptyPgCatalogTable {
+        name: name.to_string(),
+        create_sql: create_sql.to_string(),
+    };
+    Arc::new(
+        VirtualTable::new_internal(
+            name.to_string(),
+            table.sql(),
+            VTabKind::VirtualTable,
+            Arc::new(RwLock::new(table)),
+        )
+        .unwrap_or_else(|_| panic!("{name} virtual table creation should not fail")),
+    )
+}
+
 /// Create PostgreSQL system catalog virtual tables
 pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
     use crate::vtab::VirtualTable;
@@ -782,6 +929,23 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
             )
             .expect("pg_get_tabledef virtual table creation should not fail"),
         ),
+        // Empty stub tables for psql \d command compatibility
+        empty_catalog_table("pg_policy", "CREATE TABLE pg_policy (oid INTEGER, polname TEXT, polpermissive TEXT, polroles TEXT, polcmd TEXT, polqual TEXT, polwithcheck TEXT, polrelid INTEGER)"),
+        empty_catalog_table("pg_trigger", "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT)"),
+        empty_catalog_table("pg_index", "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique INTEGER, indisprimary INTEGER, indisexclusion INTEGER, indimmediate INTEGER, indisclustered INTEGER, indisvalid INTEGER, indcheckxmin INTEGER, indisready INTEGER, indislive INTEGER, indisreplident INTEGER, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT)"),
+        empty_catalog_table("pg_constraint", "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable INTEGER, condeferred INTEGER, convalidated INTEGER, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal INTEGER, coninhcount INTEGER, connoinherit INTEGER, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT)"),
+        empty_catalog_table("pg_statistic_ext", "CREATE TABLE pg_statistic_ext (oid INTEGER, stxrelid INTEGER, stxname TEXT, stxnamespace INTEGER, stxowner INTEGER, stxstattarget INTEGER, stxkeys TEXT, stxkind TEXT, stxexprs TEXT)"),
+        empty_catalog_table("pg_inherits", "CREATE TABLE pg_inherits (inhrelid INTEGER, inhparent INTEGER, inhseqno INTEGER, inhdetachpending INTEGER)"),
+        empty_catalog_table("pg_rewrite", "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead INTEGER, ev_qual TEXT, ev_action TEXT)"),
+        empty_catalog_table("pg_foreign_table", "CREATE TABLE pg_foreign_table (ftrelid INTEGER, ftserver INTEGER, ftoptions TEXT)"),
+        empty_catalog_table("pg_partitioned_table", "CREATE TABLE pg_partitioned_table (partrelid INTEGER, partstrat TEXT, partnatts INTEGER, partdefid INTEGER, partattrs TEXT, partclass TEXT, partcollation TEXT, partexprs TEXT)"),
+        empty_catalog_table("pg_type", "CREATE TABLE pg_type (oid INTEGER, typname TEXT, typnamespace INTEGER, typowner INTEGER, typlen INTEGER, typbyval INTEGER, typtype TEXT, typcategory TEXT, typispreferred INTEGER, typisdefined INTEGER, typdelim TEXT, typrelid INTEGER, typsubscript TEXT, typelem INTEGER, typarray INTEGER, typinput TEXT, typoutput TEXT, typreceive TEXT, typsend TEXT, typmodin TEXT, typmodout TEXT, typanalyze TEXT, typalign TEXT, typstorage TEXT, typnotnull INTEGER, typbasetype INTEGER, typtypmod INTEGER, typndims INTEGER, typcollation INTEGER, typdefaultbin TEXT, typdefault TEXT, typacl TEXT)"),
+        empty_catalog_table("pg_collation", "CREATE TABLE pg_collation (oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER, collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER, collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT, collversion TEXT)"),
+        empty_catalog_table("pg_attrdef", "CREATE TABLE pg_attrdef (oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT)"),
+        empty_catalog_table("pg_description", "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)"),
+        empty_catalog_table("pg_publication", "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER)"),
+        empty_catalog_table("pg_publication_namespace", "CREATE TABLE pg_publication_namespace (oid INTEGER, pnpubid INTEGER, pnnspid INTEGER)"),
+        empty_catalog_table("pg_publication_rel", "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT)"),
     ]
 }
 

@@ -189,17 +189,18 @@ impl VirtualTable {
     }
 
     pub(crate) fn open(&self, conn: Arc<Connection>) -> crate::Result<VirtualTableCursor> {
-        match &self.vtab_type {
+        let kind = match &self.vtab_type {
             VirtualTableType::Pragma(table) => {
-                Ok(VirtualTableCursor::Pragma(Box::new(table.open(conn)?)))
+                VirtualTableCursorKind::Pragma(Box::new(table.open(conn)?))
             }
-            VirtualTableType::External(table) => Ok(VirtualTableCursor::External(
-                table.open(conn, self.vtab_id)?,
-            )),
+            VirtualTableType::External(table) => {
+                VirtualTableCursorKind::External(table.open(conn, self.vtab_id)?)
+            }
             VirtualTableType::Internal(table) => {
-                Ok(VirtualTableCursor::Internal(table.read().open(conn)?))
+                VirtualTableCursorKind::Internal(table.read().open(conn)?)
             }
-        }
+        };
+        Ok(VirtualTableCursor::new(kind))
     }
 
     pub(crate) fn update(&self, args: &[Value]) -> crate::Result<Option<i64>> {
@@ -279,36 +280,57 @@ impl VirtualTable {
     }
 }
 
-pub enum VirtualTableCursor {
+pub enum VirtualTableCursorKind {
     Pragma(Box<PragmaVirtualTableCursor>),
     External(ExtVirtualTableCursor),
     Internal(Arc<RwLock<dyn InternalVirtualTableCursor>>),
 }
 
+// FIXME: null_flag is a workaround for LEFT JOIN with virtual tables.
+// op_null_row previously only handled BTree cursors, causing a panic on virtual
+// table cursors. This needs a proper fix in the SQLite LEFT JOIN implementation
+// so that NullRow works uniformly for all cursor types.
+// See: virtual-table-left-join-nullrow.md
+pub struct VirtualTableCursor {
+    kind: VirtualTableCursorKind,
+    pub(crate) null_flag: bool,
+}
+
 crate::assert::assert_send_sync!(VirtualTableCursor);
 
 impl VirtualTableCursor {
+    pub(crate) fn new(kind: VirtualTableCursorKind) -> Self {
+        Self {
+            kind,
+            null_flag: false,
+        }
+    }
+
     pub(crate) fn next(&mut self) -> crate::Result<bool> {
-        match self {
-            VirtualTableCursor::Pragma(cursor) => cursor.next(),
-            VirtualTableCursor::External(cursor) => cursor.next(),
-            VirtualTableCursor::Internal(cursor) => cursor.write().next(),
+        self.null_flag = false;
+        match &mut self.kind {
+            VirtualTableCursorKind::Pragma(cursor) => cursor.next(),
+            VirtualTableCursorKind::External(cursor) => cursor.next(),
+            VirtualTableCursorKind::Internal(cursor) => cursor.write().next(),
         }
     }
 
     pub(crate) fn rowid(&self) -> i64 {
-        match self {
-            VirtualTableCursor::Pragma(cursor) => cursor.rowid(),
-            VirtualTableCursor::External(cursor) => cursor.rowid(),
-            VirtualTableCursor::Internal(cursor) => cursor.read().rowid(),
+        match &self.kind {
+            VirtualTableCursorKind::Pragma(cursor) => cursor.rowid(),
+            VirtualTableCursorKind::External(cursor) => cursor.rowid(),
+            VirtualTableCursorKind::Internal(cursor) => cursor.read().rowid(),
         }
     }
 
     pub(crate) fn column(&self, column: usize) -> crate::Result<Value> {
-        match self {
-            VirtualTableCursor::Pragma(cursor) => cursor.column(column),
-            VirtualTableCursor::External(cursor) => cursor.column(column),
-            VirtualTableCursor::Internal(cursor) => cursor.read().column(column),
+        if self.null_flag {
+            return Ok(Value::Null);
+        }
+        match &self.kind {
+            VirtualTableCursorKind::Pragma(cursor) => cursor.column(column),
+            VirtualTableCursorKind::External(cursor) => cursor.column(column),
+            VirtualTableCursorKind::Internal(cursor) => cursor.read().column(column),
         }
     }
 
@@ -319,20 +341,23 @@ impl VirtualTableCursor {
         arg_count: usize,
         args: Vec<Value>,
     ) -> crate::Result<bool> {
-        match self {
-            VirtualTableCursor::Pragma(cursor) => cursor.filter(args),
-            VirtualTableCursor::External(cursor) => {
+        self.null_flag = false;
+        match &mut self.kind {
+            VirtualTableCursorKind::Pragma(cursor) => cursor.filter(args),
+            VirtualTableCursorKind::External(cursor) => {
                 cursor.filter(idx_num, idx_str, arg_count, args)
             }
-            VirtualTableCursor::Internal(cursor) => cursor.write().filter(&args, idx_str, idx_num),
+            VirtualTableCursorKind::Internal(cursor) => {
+                cursor.write().filter(&args, idx_str, idx_num)
+            }
         }
     }
 
     pub(crate) fn vtab_id(&self) -> Option<u64> {
-        match self {
-            VirtualTableCursor::Pragma(_) => None,
-            VirtualTableCursor::External(cursor) => cursor.vtab_id.into(),
-            VirtualTableCursor::Internal(_) => None,
+        match &self.kind {
+            VirtualTableCursorKind::Pragma(_) => None,
+            VirtualTableCursorKind::External(cursor) => cursor.vtab_id.into(),
+            VirtualTableCursorKind::Internal(_) => None,
         }
     }
 }

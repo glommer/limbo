@@ -441,6 +441,7 @@ pub fn op_null(
     Ok(InsnFunctionStepResult::Step)
 }
 
+// FIXME: Virtual table branch is a workaround — see virtual-table-left-join-nullrow.md
 pub fn op_null_row(
     program: &Program,
     state: &mut ProgramState,
@@ -449,9 +450,16 @@ pub fn op_null_row(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(NullRow { cursor_id }, insn);
     {
-        let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "NullRow");
-        let cursor = cursor.as_btree_mut();
-        cursor.set_null_flag(true);
+        let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
+        if matches!(cursor_type, CursorType::VirtualTable(_)) {
+            let cursor = get_cursor!(state, *cursor_id);
+            cursor.as_virtual_mut().null_flag = true;
+        } else {
+            let cursor =
+                must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "NullRow");
+            let cursor = cursor.as_btree_mut();
+            cursor.set_null_flag(true);
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5161,6 +5169,38 @@ pub fn op_function(
             }
             ScalarFunc::PgTableIsVisible => {
                 state.registers[*dest] = Register::Value(Value::Integer(1));
+            }
+            // FIXME: Temporary stubs for psql \d query — return NULL.
+            ScalarFunc::PgGetExpr
+            | ScalarFunc::PgArrayToString
+            | ScalarFunc::PgGetStatisticsObjDefColumns
+            | ScalarFunc::PgRelationIsPublishable
+            | ScalarFunc::PgArrayUpper => {
+                state.registers[*dest] = Register::Value(Value::Null);
+            }
+            // FIXME: Temporary stub for psql \d query. Returns type name from OID.
+            // Should be replaced with proper type catalog when pg_type is implemented.
+            ScalarFunc::PgFormatType => {
+                let type_oid = match &state.registers[*start_reg] {
+                    Register::Value(v) => v.as_int().unwrap_or(0),
+                    _ => 0,
+                };
+                let type_name = match type_oid {
+                    16 => "boolean",
+                    17 => "bytea",
+                    20 => "bigint",
+                    21 => "smallint",
+                    23 => "integer",
+                    25 => "text",
+                    26 => "oid",
+                    700 => "real",
+                    701 => "double precision",
+                    1043 => "character varying",
+                    1700 => "numeric",
+                    _ => "unknown",
+                };
+                state.registers[*dest] =
+                    Register::Value(Value::build_text(type_name));
             }
             ScalarFunc::Abs
             | ScalarFunc::Lower

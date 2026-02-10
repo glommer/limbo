@@ -2183,8 +2183,35 @@ pub fn translate_expr(
                                 func_ctx,
                             )
                         }
-                        ScalarFunc::PgGetUserById | ScalarFunc::PgTableIsVisible => {
+                        ScalarFunc::PgGetUserById
+                        | ScalarFunc::PgTableIsVisible
+                        | ScalarFunc::PgGetStatisticsObjDefColumns
+                        | ScalarFunc::PgRelationIsPublishable => {
                             let args = expect_arguments_exact!(args, 1, srf);
+                            translate_function(
+                                program,
+                                args,
+                                referenced_tables,
+                                resolver,
+                                target_register,
+                                func_ctx,
+                            )
+                        }
+                        ScalarFunc::PgFormatType
+                        | ScalarFunc::PgArrayToString
+                        | ScalarFunc::PgArrayUpper => {
+                            let args = expect_arguments_exact!(args, 2, srf);
+                            translate_function(
+                                program,
+                                args,
+                                referenced_tables,
+                                resolver,
+                                target_register,
+                                func_ctx,
+                            )
+                        }
+                        ScalarFunc::PgGetExpr => {
+                            let args = expect_arguments_min!(args, 2, srf);
                             translate_function(
                                 program,
                                 args,
@@ -4233,12 +4260,21 @@ pub fn bind_and_rewrite_expr<'a>(
                             .as_ref()
                             .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                     });
-                    if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
-                        *expr = row_id_expr;
-
-                        return Ok(WalkControl::Continue);
-                    }
+                    // FIXME: This fix (column lookup before rowid alias) was done
+                    // as part of PG compat work. Needs a proper SQLite test case.
+                    // See: rowid-alias-precedence.md
+                    //
+                    // If the table has a column with this name, use it.
+                    // Only fall back to rowid alias if no such column exists
+                    // (SQLite spec: oid/rowid/_rowid_ are rowid aliases only
+                    // when the table has no user-defined column with that name).
                     let Some(col_idx) = col_idx else {
+                        if let Some(row_id_expr) =
+                            parse_row_id(&normalized_id, tbl_id, || false)?
+                        {
+                            *expr = row_id_expr;
+                            return Ok(WalkControl::Continue);
+                        }
                         crate::bail_parse_error!("no such column: {}", normalized_id);
                     };
                     let col = tbl.columns().get(col_idx).unwrap();

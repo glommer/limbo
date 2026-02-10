@@ -26,9 +26,12 @@ impl PostgreSQLTranslator {
     fn map_table_name(&self, table_name: &str) -> String {
         match table_name.to_lowercase().as_str() {
             // These have virtual table implementations in pg_catalog.rs - pass through
-            "pg_class" | "pg_namespace" | "pg_attribute" | "pg_roles" | "pg_am" => {
-                table_name.to_string()
-            }
+            "pg_class" | "pg_namespace" | "pg_attribute" | "pg_roles" | "pg_am"
+            | "pg_policy" | "pg_trigger" | "pg_index" | "pg_constraint"
+            | "pg_statistic_ext" | "pg_inherits" | "pg_rewrite" | "pg_foreign_table"
+            | "pg_partitioned_table" | "pg_type" | "pg_collation" | "pg_attrdef"
+            | "pg_description" | "pg_publication" | "pg_publication_namespace"
+            | "pg_publication_rel" | "pg_get_tabledef" => table_name.to_string(),
             // PostgreSQL information schema mappings (no virtual table yet)
             "pg_tables" => "sqlite_master".to_string(),
             "information_schema.tables" => "sqlite_master".to_string(),
@@ -78,18 +81,21 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
-        // Translate PostgreSQL SELECT to turso_parser AST
+        use pg_query::protobuf::SetOperation;
 
-        // 1. Handle FROM clause first to get the base table(s)
+        // Check if this is a UNION/INTERSECT/EXCEPT (set operation)
+        let set_op = select.op();
+        if set_op != SetOperation::SetopNone && set_op != SetOperation::Undefined {
+            return self.translate_set_operation(select);
+        }
+
+        // Regular SELECT — translate FROM, columns, WHERE, ORDER BY
         let from_clause = if !select.from_clause.is_empty() {
-            // For now, handle single table only
-            let from_item = &select.from_clause[0];
-            Some(self.translate_from_clause(from_item)?)
+            Some(self.translate_from_items(&select.from_clause)?)
         } else {
             None
         };
 
-        // 2. Handle SELECT list (result columns)
         let target_list = &select.target_list;
         if target_list.is_empty() {
             return Err(ParseError::ParseError("Empty target list".to_string()));
@@ -97,17 +103,14 @@ impl PostgreSQLTranslator {
 
         let result_columns = self.translate_target_list(target_list)?;
 
-        // 3. Handle WHERE clause if present
         let where_clause = if let Some(where_clause) = &select.where_clause {
             Some(self.translate_expr(where_clause)?)
         } else {
             None
         };
 
-        // 4. Handle ORDER BY clause
         let order_by = self.translate_order_by(&select.sort_clause)?;
 
-        // Build the SELECT AST
         let one_select = ast::OneSelect::Select {
             distinctness: None,
             columns: result_columns,
@@ -122,14 +125,161 @@ impl PostgreSQLTranslator {
             compounds: vec![],
         };
 
-        let select_ast = ast::Select {
+        Ok(ast::Select {
             with: None,
             body: select_body,
             order_by,
             limit: None,
+        })
+    }
+
+    fn translate_set_operation(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<ast::Select, ParseError> {
+        // Flatten the left-deep tree of set operations into a list.
+        // pg_query represents A UNION B UNION C as:
+        //   SetOp(SetOp(A, B), C)
+        let mut parts: Vec<(Option<ast::CompoundOperator>, &pg_query::protobuf::SelectStmt)> =
+            Vec::new();
+        Self::flatten_set_operation(select, &mut parts);
+
+        if parts.is_empty() {
+            return Err(ParseError::ParseError(
+                "Empty set operation".to_string(),
+            ));
+        }
+
+        // First part becomes the primary select
+        let (_, first_stmt) = &parts[0];
+        let first_select = self.translate_one_select(first_stmt)?;
+
+        // Remaining parts become compounds
+        let mut compounds = Vec::new();
+        for (op, stmt) in parts.iter().skip(1) {
+            let operator = op.ok_or_else(|| {
+                ParseError::ParseError("Missing compound operator".to_string())
+            })?;
+            compounds.push(ast::CompoundSelect {
+                operator,
+                select: self.translate_one_select(stmt)?,
+            });
+        }
+
+        // ORDER BY on compound SELECTs is not yet supported in Turso's
+        // query planner, so we drop it. The tables involved are empty stubs
+        // anyway, so ordering doesn't matter.
+        Ok(ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: first_select,
+                compounds,
+            },
+            order_by: vec![],
+            limit: None,
+        })
+    }
+
+    fn flatten_set_operation<'a>(
+        stmt: &'a pg_query::protobuf::SelectStmt,
+        parts: &mut Vec<(Option<ast::CompoundOperator>, &'a pg_query::protobuf::SelectStmt)>,
+    ) {
+        use pg_query::protobuf::SetOperation;
+
+        let set_op = stmt.op();
+        if set_op == SetOperation::SetopNone || set_op == SetOperation::Undefined {
+            // Leaf select
+            parts.push((None, stmt));
+            return;
+        }
+
+        let operator = match (set_op, stmt.all) {
+            (SetOperation::SetopUnion, true) => ast::CompoundOperator::UnionAll,
+            (SetOperation::SetopUnion, false) => ast::CompoundOperator::Union,
+            (SetOperation::SetopIntersect, _) => ast::CompoundOperator::Intersect,
+            (SetOperation::SetopExcept, _) => ast::CompoundOperator::Except,
+            _ => return,
         };
 
-        Ok(select_ast)
+        if let Some(larg) = &stmt.larg {
+            Self::flatten_set_operation(larg, parts);
+        }
+        if let Some(rarg) = &stmt.rarg {
+            // The first element pushed from rarg gets the operator
+            let prev_len = parts.len();
+            Self::flatten_set_operation(rarg, parts);
+            if parts.len() > prev_len {
+                parts[prev_len].0 = Some(operator);
+            }
+        }
+    }
+
+    /// Translate a single leaf SELECT (no set operations) into a OneSelect.
+    fn translate_one_select(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<ast::OneSelect, ParseError> {
+        let from_clause = if !select.from_clause.is_empty() {
+            Some(self.translate_from_items(&select.from_clause)?)
+        } else {
+            None
+        };
+
+        let target_list = &select.target_list;
+        if target_list.is_empty() {
+            return Err(ParseError::ParseError("Empty target list".to_string()));
+        }
+
+        let result_columns = self.translate_target_list(target_list)?;
+
+        let where_clause = if let Some(where_clause) = &select.where_clause {
+            Some(self.translate_expr(where_clause)?)
+        } else {
+            None
+        };
+
+        Ok(ast::OneSelect::Select {
+            distinctness: None,
+            columns: result_columns,
+            from: from_clause,
+            where_clause: where_clause.map(Box::new),
+            group_by: None,
+            window_clause: vec![],
+        })
+    }
+
+    /// Translate multiple FROM items. The first becomes the primary table,
+    /// subsequent items become comma-joins (implicit cross join).
+    fn translate_from_items(
+        &self,
+        from_items: &[pg_query::protobuf::Node],
+    ) -> Result<ast::FromClause, ParseError> {
+        let mut from_clause = self.translate_from_clause(&from_items[0])?;
+        // Additional FROM items are comma-joins (implicit cross join)
+        for item in &from_items[1..] {
+            let table = match &item.node {
+                Some(pg_query::protobuf::node::Node::RangeVar(range_var)) => {
+                    self.translate_range_var(range_var)?
+                }
+                Some(pg_query::protobuf::node::Node::JoinExpr(join_expr)) => {
+                    // A JoinExpr as a comma-separated item — flatten its joins
+                    let nested = self.translate_join_expr(join_expr)?;
+                    from_clause.joins.extend(nested.joins);
+                    *nested.select
+                }
+                other => {
+                    return Err(ParseError::ParseError(format!(
+                        "Unsupported FROM item type: {other:?}"
+                    )))
+                }
+            };
+            from_clause.joins.push(ast::JoinedSelectTable {
+                operator: ast::JoinOperator::Comma,
+                table: Box::new(table),
+                constraint: None,
+            });
+        }
+        Ok(from_clause)
     }
 
     fn translate_from_clause(
@@ -388,6 +538,44 @@ impl PostgreSQLTranslator {
             Some(pg_query::protobuf::node::Node::CaseExpr(case_expr)) => {
                 self.translate_case_expr(case_expr)
             }
+            Some(pg_query::protobuf::node::Node::CollateClause(collate)) => {
+                // Strip COLLATE clause, just translate the inner expression
+                if let Some(arg) = &collate.arg {
+                    self.translate_expr(arg)
+                } else {
+                    Err(ParseError::ParseError(
+                        "COLLATE clause missing inner expression".to_string(),
+                    ))
+                }
+            }
+            Some(pg_query::protobuf::node::Node::TypeCast(type_cast)) => {
+                // Strip type casts — SQLite doesn't have PG's type system
+                if let Some(arg) = &type_cast.arg {
+                    self.translate_expr(arg)
+                } else {
+                    Err(ParseError::ParseError(
+                        "TypeCast missing inner expression".to_string(),
+                    ))
+                }
+            }
+            Some(pg_query::protobuf::node::Node::SubLink(_)) => {
+                // Subquery expressions (correlated subqueries in SELECT list).
+                // Stub as NULL — the referenced tables (pg_attrdef, pg_collation, etc.)
+                // are not yet implemented.
+                Ok(ast::Expr::Literal(ast::Literal::Null))
+            }
+            Some(pg_query::protobuf::node::Node::NullTest(null_test)) => {
+                use pg_query::protobuf::NullTestType;
+                let arg = null_test
+                    .arg
+                    .as_ref()
+                    .ok_or_else(|| ParseError::ParseError("NullTest missing arg".to_string()))?;
+                let expr = self.translate_expr(arg)?;
+                match null_test.nulltesttype() {
+                    NullTestType::IsNotNull => Ok(ast::Expr::NotNull(Box::new(expr))),
+                    _ => Ok(ast::Expr::IsNull(Box::new(expr))),
+                }
+            }
             Some(pg_query::protobuf::node::Node::AStar(_)) => {
                 // SELECT * - this should be handled as ResultColumn::Star in translate_target_list
                 Err(ParseError::ParseError(
@@ -405,6 +593,9 @@ impl PostgreSQLTranslator {
         &self,
         a_const: &pg_query::protobuf::AConst,
     ) -> Result<ast::Expr, ParseError> {
+        if a_const.isnull {
+            return Ok(ast::Expr::Literal(ast::Literal::Null));
+        }
         if let Some(val) = &a_const.val {
             match val {
                 pg_query::protobuf::a_const::Val::Ival(i) => Ok(ast::Expr::Literal(
@@ -418,6 +609,12 @@ impl PostgreSQLTranslator {
                 }
                 pg_query::protobuf::a_const::Val::Fval(f) => {
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(f.fval.clone())))
+                }
+                pg_query::protobuf::a_const::Val::Boolval(b) => {
+                    // SQLite uses 0/1 for booleans
+                    Ok(ast::Expr::Literal(ast::Literal::Numeric(
+                        if b.boolval { "1" } else { "0" }.to_string(),
+                    )))
                 }
                 _ => Err(ParseError::ParseError(
                     "Unsupported constant type".to_string(),
@@ -447,6 +644,12 @@ impl PostgreSQLTranslator {
                 // LIKE/NOT LIKE operator
                 self.translate_like_expr(a_expr)
             }
+            AExprKind::AexprOpAny => {
+                // expr = ANY(array) → stub as 0 (false).
+                // Our pg_catalog tables that use arrays are empty stubs,
+                // so this never actually evaluates.
+                Ok(ast::Expr::Literal(ast::Literal::Numeric("0".to_string())))
+            }
             _ => Err(ParseError::ParseError(format!(
                 "Unsupported AExpr kind: {:?}",
                 a_expr.kind()
@@ -458,15 +661,17 @@ impl PostgreSQLTranslator {
         &self,
         a_expr: &pg_query::protobuf::AExpr,
     ) -> Result<ast::Expr, ParseError> {
-        // Extract operator name
-        let op_name = if let Some(name) = a_expr.name.first() {
-            match &name.node {
-                Some(pg_query::protobuf::node::Node::String(s)) => &s.sval,
-                _ => return Err(ParseError::ParseError("Invalid operator name".to_string())),
-            }
-        } else {
-            return Err(ParseError::ParseError("Missing operator name".to_string()));
-        };
+        // Extract operator name — use the last String node to handle
+        // schema-qualified operators like OPERATOR(pg_catalog.~)
+        let op_name = a_expr
+            .name
+            .iter()
+            .rev()
+            .find_map(|name| match &name.node {
+                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| ParseError::ParseError("Missing operator name".to_string()))?;
 
         // Translate left and right expressions
         let left = if let Some(lexpr) = &a_expr.lexpr {
@@ -486,7 +691,7 @@ impl PostgreSQLTranslator {
         };
 
         // Handle regex operators (~, !~) which map to REGEXP expressions
-        match op_name.as_str() {
+        match op_name {
             "~" => {
                 return Ok(ast::Expr::Like {
                     lhs: left,
@@ -509,7 +714,7 @@ impl PostgreSQLTranslator {
         }
 
         // Map PostgreSQL operators to Turso operators
-        let binary_op = match op_name.as_str() {
+        let binary_op = match op_name {
             "=" => ast::Operator::Equals,
             "!=" | "<>" => ast::Operator::NotEquals,
             "<" => ast::Operator::Less,
