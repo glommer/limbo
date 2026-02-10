@@ -339,7 +339,7 @@ impl PostgreSQLTranslator {
                         Some(pg_query::protobuf::node::Node::String(s)) => {
                             if col_ref.fields.len() == 1 {
                                 // Simple column reference
-                                Ok(ast::Expr::Name(ast::Name::from_string(s.sval.clone())))
+                                Ok(ast::Expr::Id(ast::Name::from_string(s.sval.clone())))
                             } else {
                                 // Qualified column reference (table.column)
                                 let mut parts = vec![];
@@ -358,7 +358,7 @@ impl PostgreSQLTranslator {
                                     ))
                                 } else {
                                     // Just a simple column name
-                                    Ok(ast::Expr::Name(ast::Name::from_string(parts[0].clone())))
+                                    Ok(ast::Expr::Id(ast::Name::from_string(parts[0].clone())))
                                 }
                             }
                         }
@@ -1018,10 +1018,10 @@ mod tests {
                 // First column should be 'id'
                 if let ast::ResultColumn::Expr(expr, alias) = &columns[0] {
                     assert!(
-                        matches!(**expr, ast::Expr::Name(_)),
+                        matches!(**expr, ast::Expr::Id(_)),
                         "Expected Name expression but got {expr:?}"
                     );
-                    if let ast::Expr::Name(name) = &**expr {
+                    if let ast::Expr::Id(name) = &**expr {
                         assert_eq!(name.as_str(), "id");
                     }
                     assert!(alias.is_none());
@@ -1032,10 +1032,10 @@ mod tests {
                 // Second column should be 'name'
                 if let ast::ResultColumn::Expr(expr, alias) = &columns[1] {
                     assert!(
-                        matches!(**expr, ast::Expr::Name(_)),
+                        matches!(**expr, ast::Expr::Id(_)),
                         "Expected Name expression but got {expr:?}"
                     );
-                    if let ast::Expr::Name(name) = &**expr {
+                    if let ast::Expr::Id(name) = &**expr {
                         assert_eq!(name.as_str(), "name");
                     }
                     assert!(alias.is_none());
@@ -1140,10 +1140,10 @@ mod tests {
                     if let ast::Expr::Binary(left, op, right) = &**where_expr {
                         // Left side should be column 'id'
                         assert!(
-                            matches!(**left, ast::Expr::Name(_)),
+                            matches!(**left, ast::Expr::Id(_)),
                             "Expected Name expression for left side"
                         );
-                        if let ast::Expr::Name(name) = &**left {
+                        if let ast::Expr::Id(name) = &**left {
                             assert_eq!(name.as_str(), "id");
                         }
 
@@ -1331,7 +1331,7 @@ mod tests {
 
                         // Check that lhs is a column reference
                         assert!(
-                            matches!(**lhs, ast::Expr::Name(_)),
+                            matches!(**lhs, ast::Expr::Id(_)),
                             "Left side should be a column name"
                         );
 
@@ -1380,7 +1380,7 @@ mod tests {
 
                         // Check left and right expressions
                         assert!(
-                            matches!(**lhs, ast::Expr::Name(_)),
+                            matches!(**lhs, ast::Expr::Id(_)),
                             "Left side should be column name"
                         );
                         assert!(
@@ -1425,7 +1425,7 @@ mod tests {
 
                         // Check expressions
                         assert!(
-                            matches!(**lhs, ast::Expr::Name(_)),
+                            matches!(**lhs, ast::Expr::Id(_)),
                             "Left side should be column name"
                         );
                         assert!(
