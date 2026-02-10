@@ -548,46 +548,28 @@ impl Schema {
     }
 
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
-        self.get_table_with_dialect(name, crate::SqlDialect::Sqlite)
-    }
-
-    pub fn get_table_with_dialect(
-        &self,
-        name: &str,
-        dialect: crate::SqlDialect,
-    ) -> Option<Arc<Table>> {
         let name = normalize_ident(name);
         let name = if name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT) {
             SCHEMA_TABLE_NAME
         } else {
             &name
         };
+        self.tables.get(name).cloned()
+    }
 
-        // Check if this is a SQLite-specific system table or builtin function
-        if self.is_sqlite_specific_table(name) {
-            match dialect {
-                crate::SqlDialect::Sqlite => self.tables.get(name).cloned(),
-                crate::SqlDialect::Postgres => None, // Hide SQLite-specific tables in PostgreSQL mode
-            }
-        } else if let Some(table) = self.tables.get(name) {
-            // Regular user tables and dialect-agnostic builtin functions (available in all dialects)
-            Some(table.clone())
-        } else {
-            // Check dialect-specific catalog tables
-            match dialect {
-                crate::SqlDialect::Postgres => self.postgres_catalog_tables.get(name).cloned(),
-                crate::SqlDialect::Sqlite => None,
-            }
-        }
+    /// Look up a table in the PostgreSQL catalog (pg_class, pg_namespace, etc.)
+    pub fn get_postgres_table(&self, name: &str) -> Option<Arc<Table>> {
+        let name = normalize_ident(name);
+        self.postgres_catalog_tables.get(&name).cloned()
     }
 
     /// Check if a table name is SQLite-specific and should be hidden in other dialects
-    fn is_sqlite_specific_table(&self, name: &str) -> bool {
-        name == SCHEMA_TABLE_NAME
-            || name == SCHEMA_TABLE_NAME_ALT
+    pub fn is_sqlite_specific_table(name: &str) -> bool {
+        name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME)
+            || name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT)
             || name.starts_with("pragma_")
             || name.starts_with("json_")
-            || name == "sqlite_dbpage"
+            || name.eq_ignore_ascii_case("sqlite_dbpage")
     }
 
     pub fn remove_table(&mut self, table_name: &str) {
