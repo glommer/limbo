@@ -315,6 +315,7 @@ mod tests {
                 enable_autovacuum: false,
                 enable_triggers: false,
                 enable_attach: false,
+                enable_postgres: false,
             },
             None,
         )?;

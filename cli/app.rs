@@ -87,6 +87,8 @@ pub struct Opts {
     pub experimental_triggers: bool,
     #[clap(long, help = "Enable experimental attach feature")]
     pub experimental_attach: bool,
+    #[clap(long, help = "Enable experimental PostgreSQL dialect")]
+    pub experimental_postgres: bool,
 }
 
 const PROMPT: &str = "turso> ";
@@ -209,7 +211,8 @@ impl Limbo {
             .with_index_method(opts.experimental_index_method)
             .with_autovacuum(opts.experimental_autovacuum)
             .with_triggers(opts.experimental_triggers)
-            .with_attach(opts.experimental_attach);
+            .with_attach(opts.experimental_attach)
+            .with_postgres(opts.experimental_postgres);
 
         let (io, conn) = if db_file.contains([':', '?', '&', '#']) {
             Connection::from_uri(&db_file, db_opts)?

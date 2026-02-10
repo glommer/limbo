@@ -740,7 +740,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
         let conn = db.connect().unwrap();
 
         // Switch to PostgreSQL dialect
@@ -782,7 +782,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
         let conn = db.connect().unwrap();
 
         // Create test tables in SQLite mode (default)
@@ -823,7 +823,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
         let conn = db.connect().unwrap();
 
         // Create a test table with known columns
@@ -861,7 +861,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
         let conn = db.connect().unwrap();
 
         // Create a test table
@@ -885,7 +885,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
         let conn = db.connect().unwrap();
 
         // Default is SQLite mode
@@ -909,7 +909,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
         let conn = db.connect().unwrap();
 
         // Create a test table
@@ -970,7 +970,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let db = Database::open_file_with_flags(io, db_path.to_str().unwrap(), crate::OpenFlags::default(), crate::DatabaseOpts::new().with_postgres(true), None).unwrap();
         let conn = db.connect().unwrap();
 
         // Create multiple tables

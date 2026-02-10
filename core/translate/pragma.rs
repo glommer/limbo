@@ -409,7 +409,14 @@ fn update_pragma(
 
             let dialect = match dialect_str.as_str() {
                 "sqlite" => crate::SqlDialect::Sqlite,
-                "postgres" | "postgresql" => crate::SqlDialect::Postgres,
+                "postgres" | "postgresql" => {
+                    if !connection.experimental_postgres_enabled() {
+                        bail_parse_error!(
+                            "PostgreSQL dialect is an experimental feature. Enable with --experimental-postgres flag"
+                        );
+                    }
+                    crate::SqlDialect::Postgres
+                }
                 _ => bail_parse_error!("Invalid SQL dialect. Supported values: 'sqlite', 'postgres'"),
             };
 

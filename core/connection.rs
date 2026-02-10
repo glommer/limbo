@@ -1294,6 +1294,10 @@ impl Connection {
         self.db.experimental_attach_enabled()
     }
 
+    pub fn experimental_postgres_enabled(&self) -> bool {
+        self.db.experimental_postgres_enabled()
+    }
+
     pub fn mvcc_enabled(&self) -> bool {
         self.db.mvcc_enabled()
     }
@@ -1407,10 +1411,12 @@ impl Connection {
 
         let use_views = self.db.experimental_views_enabled();
         let use_strict = self.db.experimental_strict_enabled();
+        let use_postgres = self.db.experimental_postgres_enabled();
 
         let db_opts = DatabaseOpts::new()
             .with_views(use_views)
-            .with_strict(use_strict);
+            .with_strict(use_strict)
+            .with_postgres(use_postgres);
         let io: Arc<dyn IO> = if path.contains(":memory:") {
             Arc::new(MemoryIO::new())
         } else {

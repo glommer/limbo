@@ -62,6 +62,7 @@ impl Args {
                 .with_encryption(true)
                 .with_triggers(true)
                 .with_attach(true)
+                .with_postgres(true)
         };
 
         builder = quote! {
