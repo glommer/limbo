@@ -383,6 +383,8 @@ pub enum ScalarFunc {
     Attach,
     Detach,
     Unlikely,
+    Regexp,
+    PgGetUserById,
     StatInit,
     StatPush,
     StatGet,
@@ -450,6 +452,8 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Attach => false, // changes database state
             ScalarFunc::Detach => false, // changes database state
             ScalarFunc::Unlikely => true,
+            ScalarFunc::Regexp => true,
+            ScalarFunc::PgGetUserById => true,
             ScalarFunc::StatInit => false, // internal ANALYZE function
             ScalarFunc::StatPush => false, // internal ANALYZE function
             ScalarFunc::StatGet => false,  // internal ANALYZE function
@@ -519,6 +523,8 @@ impl Display for ScalarFunc {
             Self::Attach => "attach",
             Self::Detach => "detach",
             Self::Unlikely => "unlikely",
+            Self::Regexp => "regexp",
+            Self::PgGetUserById => "pg_get_userbyid",
             Self::StatInit => "stat_init",
             Self::StatPush => "stat_push",
             Self::StatGet => "stat_get",
@@ -844,6 +850,8 @@ impl Func {
             "if" | "iif" => Ok(Self::Scalar(ScalarFunc::Iif)),
             "instr" => Ok(Self::Scalar(ScalarFunc::Instr)),
             "like" => Ok(Self::Scalar(ScalarFunc::Like)),
+            "regexp" => Ok(Self::Scalar(ScalarFunc::Regexp)),
+            "pg_get_userbyid" => Ok(Self::Scalar(ScalarFunc::PgGetUserById)),
             "abs" => Ok(Self::Scalar(ScalarFunc::Abs)),
             "upper" => Ok(Self::Scalar(ScalarFunc::Upper)),
             "lower" => Ok(Self::Scalar(ScalarFunc::Lower)),

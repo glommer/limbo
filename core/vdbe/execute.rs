@@ -5111,6 +5111,26 @@ pub fn op_function(
                     }
                 }
             }
+            ScalarFunc::Regexp => {
+                let pattern_value = state.registers[*start_reg].get_value();
+                let text_value = state.registers[*start_reg + 1].get_value();
+
+                if pattern_value == &Value::Null || text_value == &Value::Null {
+                    state.registers[*dest] = Register::Value(Value::Null);
+                } else {
+                    let pattern_str = pattern_value.to_string();
+                    let text_str = text_value.to_string();
+                    let re = regex::Regex::new(&pattern_str).map_err(|e| {
+                        LimboError::InternalError(format!("invalid regexp pattern: {e}"))
+                    })?;
+                    let matches = re.is_match(&text_str);
+                    state.registers[*dest] =
+                        Register::Value(Value::Integer(matches as i64));
+                }
+            }
+            ScalarFunc::PgGetUserById => {
+                state.registers[*dest] = Register::Value(Value::build_text("turso"));
+            }
             ScalarFunc::Abs
             | ScalarFunc::Lower
             | ScalarFunc::Upper

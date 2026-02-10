@@ -348,6 +348,46 @@ impl PostgreSQLTranslator {
             return Err(ParseError::ParseError("Missing operator name".to_string()));
         };
 
+        // Translate left and right expressions
+        let left = if let Some(lexpr) = &a_expr.lexpr {
+            Box::new(self.translate_expr(lexpr)?)
+        } else {
+            return Err(ParseError::ParseError(
+                "Missing left expression".to_string(),
+            ));
+        };
+
+        let right = if let Some(rexpr) = &a_expr.rexpr {
+            Box::new(self.translate_expr(rexpr)?)
+        } else {
+            return Err(ParseError::ParseError(
+                "Missing right expression".to_string(),
+            ));
+        };
+
+        // Handle regex operators (~, !~) which map to REGEXP expressions
+        match op_name.as_str() {
+            "~" => {
+                return Ok(ast::Expr::Like {
+                    lhs: left,
+                    not: false,
+                    op: ast::LikeOperator::Regexp,
+                    rhs: right,
+                    escape: None,
+                });
+            }
+            "!~" => {
+                return Ok(ast::Expr::Like {
+                    lhs: left,
+                    not: true,
+                    op: ast::LikeOperator::Regexp,
+                    rhs: right,
+                    escape: None,
+                });
+            }
+            _ => {}
+        }
+
         // Map PostgreSQL operators to Turso operators
         let binary_op = match op_name.as_str() {
             "=" => ast::Operator::Equals,
@@ -367,23 +407,6 @@ impl PostgreSQLTranslator {
                     "Unsupported operator: {op_name}"
                 )))
             }
-        };
-
-        // Translate left and right expressions
-        let left = if let Some(lexpr) = &a_expr.lexpr {
-            Box::new(self.translate_expr(lexpr)?)
-        } else {
-            return Err(ParseError::ParseError(
-                "Missing left expression".to_string(),
-            ));
-        };
-
-        let right = if let Some(rexpr) = &a_expr.rexpr {
-            Box::new(self.translate_expr(rexpr)?)
-        } else {
-            return Err(ParseError::ParseError(
-                "Missing right expression".to_string(),
-            ));
         };
 
         Ok(ast::Expr::Binary(left, binary_op, right))

@@ -2172,6 +2172,28 @@ pub fn translate_expr(
 
                             Ok(target_register)
                         }
+                        ScalarFunc::Regexp => {
+                            let args = expect_arguments_exact!(args, 2, srf);
+                            translate_function(
+                                program,
+                                args,
+                                referenced_tables,
+                                resolver,
+                                target_register,
+                                func_ctx,
+                            )
+                        }
+                        ScalarFunc::PgGetUserById => {
+                            let args = expect_arguments_exact!(args, 1, srf);
+                            translate_function(
+                                program,
+                                args,
+                                referenced_tables,
+                                resolver,
+                                target_register,
+                                func_ctx,
+                            )
+                        }
                         ScalarFunc::StatInit | ScalarFunc::StatPush | ScalarFunc::StatGet => {
                             crate::bail_parse_error!(
                                 "{} is an internal function used by ANALYZE",
@@ -3628,7 +3650,21 @@ fn translate_like_base(
         ast::LikeOperator::Match => {
             crate::bail_parse_error!("MATCH requires the 'fts' feature to be enabled")
         }
-        ast::LikeOperator::Regexp => crate::bail_parse_error!("REGEXP in LIKE is not supported"),
+        ast::LikeOperator::Regexp => {
+            let arg_count = 2;
+            let start_reg = program.alloc_registers(arg_count);
+            translate_expr(program, referenced_tables, rhs, start_reg, resolver)?;
+            translate_expr(program, referenced_tables, lhs, start_reg + 1, resolver)?;
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg,
+                dest: target_register,
+                func: FuncCtx {
+                    func: Func::Scalar(ScalarFunc::Regexp),
+                    arg_count,
+                },
+            });
+        }
     }
 
     Ok(target_register)
