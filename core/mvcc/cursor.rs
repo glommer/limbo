@@ -1318,7 +1318,15 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn delete(&mut self) -> Result<IOResult<()>> {
         let rowid = match self.get_current_pos() {
             CursorPosition::Loaded { row_id, .. } => row_id,
-            _ => panic!("Cannot delete: no current row"),
+            _ => {
+                // In MVCC mode, DeferredSeek can fail to position the table
+                // cursor when the index entry is visible but the table row is
+                // not, due to non-atomic timestamp conversion during concurrent
+                // commits. Return an error so the caller can handle this.
+                return Err(LimboError::InternalError(
+                    "Cannot delete: no current row".to_string(),
+                ));
+            }
         };
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),

@@ -7696,7 +7696,27 @@ pub fn op_delete(
                 {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.delete());
+                    match cursor.delete() {
+                        Ok(IOResult::Done(())) => {}
+                        Ok(IOResult::IO(io)) => {
+                            return Ok(InsnFunctionStepResult::IO(io));
+                        }
+                        Err(LimboError::InternalError(ref msg))
+                            if msg.contains("no current row")
+                                && program.connection.db.mvcc_enabled() =>
+                        {
+                            // In MVCC mode, DeferredSeek can fail to position
+                            // the table cursor when the index entry is visible
+                            // but the table row is not, due to non-atomic
+                            // timestamp conversion during concurrent commits.
+                            // Skip without counting as a change.
+                            state.op_delete_state.sub_state =
+                                OpDeleteSubState::MaybeCaptureRecord;
+                            state.pc += 1;
+                            return Ok(InsnFunctionStepResult::Step);
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
@@ -7765,6 +7785,20 @@ pub fn op_idx_delete(
         return_if_io!(cursor.delete(&state.registers[*start_reg..*start_reg + *num_regs]));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
+    }
+
+    // In MVCC mode, if the key registers are Null, it means DeferredSeek
+    // failed to position the table cursor (the row is invisible due to
+    // non-atomic timestamp conversion during a concurrent commit). Seeking
+    // the index cursor with Null values would reposition it incorrectly,
+    // causing the DELETE loop to restart and spin forever. Skip the delete.
+    if program.connection.db.mvcc_enabled() && state.op_idx_delete_state.is_none() {
+        let has_null_key = (*start_reg..*start_reg + *num_regs)
+            .any(|i| matches!(&state.registers[i], Register::Value(Value::Null)));
+        if has_null_key {
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
     }
 
     loop {
