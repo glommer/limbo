@@ -4,11 +4,12 @@ use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
+use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
 use crate::mvcc::persistent_storage::logical_log::{
     ENCRYPTED_PAYLOAD_CHUNK_SIZE, FRAME_MAGIC, LOG_HDR_SIZE,
 };
 use crate::mvcc::yield_hooks::YieldPointMarker;
-use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
+use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
 use crate::state_machine::{StateTransition, TransitionResult};
 use crate::storage::sqlite3_ondisk::{
     checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
@@ -55,6 +56,30 @@ impl FixedYieldInjector {
 
 impl YieldInjector for FixedYieldInjector {
     fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        self.remaining.lock().remove(&point)
+    }
+}
+
+#[derive(Debug)]
+struct FixedFailureInjector {
+    remaining: Mutex<rustc_hash::FxHashMap<YieldPoint, LimboError>>,
+}
+
+impl FixedFailureInjector {
+    fn new(points: impl IntoIterator<Item = (YieldPoint, LimboError)>) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: Mutex::new(points.into_iter().collect()),
+        })
+    }
+}
+
+impl FailureInjector for FixedFailureInjector {
+    fn should_fail(
+        &self,
+        _instance_id: u64,
+        _selection_key: u64,
+        point: YieldPoint,
+    ) -> Option<LimboError> {
         self.remaining.lock().remove(&point)
     }
 }
@@ -128,6 +153,36 @@ fn mvcc_vacuum_gate_blocks_new_read_and_write_tx() {
     ));
 
     db.mvcc_store.release_vacuum_gate();
+}
+
+#[test]
+fn mvcc_pragma_page_size_propagates_to_global_header() {
+    // MvStore captures global_header from the pager during bootstrap (before any user PRAGMA
+    // can run), so without explicit propagation a later `PRAGMA page_size = N` updates the
+    // pager but leaves global_header at the default 4 KiB. Ephemeral paths that derive the
+    // working page size from MvStore would then disagree with the pager's actual buffer size.
+    let db = MvccTestDb::new();
+
+    let initial = db
+        .mvcc_store
+        .with_header(|h| h.page_size.get(), None)
+        .unwrap();
+    assert_eq!(
+        initial,
+        crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE as u32,
+        "global_header should start at the default page size"
+    );
+
+    db.conn.execute("PRAGMA page_size = 512").unwrap();
+
+    let after = db
+        .mvcc_store
+        .with_header(|h| h.page_size.get(), None)
+        .unwrap();
+    assert_eq!(
+        after, 512,
+        "PRAGMA page_size must propagate to MvStore.global_header"
+    );
 }
 
 #[test]
@@ -1081,6 +1136,117 @@ fn test_recovery_checkpoint_then_more_writes() {
     assert_eq!(rows[1][1].to_string(), "b");
     assert_eq!(rows[2][0].as_int().unwrap(), 3);
     assert_eq!(rows[2][1].to_string(), "c");
+}
+
+/// This test checks that after MVCC restart, the auto-indexes for PRIMARY KEY and UNIQUE
+/// constraints stay associated with the columns they were created for.
+#[test]
+fn test_restart_preserves_autoindex_to_column_mapping() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    {
+        let conn = db.connect();
+        // The dummy table exposes the bug because of the implementation of the HashMap used to
+        // store schema rows. This test is not perfect, because it may not catch a regression if
+        // the implementation changes. But until we patch the simulator to reproduce the bug,
+        // this'll do.
+        conn.execute("CREATE TABLE dummy(x)").unwrap();
+        conn.execute("CREATE TABLE t(a TEXT PRIMARY KEY, b TEXT UNIQUE)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES('aa', 'bb')").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    let a_rows = get_rows(&conn, "SELECT a FROM t");
+    assert_eq!(a_rows.len(), 1);
+    assert_eq!(a_rows[0][0].to_string(), "aa");
+    let b_rows = get_rows(&conn, "SELECT b FROM t");
+    assert_eq!(b_rows.len(), 1);
+    assert_eq!(b_rows[0][0].to_string(), "bb");
+}
+
+/// What this test checks: when transaction A updates a row and a concurrent
+/// transaction B (later begin_ts) speculatively tombstones that row while A
+/// is in `Preparing`, A's commit must serialize its OWN writes — not the
+/// DELETEs that B's tombstone TxID, still pinned to the versions' `end`
+/// fields, would imply.
+///
+/// References: Hekaton paper (https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf)
+/// §2.5 Table 1 (speculative read of preparing writer), §2.7 (commit deps).
+#[test]
+fn test_concurrent_update_then_delete_serializes_correctly_across_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+            .unwrap();
+        conn.execute("INSERT INTO t(id, v) VALUES (1, 'initial')")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    {
+        let conn_a = db.connect();
+        let conn_b = db.connect();
+
+        conn_a.execute("BEGIN CONCURRENT").unwrap();
+        conn_a
+            .execute("UPDATE t SET v = 'a_value' WHERE id = 1")
+            .unwrap();
+
+        conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+            CommitYieldPoint::CommitValidation.point(),
+        ])));
+
+        let mut commit_stmt = conn_a.prepare("COMMIT").unwrap();
+        let mut yielded = false;
+        for _ in 0..100 {
+            match commit_stmt.step().unwrap() {
+                StepResult::IO => {
+                    yielded = true;
+                    break;
+                }
+                StepResult::Done => break,
+                _ => {}
+            }
+        }
+        assert!(
+            yielded,
+            "tx_a's COMMIT should yield at CommitYieldPoint::CommitValidation"
+        );
+
+        // tx_b begins *after* tx_a's prepare so tx_b.begin_ts > tx_a's
+        // prepared end_ts; its DELETE plants a speculative tombstone whose
+        // TxID(tx_b) lands in the `end` field of tx_a's new versions.
+        conn_b.execute("BEGIN CONCURRENT").unwrap();
+        conn_b.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+        commit_stmt.run_collect_rows().unwrap();
+        drop(commit_stmt);
+
+        let rows = get_rows(&conn_a, "SELECT id, v FROM t");
+        assert_eq!(rows.len(), 1);
+
+        conn_b.execute("ROLLBACK").unwrap();
+
+        conn_a.close().unwrap();
+        conn_b.close().unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(
+        rows.len(),
+        1,
+        "tx_a's committed row must survive recovery, got {rows:?}"
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "a_value");
 }
 
 /// What this test checks: MVCC restart handles sqlite_schema rows with rootpage=0 (triggers).
@@ -2150,6 +2316,227 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
     );
 }
 
+/// What this test checks: a checkpoint state machine created before another checkpoint
+/// advances the durable boundary must resample that boundary after taking the checkpoint lock.
+/// Why this matters: otherwise a delayed checkpoint can replay an already-durable unique-index
+/// delete and fail. This test uses raw APIs, check test_checkpoint_resamples_boundary_before_starting_with_yield_injection
+/// which uses only user facing APIs to simulate the same error.
+#[test]
+fn test_checkpoint_resamples_boundary_before_starting() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE dry_floor_846 (
+            sour_sand_972 BLOB UNIQUE,
+            sour_river_140 REAL,
+            sweet_wall_518 BLOB,
+            fast_grass_379 TEXT,
+            dark_wave_139 REAL UNIQUE,
+            sad_wind_216 INTEGER UNIQUE PRIMARY KEY
+        )",
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO dry_floor_846 (
+            sour_sand_972, sour_river_140, sweet_wall_518,
+            fast_grass_379, dark_wave_139, sad_wind_216
+        ) VALUES (
+            zeroblob(16), 6.85, x'736d6172745f6c6561665f353637',
+            'wild_hill_714', 8.43, 788
+        )",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let first_boundary = mvcc_store.durable_txid_max.load(Ordering::SeqCst);
+    assert!(first_boundary > 0);
+
+    conn.execute(
+        "UPDATE dry_floor_846
+            SET sour_sand_972 = x'66756c6c5f737461725f333732',
+                sour_river_140 = 5.75,
+                sweet_wall_518 = zeroblob(32),
+                fast_grass_379 = 'old_moon_16',
+                dark_wave_139 = 2.90
+          WHERE sad_wind_216 = 788",
+    )
+    .unwrap();
+    let update_ts = mvcc_store.last_committed_tx_ts.load(Ordering::SeqCst);
+    assert!(update_ts > first_boundary);
+
+    let delayed_conn = db.connect();
+    let delayed_pager = delayed_conn.pager.load().clone();
+    let mut delayed_checkpoint = CheckpointStateMachine::new(
+        delayed_pager.clone(),
+        mvcc_store.clone(),
+        delayed_conn.clone(),
+        true,
+        delayed_conn.get_sync_mode(),
+    );
+    let (old_boundary, _) = delayed_checkpoint.checkpoint_bounds_for_test();
+    assert_eq!(old_boundary, Some(first_boundary));
+
+    let interrupted_conn = db.connect();
+    let interrupted_pager = interrupted_conn.pager.load().clone();
+    let mut interrupted_checkpoint = CheckpointStateMachine::new(
+        interrupted_pager.clone(),
+        mvcc_store.clone(),
+        interrupted_conn.clone(),
+        true,
+        interrupted_conn.get_sync_mode(),
+    );
+    let mut reached_wal_checkpoint = false;
+    for _ in 0..50_000 {
+        if interrupted_checkpoint.state_for_test() == CheckpointState::CheckpointWal {
+            reached_wal_checkpoint = true;
+            break;
+        }
+        match interrupted_checkpoint.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(interrupted_pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                panic!("checkpoint finished before reaching WAL checkpoint")
+            }
+        }
+    }
+    assert!(
+        reached_wal_checkpoint,
+        "expected checkpoint to reach WAL checkpoint"
+    );
+    assert_eq!(
+        mvcc_store.durable_txid_max.load(Ordering::SeqCst),
+        update_ts
+    );
+    interrupted_checkpoint.cleanup_after_external_io_error();
+
+    let mut finished = false;
+    for _ in 0..50_000 {
+        match delayed_checkpoint.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(delayed_pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    assert!(finished, "delayed checkpoint did not finish");
+
+    let rows = get_rows(
+        &conn,
+        "SELECT sad_wind_216, dark_wave_139, hex(sour_sand_972)
+           FROM dry_floor_846
+          WHERE sad_wind_216 = 788",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 788);
+    assert_eq!(rows[0][1].to_string(), "2.9");
+    assert_eq!(&rows[0][2].to_string(), "66756C6C5F737461725F333732");
+
+    let integrity = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(&integrity[0][0].to_string(), "ok");
+}
+
+/// What this test checks: a checkpoint state machine created before another checkpoint
+/// advances the durable boundary must resample that boundary after taking the checkpoint lock.
+/// Why this matters: otherwise a delayed checkpoint can replay an already-durable unique-index
+/// delete and fail.
+#[test]
+fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE dry_floor_846 (
+            sour_sand_972 BLOB UNIQUE,
+            sour_river_140 REAL,
+            sweet_wall_518 BLOB,
+            fast_grass_379 TEXT,
+            dark_wave_139 REAL UNIQUE,
+            sad_wind_216 INTEGER UNIQUE PRIMARY KEY
+        )",
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO dry_floor_846 (
+            sour_sand_972, sour_river_140, sweet_wall_518,
+            fast_grass_379, dark_wave_139, sad_wind_216
+        ) VALUES (
+            zeroblob(16), 6.85, x'736d6172745f6c6561665f353637',
+            'wild_hill_714', 8.43, 788
+        )",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let first_boundary = mvcc_store.durable_txid_max.load(Ordering::SeqCst);
+    assert!(first_boundary > 0);
+
+    conn.execute(
+        "UPDATE dry_floor_846
+            SET sour_sand_972 = x'66756c6c5f737461725f333732',
+                sour_river_140 = 5.75,
+                sweet_wall_518 = zeroblob(32),
+                fast_grass_379 = 'old_moon_16',
+                dark_wave_139 = 2.90
+          WHERE sad_wind_216 = 788",
+    )
+    .unwrap();
+    let update_ts = mvcc_store.last_committed_tx_ts.load(Ordering::SeqCst);
+    assert!(update_ts > first_boundary);
+
+    let delayed_conn = db.connect();
+    delayed_conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CheckpointYieldPoint::BeforeAcquireLock.point(),
+    ])));
+    let mut delayed_checkpoint = delayed_conn.prepare("PRAGMA journal_mode = 'wal'").unwrap();
+    assert!(
+        matches!(delayed_checkpoint.step().unwrap(), StepResult::IO),
+        "first checkpoint should yield before acquiring the checkpoint lock"
+    );
+
+    let interleaving_conn = db.connect();
+    interleaving_conn.set_failure_injector(Some(FixedFailureInjector::new([(
+        CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+        LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+    )])));
+    interleaving_conn
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect_err("interleaving checkpoint should fail after advancing durable boundary");
+    interleaving_conn.set_failure_injector(None);
+    assert_eq!(
+        mvcc_store.durable_txid_max.load(Ordering::SeqCst),
+        update_ts
+    );
+
+    let journal_mode_rows = delayed_checkpoint.run_collect_rows().unwrap();
+    assert_eq!(journal_mode_rows.len(), 1);
+    assert_eq!(&journal_mode_rows[0][0].to_string(), "wal");
+
+    let rows = get_rows(
+        &conn,
+        "SELECT sad_wind_216, dark_wave_139, hex(sour_sand_972)
+           FROM dry_floor_846
+          WHERE sad_wind_216 = 788",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 788);
+    assert_eq!(rows[0][1].to_string(), "2.9");
+    assert_eq!(&rows[0][2].to_string(), "66756C6C5F737461725F333732");
+
+    let integrity = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(&integrity[0][0].to_string(), "ok");
+}
+
 /// What this test checks: Replay gate uses metadata boundary and never applies frames at or below it.
 /// Why this matters: This enforces exactly-once effects at the DB-file apply boundary.
 #[test]
@@ -2972,7 +3359,7 @@ pub(crate) fn commit_tx(
     conn: &Arc<Connection>,
     tx_id: u64,
 ) -> Result<()> {
-    let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
+    let mut sm = mv_store.commit_tx(tx_id, conn, crate::MAIN_DB_ID).unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;
@@ -2993,7 +3380,7 @@ pub(crate) fn commit_tx_no_conn(
     conn: &Arc<Connection>,
 ) -> Result<(), LimboError> {
     let mv_store = db.get_mvcc_store();
-    let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
+    let mut sm = mv_store.commit_tx(tx_id, conn, crate::MAIN_DB_ID).unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;
@@ -3320,7 +3707,7 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
         state,
         tx_id,
         begin_ts,
-        write_set: SkipSet::new(),
+        write_set: Mutex::new(WriteSet::new()),
         read_set: SkipSet::new(),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
@@ -4676,9 +5063,13 @@ fn transaction_display() {
     let tx_id = 42;
     let begin_ts = 20250914;
 
-    let write_set = SkipSet::new();
-    write_set.insert(RowID::new((-2).into(), RowKey::Int(11)));
-    write_set.insert(RowID::new((-2).into(), RowKey::Int(13)));
+    let empty_versions = || Arc::new(RwLock::new(Vec::new()));
+    let write_set = Mutex::new({
+        let mut write_set = WriteSet::new();
+        write_set.insert(RowID::new((-2).into(), RowKey::Int(11)), empty_versions());
+        write_set.insert(RowID::new((-2).into(), RowKey::Int(13)), empty_versions());
+        write_set
+    });
 
     let read_set = SkipSet::new();
     read_set.insert(RowID::new((-2).into(), RowKey::Int(17)));
@@ -6703,6 +7094,54 @@ fn test_delete_btree_resident_row_is_skipped_by_desc_unique_index_scan() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// Regression test for issue #5935: a reverse (DESC) index scan inside a
+/// `BEGIN CONCURRENT` snapshot must not observe rows inserted and committed
+/// by another transaction after the snapshot started. The same root cause
+/// also produced phantom NULL results from `MAX()` on an indexed column.
+#[test]
+fn test_desc_index_scan_respects_mvcc_snapshot_for_concurrent_insert() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup.execute("CREATE TABLE t(id INT, val INT)").unwrap();
+    setup.execute("CREATE INDEX idx_val ON t(val)").unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    setup.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    setup.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(
+        &reader,
+        "SELECT id, val FROM t WHERE val > 10 ORDER BY val DESC",
+    );
+    assert_eq!(rows.len(), 2);
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (4, 100)").unwrap();
+    writer.execute("COMMIT").unwrap();
+
+    let rows = get_rows(
+        &reader,
+        "SELECT id, val FROM t WHERE val > 10 ORDER BY val DESC",
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "DESC scan must still see 2 rows from snapshot"
+    );
+    assert_eq!(rows[0][1].as_int().unwrap(), 30);
+    assert_eq!(rows[1][1].as_int().unwrap(), 20);
+
+    let rows = get_rows(&reader, "SELECT MAX(val) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        30,
+        "MAX must still be 30 from snapshot"
+    );
+}
+
 /// Test DELETE all B-tree rows and re-insert with same IDs in MVCC.
 /// Verifies tombstones correctly shadow B-tree and new rows are visible.
 ///
@@ -7217,6 +7656,93 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
         "row from abandoned INSERT commit remained visible: {rows:?}",
     );
     observer.close().unwrap();
+}
+
+/// Regression guard for the `mv_store.txs` ↔ `connection.mv_tx_id` divergence
+/// originally observed in production as `Transaction <id> not found while
+/// releasing savepoint` (panic) and `NoSuchTransactionID(<id>)` (read-path
+/// error) — see Antithesis Limbo run, 2026-04-27.
+///
+/// **Bug shape (pre-fix):** `CommitStateMachine` called `mvcc_store.remove_tx(tx_id)`
+/// directly. The connection-cache clear (`conn.set_mv_tx(None)`) lived at the
+/// caller (vdbe/mod.rs:1898) and only ran on the success path. If anything
+/// between `remove_tx` and that caller-side clear failed or yielded I/O and
+/// then the runtime abandoned the task before re-entering, the cache was
+/// stranded pointing at a tx that was already gone from `txs`. The natural
+/// trigger in production was an IO yield from `CheckpointStateMachine::step`
+/// (called after `remove_tx` at the EndCommitLogicalLog site) followed by
+/// task abandonment under network partition.
+///
+/// **Fix:** `MvStore::finish_committed_tx(tx_id, conn, db_id)` clears the
+/// connection's mv_tx cache and removes the tx from `txs` together,
+/// atomically. All three commit sites that previously called `remove_tx`
+/// directly now call `finish_committed_tx`. After this, no in-flight state
+/// (Err propagation, IO yield + abandon, success) can produce the divergent
+/// `(cache=Some, txs=None)` pair — they're mutated as a single act.
+///
+/// **What this test exercises:** we inject a `TxError` at the historical
+/// post-`remove_tx` boundary (`CommitYieldPoint::AfterRemoveTx`). The abort
+/// handler at vdbe/mod.rs:2204 explicitly skips rollback for `TxError`, so
+/// pre-fix nothing else would have cleared the cache — the divergence would
+/// surface. Post-fix, `finish_committed_tx` already cleared the cache before
+/// the injection point fires, so both stores are gone in lock-step and a
+/// follow-up read on the connection sees a clean state.
+#[test]
+fn test_commit_failure_after_remove_tx_does_not_strand_conn_cache() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'new')").unwrap();
+
+    let tx_id = conn.get_mv_tx_id().expect("tx should be open after BEGIN");
+    let mv_store = db.get_mvcc_store();
+    assert!(
+        mv_store.txs.get(&tx_id).is_some(),
+        "precondition: tx must be live in txs before COMMIT"
+    );
+
+    conn.set_failure_injector(Some(FixedFailureInjector::new([(
+        CommitYieldPoint::AfterRemoveTx.point(),
+        // `TxError` is in the no-rollback list at vdbe/mod.rs:2204, so the abort
+        // handler will not rescue stranded state on its own — the only thing
+        // keeping the connection coherent here is `finish_committed_tx`.
+        LimboError::TxError("synthetic post-remove_tx failure".to_string()),
+    )])));
+
+    let commit_err = conn
+        .execute("COMMIT")
+        .expect_err("commit must fail at the injected boundary");
+    tracing::info!("injected commit failure: {commit_err}");
+
+    // The pairing invariant: `finish_committed_tx` clears both atomically, so
+    // after the injected Err we see them gone together — no half-state.
+    assert!(
+        mv_store.txs.get(&tx_id).is_none(),
+        "fix: tx must be gone from txs (finish_committed_tx ran before the \
+         injection point)"
+    );
+    assert_eq!(
+        conn.get_mv_tx_id(),
+        None,
+        "fix: connection mv_tx cache must be cleared in lock-step with the \
+         txs removal — pre-fix this stranded the cache"
+    );
+
+    // NOTE: we deliberately do not assert anything about the *visibility* of
+    // the failed-commit's INSERT here. By the time the injection fires at
+    // `AfterRemoveTx`, the commit pipeline has already published
+    // `tx.state = Committed(end_ts)` and timestamp-rewritten live versions
+    // (mod.rs:1901-1903) — so the row IS visible to subsequent readers. That's
+    // a separate "Err on COMMIT but data is durable" semantic concern that
+    // predates this fix and applies equally to the production network-partition
+    // scenario; it's not what this regression test is guarding. This test
+    // verifies only the pairing invariant: `mv_store.txs` and
+    // `conn.mv_tx_id` mutate in lock-step, leaving the connection reusable.
+
+    conn.close().unwrap();
 }
 
 /// if a txn made some inserts, then aborted (or abandoned due to some IO issue), then those
@@ -9381,7 +9907,7 @@ fn test_snapshot_stability_full() {
         conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
         // Pre-existing rows so V_old candidates exist before any tx starts.
         for i in 0..500 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'v_{i}', NULL)"))
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'v_{i}', NULL)"))
                 .unwrap();
         }
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
@@ -9488,7 +10014,7 @@ fn test_snapshot_stability_full() {
                 let mut aborted = false;
                 'sp: for i in 0..depth {
                     let name = format!("sp_{i}_{}", rng.random::<u32>() % 100_000);
-                    if conn.execute(&format!("SAVEPOINT {name}")).is_err() {
+                    if conn.execute(format!("SAVEPOINT {name}")).is_err() {
                         aborted = true;
                         break 'sp;
                     }
@@ -9523,8 +10049,8 @@ fn test_snapshot_stability_full() {
                 }
                 let rb = (rng.random::<u8>() as usize) % depth;
                 let target = sps[rb].clone();
-                let _ = conn.execute(&format!("ROLLBACK TO {target}"));
-                let _ = conn.execute(&format!("RELEASE {target}"));
+                let _ = conn.execute(format!("ROLLBACK TO {target}"));
+                let _ = conn.execute(format!("RELEASE {target}"));
                 let _ = conn.execute("COMMIT");
                 sp_iters.fetch_add(1, Ordering::Relaxed);
             }
@@ -9575,7 +10101,7 @@ fn test_snapshot_stability_full() {
             let modes = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"];
             let mut idx = 0usize;
             while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
-                let _ = conn.execute(&format!(
+                let _ = conn.execute(format!(
                     "PRAGMA wal_checkpoint({})",
                     modes[idx % modes.len()]
                 ));
@@ -9596,8 +10122,8 @@ fn test_snapshot_stability_full() {
             let mut i = 0u32;
             while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
                 let name = format!("idx_dyn_{}", i % 4);
-                let _ = conn.execute(&format!("CREATE INDEX {name} ON t(v)"));
-                let _ = conn.execute(&format!("DROP INDEX {name}"));
+                let _ = conn.execute(format!("CREATE INDEX {name} ON t(v)"));
+                let _ = conn.execute(format!("DROP INDEX {name}"));
                 i = i.wrapping_add(1);
                 ddl_iters.fetch_add(1, Ordering::Relaxed);
             }

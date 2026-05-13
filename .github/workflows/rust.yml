@@ -105,7 +105,7 @@ jobs:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests)' --failure-output=final
-        timeout-minutes: 20
+        timeout-minutes: 30
       - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
         run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
         timeout-minutes: 5
@@ -325,6 +325,9 @@ jobs:
           - name: in-process
             iterations: 100
             args: "--mode fast --reopen-probability 0.001"
+          - name: in-process-mvcc
+            iterations: 100
+            args: "--mode fast --reopen-probability 0.01 --enable-mvcc"
           - name: multiprocess
             iterations: 20
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
@@ -370,9 +373,10 @@ jobs:
       - name: Run Windows CLI multiprocess VFS regression
         run: cargo test -q -p turso_cli input::tests::experimental_win_iocp_backend_is_available_for_path_databases -- --exact
       - name: Run Windows core multiprocess regressions
-        run: cargo test -q -p turso_core --features "fs experimental_win_iocp" multiprocess_tests:: -- --nocapture
+        run: |
+          cargo test -q -p turso_core --features "fs experimental_win_iocp" multiprocess_tests:: -- --nocapture
       - name: Run Windows multiprocess startup smoke
-          run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01
+        run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01
 
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404

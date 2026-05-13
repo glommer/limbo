@@ -8,7 +8,10 @@ use crate::vdbe::builder::SelfTableContext;
 use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
-    schema::{BTreeTable, CheckConstraint, Index, ROWID_SENTINEL},
+    schema::{
+        collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Index,
+        EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
+    },
     sync::Arc,
     translate::{
         display::format_eqp_detail,
@@ -830,7 +833,8 @@ fn emit_update_column_values<'a>(
                         GeneratedType::NotGenerated => None,
                     };
 
-                    program.with_self_table_context(
+                    t_ctx.resolver.with_self_table_context(
+                        program,
                         self_table_context.as_ref(),
                         |program, _| {
                             // Save/restore target_union_type so union_value() resolves tags
@@ -1534,8 +1538,6 @@ fn emit_update_insns<'a>(
     // the end of the function.
     {
         let columns = target_table.table.columns();
-        t_ctx.resolver.self_table_column_affinities =
-            columns.iter().map(|c| c.affinity()).collect();
         for (idx, col) in columns.iter().enumerate() {
             t_ctx
                 .resolver
@@ -1552,12 +1554,35 @@ fn emit_update_insns<'a>(
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     if let Table::BTree(ref btree) = target_table.table {
         let has_check_constraints = !btree.check_constraints.is_empty();
+        let cols = btree.columns();
+        let virtual_col_names: HashSet<String> = cols
+            .iter()
+            .filter(|c| c.is_virtual_generated())
+            .filter_map(|c| c.name.as_ref().map(|n| normalize_ident(n)))
+            .collect();
+        let expr_references_virtual = |expr: &ast::Expr| {
+            !virtual_col_names.is_empty()
+                && !collect_column_dependencies_of_expr(expr, cols).is_disjoint(&virtual_col_names)
+        };
+        let index_references_virtual_column = indexes_to_update.iter().any(|idx| {
+            idx.columns.iter().any(|col| {
+                if col.pos_in_table != EXPR_INDEX_SENTINEL {
+                    cols[col.pos_in_table].is_virtual_generated()
+                } else {
+                    col.expr.as_deref().is_some_and(expr_references_virtual)
+                }
+            }) || idx
+                .where_clause
+                .as_deref()
+                .is_some_and(expr_references_virtual)
+        });
 
         if update_affects_virtual_columns
             || has_before_triggers
             || has_after_triggers
             || has_returning
             || has_check_constraints
+            || index_references_virtual_column
         {
             let columns = target_table.table.columns();
 
@@ -2543,6 +2568,5 @@ fn emit_update_insns<'a>(
     program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
     t_ctx.resolver.register_affinities.clear();
-    t_ctx.resolver.self_table_column_affinities.clear();
     Ok(())
 }

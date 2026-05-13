@@ -52,7 +52,7 @@ use super::sqlite3_ondisk::{
     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
     FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
 };
-use super::wal::CheckpointMode;
+use super::wal::{CheckpointMode, WalAutoActions};
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
 /// SQLite's default maximum page count
@@ -2001,7 +2001,13 @@ impl Pager {
             turso_assert!(c.succeeded(), "memory IO should complete immediately");
             current_offset += page_size;
             rollback_bitset.insert(page_id);
-            self.upsert_page_in_cache(page_id as usize, page, false)?;
+            // The restored image is the transaction-visible state at the
+            // savepoint, not necessarily durable state. Keep it dirty so cache
+            // eviction cannot drop uncommitted changes that predate the
+            // rolled-back savepoint/statement.
+            page.set_dirty();
+            dirty_pages.insert(page_id);
+            self.force_upsert_page_in_cache(page_id as usize, page)?;
         }
 
         let truncate_completion = subjournal.truncate(journal_start_offset)?;
@@ -2031,6 +2037,14 @@ impl Pager {
                 frame: savepoint.wal_max_frame,
                 checksum: savepoint.wal_checksum,
             }));
+            self.page_cache
+                .write()
+                .delete_clean_pages_after_wal_frame(savepoint.wal_max_frame)
+                .map_err(|e| {
+                    LimboError::InternalError(format!(
+                        "failed to invalidate rolled-back WAL pages: {e:?}"
+                    ))
+                })?;
         }
 
         Ok(())
@@ -2667,14 +2681,20 @@ impl Pager {
 
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn begin_write_tx(&self) -> Result<IOResult<()>> {
+    /// `allowed_auto_actions` controls which automatic WAL maintenance the
+    /// caller permits during this begin. The only action consulted here is
+    /// `WalAutoActions::Restart`, which gates the WAL-header restart inside
+    /// `try_restart_log_before_write`. Callers managing WAL state externally
+    /// (sync engine) must not pass `Restart` because rotating the WAL header
+    /// behind their back invalidates watermarks they have already published.
+    pub fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> Result<IOResult<()>> {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         return_if_io!(self.maybe_allocate_page1());
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
-        Ok(IOResult::Done(wal.begin_write_tx()?))
+        Ok(IOResult::Done(wal.begin_write_tx(allowed_auto_actions)?))
     }
 
     /// Acquire exclusive WAL access + block new transactions (used by VACUUM).
@@ -2755,7 +2775,7 @@ impl Pager {
                 }
                 _ => {
                     return_if_io!(self.commit_dirty_pages(
-                        connection.is_wal_auto_checkpoint_disabled(),
+                        connection.wal_auto_actions(),
                         connection.get_sync_mode(),
                         connection.get_data_sync_retry(),
                     ));
@@ -3350,7 +3370,7 @@ impl Pager {
             }
             Err(e) => {
                 self.io.cancel(&state.completions)?;
-                self.io.drain()?;
+                self.io.drain_completions(&state.completions)?;
                 Err(e)
             }
         }
@@ -3549,7 +3569,7 @@ impl Pager {
                 Ok(c) => completions.push(c),
                 Err(e) => {
                     self.io.cancel(&completions)?;
-                    self.io.drain()?;
+                    self.io.drain_completions(&completions)?;
                     return Err(e);
                 }
             }
@@ -3572,7 +3592,7 @@ impl Pager {
                     if spilled {
                         // After spilling, try to evict clean pages to make room in the cache
                         let mut cache = self.page_cache.write();
-                        if let Err(e) = cache.make_room_for(1) {
+                        if let Err(e) = cache.make_room_for(1, false) {
                             // Cache is completely full with unevictable pages
                             tracing::error!(
                                 "ensure_cache_space: {e} cache full, could not make room"
@@ -3593,10 +3613,15 @@ impl Pager {
     /// In the base case, it will write the dirty pages to the WAL and then fsync the WAL.
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
     /// the database file and then fsync the database file.
+    ///
+    /// `allowed_auto_actions` controls automatic WAL maintenance permitted at
+    /// commit time. Only `WalAutoActions::Checkpoint` is consulted here — it
+    /// gates the post-commit auto-checkpoint when `should_checkpoint()` is
+    /// true.
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn commit_dirty_pages(
         &self,
-        wal_auto_checkpoint_disabled: bool,
+        allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<()>> {
@@ -3613,7 +3638,7 @@ impl Pager {
         }
 
         let result =
-            self.commit_dirty_pages_inner(wal_auto_checkpoint_disabled, sync_mode, data_sync_retry);
+            self.commit_dirty_pages_inner(allowed_auto_actions, sync_mode, data_sync_retry);
         if result.is_err() {
             self.commit_info.write().reset();
         }
@@ -3627,7 +3652,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn commit_dirty_pages_inner(
         &self,
-        wal_auto_checkpoint_disabled: bool,
+        allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<()>> {
@@ -3686,6 +3711,18 @@ impl Pager {
                         } else {
                             let (page, completion) =
                                 self.read_page_no_cache(page_id as i64, None, false)?;
+                            // If the read completed synchronously with an error,
+                            // surface it now. Otherwise we would silently drop the
+                            // failure (the completion is "finished" so we'd skip
+                            // pushing it into the wait list) and later trip the
+                            // page-buffer-not-loaded panic in prepare_frames when
+                            // it tries to read content from the evicted page.
+                            if completion.finished() && !completion.succeeded() {
+                                let err = completion.get_error().unwrap_or(
+                                    CompletionError::IOError(std::io::ErrorKind::Other, "read"),
+                                );
+                                return Err(LimboError::CompletionError(err));
+                            }
                             commit_info.page_sources.push(PageSource::Evicted(page));
                             if !completion.finished() {
                                 commit_info.completions.push(completion);
@@ -3752,6 +3789,17 @@ impl Pager {
                             }
                             PageSource::Evicted(page) => page.clone(),
                         };
+                        // Defensive check: prepare_frames will read page contents,
+                        // which panics if the buffer is not loaded. If we got here
+                        // with an unloaded page (e.g. an evicted dirty page whose
+                        // backing WAL frame was truncated by a savepoint rollback),
+                        // surface an internal error instead of panicking.
+                        if !page.is_loaded() {
+                            return Err(LimboError::InternalError(format!(
+                                "dirty page {} has no buffer loaded at commit time",
+                                page.get().id
+                            )));
+                        }
                         commit_info.page_source_cursor += 1;
                         commit_info.collected_pages.push(page);
 
@@ -3867,7 +3915,8 @@ impl Pager {
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
 
-                    let need_checkpoint = !wal_auto_checkpoint_disabled && wal.should_checkpoint();
+                    let need_checkpoint = allowed_auto_actions.contains(WalAutoActions::Checkpoint)
+                        && wal.should_checkpoint();
                     if need_checkpoint {
                         commit_info.state = CommitState::AutoCheckpoint;
                     }
@@ -4456,7 +4505,7 @@ impl Pager {
     /// deletes the WAL file.
     pub fn checkpoint_shutdown(
         &self,
-        wal_auto_checkpoint_disabled: bool,
+        allowed_auto_actions: WalAutoActions,
         sync_mode: crate::SyncMode,
     ) -> Result<()> {
         let mut attempts = 0;
@@ -4471,7 +4520,7 @@ impl Pager {
             let c = wal.sync(self.get_sync_type())?;
             self.io.wait_for_completion(c)?;
         }
-        if !wal_auto_checkpoint_disabled {
+        if allowed_auto_actions.contains(WalAutoActions::Checkpoint) {
             while let Err(LimboError::Busy) = self.blocking_checkpoint(
                 CheckpointMode::Truncate {
                     upper_bound_inclusive: None,
@@ -4975,6 +5024,27 @@ impl Pager {
                 "Failed to insert loaded page {id} into cache: {e:?}"
             ))
         })?;
+        page.set_loaded();
+        page.clear_wal_tag();
+        Ok(())
+    }
+
+    fn force_upsert_page_in_cache(&self, id: usize, page: PageRef) -> Result<(), LimboError> {
+        let mut cache = self.page_cache.write();
+        let page_key = PageCacheKey::new(id);
+
+        turso_assert!(
+            page.is_dirty(),
+            "restored savepoint page must be dirty",
+            { "page_id": id }
+        );
+        cache
+            .force_upsert_page(page_key, page.clone())
+            .map_err(|e| {
+                LimboError::InternalError(format!(
+                    "Failed to restore savepoint page {id} into cache: {e:?}"
+                ))
+            })?;
         page.set_loaded();
         page.clear_wal_tag();
         Ok(())
@@ -5659,6 +5729,21 @@ mod checkpoint_phase_tests {
     use crate::types::IOResult;
     use crate::Database;
 
+    /// Returns an IO backend that supports shared WAL coordination on the host.
+    /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
+    /// and mapping primitives, so the experimental IOCP backend is used when
+    /// the `experimental_win_iocp` feature is enabled.
+    fn shared_wal_test_io() -> Arc<dyn IO> {
+        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+        {
+            Arc::new(crate::WindowsIOCP::new().unwrap())
+        }
+        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+        {
+            Arc::new(PlatformIO::new().unwrap())
+        }
+    }
+
     fn open_checkpoint_test_database() -> (Arc<Database>, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap().keep();
         let db_path = dir.join("test.db");
@@ -5668,7 +5753,7 @@ mod checkpoint_phase_tests {
                 .pragma_update(None, "journal_mode", "wal")
                 .unwrap();
         }
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let db = Database::open_file_with_flags(
             io,
             db_path.to_str().unwrap(),
@@ -5693,7 +5778,7 @@ mod checkpoint_phase_tests {
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.join("test.db");
         let conn = db.connect().unwrap();
-        conn.wal_auto_checkpoint_disable();
+        conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value blob)")
             .unwrap();
         conn.execute("begin immediate").unwrap();

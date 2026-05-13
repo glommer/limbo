@@ -1,10 +1,12 @@
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
-use crate::mvcc::yield_points::YieldInjector;
+use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
+    atomic::{
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8, Ordering,
+    },
     Arc, RwLock,
 };
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -25,7 +27,7 @@ use crate::{
     CipherMode, Cmd, Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts,
     Duration, EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize,
     Pager, Parser, Program, QueryMode, QueryRunner, Result, Schema, SqlDialect, Statement,
-    SyncMode, TransactionMode, Trigger, Value, VirtualTable,
+    SyncMode, TransactionMode, Trigger, Value, VirtualTable, WalAutoActions,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
@@ -175,9 +177,14 @@ pub struct Connection {
     /// page size used for an uninitialized database or the next vacuum command.
     /// it's not always equal to the current page size of the database
     pub(super) page_size: AtomicU16,
-    /// Disable automatic checkpoint behaviour when DB is shutted down or WAL reach certain size
-    /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
-    pub(super) wal_auto_checkpoint_disabled: AtomicBool,
+    /// Allowed automatic WAL maintenance actions for this connection.
+    /// Stored as the `bits()` of a `WalAutoActions`. Default is
+    /// `WalAutoActions::all_enabled()`. `wal_auto_actions_disable` clears
+    /// every bit, opting out of both auto-checkpoint and WAL header
+    /// restart — sync-engine consumers rely on the latter staying disabled
+    /// because rotating the WAL header invalidates their published
+    /// watermarks.
+    pub(super) wal_auto_actions: AtomicU8,
     pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
     /// CDC v2: transaction ID for grouping CDC records by transaction.
     /// -1 means unset (will be assigned on first CDC write in the transaction).
@@ -205,6 +212,8 @@ pub struct Connection {
         RwLock<HashMap<usize, (crate::mvcc::database::TxID, TransactionMode)>>,
     #[cfg(any(test, injected_yields))]
     pub(super) yield_injector: RwLock<Option<Arc<dyn YieldInjector>>>,
+    #[cfg(any(test, injected_yields))]
+    pub(super) failure_injector: RwLock<Option<Arc<dyn FailureInjector>>>,
     #[cfg(any(test, injected_yields))]
     pub(super) yield_instance_id_counter: AtomicU64,
 
@@ -365,6 +374,7 @@ impl Connection {
             .with_index_method(self.db.experimental_index_method_enabled())
             .with_vacuum(self.db.experimental_vacuum_enabled())
             .with_generated_columns(self.db.experimental_generated_columns_enabled())
+            .with_without_rowid(self.db.experimental_without_rowid_enabled())
     }
 
     fn effective_temp_store(&self) -> crate::TempStore {
@@ -407,7 +417,7 @@ impl Connection {
 
         #[cfg(not(target_family = "wasm"))]
         {
-            let temp_dir = tempfile::tempdir().map_err(|e| io_error(e, "tempdir"))?;
+            let temp_dir = self.create_tempdir()?;
             let temp_path = temp_dir.path().join("tursodb-temp.db");
             let temp_path_str = temp_path.to_str().ok_or_else(|| {
                 LimboError::InternalError("temp db path is not valid UTF-8".into())
@@ -677,12 +687,14 @@ impl Connection {
         Ok(true)
     }
 
+    #[turso_macros::trace_stack]
     fn compile_cmd(
         self: &Arc<Connection>,
         cmd: Cmd,
         input: &str,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         self.maybe_update_schema();
+
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
@@ -703,9 +715,13 @@ impl Connection {
                 // than cloning the original AST, which can overflow the stack
                 // on deeply nested expression trees.
                 drop(syms);
-                let mut parser = Parser::new(input.as_bytes());
-                let Some(cmd) = parser.next_cmd()? else {
-                    return Err(err);
+                let cmd = {
+                    crate::stack::trace_stack!("schema_retry_parse");
+                    let mut parser = Parser::new(input.as_bytes());
+                    let Some(cmd) = parser.next_cmd()? else {
+                        return Err(err);
+                    };
+                    cmd
                 };
                 self.maybe_update_schema();
                 let syms = self.syms.read();
@@ -744,6 +760,7 @@ impl Connection {
         self.prepare_with_origin(sql, StatementOrigin::Root)
     }
 
+    #[turso_macros::trace_stack]
     pub(crate) fn prepare_with_origin(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
@@ -785,7 +802,10 @@ impl Connection {
                 }
             }
 
-            let (cmd, byte_offset_end) = self.parse_sql(sql)?;
+            let (cmd, byte_offset_end) = {
+                crate::stack::trace_stack!("parse");
+                self.parse_sql(sql)?
+            };
             let cmd = match cmd {
                 Some(cmd) => cmd,
                 None => {
@@ -798,6 +818,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -822,6 +843,7 @@ impl Connection {
         self.prepare_stmt_with_origin(stmt, StatementOrigin::Root)
     }
 
+    #[turso_macros::trace_stack]
     fn prepare_stmt_with_origin(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
@@ -1174,6 +1196,7 @@ impl Connection {
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
     /// TODO: make this api async
     #[instrument(skip_all, level = Level::INFO)]
+    #[turso_macros::trace_stack]
     pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1208,7 +1231,10 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input)?;
-            Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            {
+                crate::stack::trace_stack!("run");
+                Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            }
         }
         Ok(())
     }
@@ -1533,9 +1559,16 @@ impl Connection {
     pub fn wal_insert_begin(&self) -> Result<()> {
         let pager = self.pager.load();
         pager.begin_read_tx()?;
-        pager.io.block(|| pager.begin_write_tx()).inspect_err(|_| {
-            pager.end_read_tx();
-        })?;
+        // Sync-engine drives WAL maintenance explicitly: any auto-restart of
+        // the WAL header here would invalidate the watermarks the caller has
+        // already published (see `wal_changed_pages_after`), so opt out of
+        // every auto action for this write transaction.
+        pager
+            .io
+            .block(|| pager.begin_write_tx(WalAutoActions::empty()))
+            .inspect_err(|_| {
+                pager.end_read_tx();
+            })?;
 
         // start write transaction and disable auto-commit mode as SQL can be executed within WAL session (at caller own risk)
         self.set_tx_state(TransactionState::Write {
@@ -1566,7 +1599,7 @@ impl Connection {
                     .io
                     .block(|| {
                         return_if_io!(pager.commit_dirty_pages(
-                            true,
+                            WalAutoActions::empty(),
                             self.get_sync_mode(),
                             self.get_data_sync_retry(),
                         ));
@@ -1689,21 +1722,29 @@ impl Connection {
             && !is_memory_db
             && should_checkpoint_on_close
         {
-            self.pager.load().checkpoint_shutdown(
-                self.is_wal_auto_checkpoint_disabled(),
-                self.get_sync_mode(),
-            )?;
+            self.pager
+                .load()
+                .checkpoint_shutdown(self.wal_auto_actions(), self.get_sync_mode())?;
         };
         Ok(())
     }
 
-    pub fn wal_auto_checkpoint_disable(&self) {
-        self.wal_auto_checkpoint_disabled
-            .store(true, Ordering::SeqCst);
+    /// Disable every automatic WAL maintenance action for this connection
+    /// (auto-checkpoint AND WAL header restart). Sync-engine consumers call
+    /// this so they own all WAL bookkeeping themselves.
+    pub fn wal_auto_actions_disable(&self) {
+        self.wal_auto_actions
+            .store(WalAutoActions::empty().bits(), Ordering::SeqCst);
     }
 
-    pub fn is_wal_auto_checkpoint_disabled(&self) -> bool {
-        self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst) || self.db.get_mv_store().is_some()
+    /// Returns the set of automatic WAL maintenance actions this connection
+    /// permits. MVCC connections always return an empty set because the
+    /// MVCC checkpoint state machine drives WAL maintenance explicitly.
+    pub fn wal_auto_actions(&self) -> WalAutoActions {
+        if self.db.get_mv_store().is_some() {
+            return WalAutoActions::empty();
+        }
+        WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
     }
 
     #[cfg(feature = "simulator")]
@@ -1859,6 +1900,15 @@ impl Connection {
 
         self.page_size.store(size.get_raw(), Ordering::SeqCst);
         self.pager.load().set_initial_page_size(size)?;
+        // MvStore caches a copy of the database header in `global_header`, captured from the
+        // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
+        // page size so subsequent transactions and any header lookups see the same value the
+        // pager will write to disk; otherwise paths like op_open_ephemeral allocate buffers
+        // sized to the connection's page_size but compute usable_space from the stale 4 KiB
+        // global header, tripping the btree_init_page assertion.
+        if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+            mv_store.set_global_page_size(size);
+        }
         self.bump_prepare_context_generation();
 
         Ok(())
@@ -2043,6 +2093,10 @@ impl Connection {
         self.db.experimental_postgres_enabled()
     }
 
+    pub fn experimental_without_rowid_enabled(&self) -> bool {
+        self.db.experimental_without_rowid_enabled()
+    }
+
     pub fn mvcc_enabled(&self) -> bool {
         self.db.mvcc_enabled()
     }
@@ -2090,6 +2144,32 @@ impl Connection {
     #[cfg(any(test, injected_yields))]
     pub(crate) fn yield_injector(&self) -> Option<Arc<dyn YieldInjector>> {
         self.yield_injector.read().clone()
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub fn set_failure_injector(&self, injector: Option<Arc<dyn FailureInjector>>) {
+        let mut slot = self.failure_injector.write();
+        match injector {
+            Some(injector) => {
+                turso_assert!(
+                    slot.is_none(),
+                    "failure injector should be empty before installing a new one"
+                );
+                *slot = Some(injector);
+            }
+            None => {
+                turso_assert!(
+                    slot.is_some(),
+                    "failure injector should be installed before it is cleared"
+                );
+                *slot = None;
+            }
+        }
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub(crate) fn failure_injector(&self) -> Option<Arc<dyn FailureInjector>> {
+        self.failure_injector.read().clone()
     }
 
     #[cfg(any(test, injected_yields))]
@@ -2470,7 +2550,8 @@ impl Connection {
             .with_index_method(self.db.experimental_index_method_enabled())
             .with_vacuum(self.db.experimental_vacuum_enabled())
             .with_generated_columns(self.db.experimental_generated_columns_enabled())
-            .with_postgres(self.db.experimental_postgres_enabled());
+            .with_postgres(self.db.experimental_postgres_enabled())
+            .with_without_rowid(self.db.experimental_without_rowid_enabled());
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO
         // - File-based databases reuse the parent's IO when the parent is also
@@ -2831,6 +2912,24 @@ impl Connection {
     pub fn enable_custom_types(&self) {
         self.custom_types_override
             .store(true, crate::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Create a `TempDir` honoring `TURSO_TMPDIR` and `SQLITE_TMPDIR`,
+    /// falling back to the OS default (`env::temp_dir()`).
+    ///
+    /// `&self` is reserved for a future per-connection
+    /// `temp_store_directory` setting (e.g. `PRAGMA temp_store_directory`)
+    /// so call sites don't need to change when that lands.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn create_tempdir(&self) -> Result<TempDir> {
+        let res = if let Some(d) = std::env::var_os("TURSO_TMPDIR") {
+            tempfile::tempdir_in(d)
+        } else if let Some(d) = std::env::var_os("SQLITE_TMPDIR") {
+            tempfile::tempdir_in(d)
+        } else {
+            tempfile::tempdir()
+        };
+        res.map_err(|e| io_error(e, "tempdir"))
     }
 
     pub fn get_data_sync_retry(&self) -> bool {

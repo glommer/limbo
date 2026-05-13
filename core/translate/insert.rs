@@ -228,6 +228,7 @@ impl<'a> InsertEmitCtx<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn translate_insert(
     resolver: &mut Resolver,
     on_conflict: Option<ResolveType>,
@@ -842,14 +843,11 @@ pub fn translate_insert(
     // while the table row gets the default value, causing integrity_check failures.
     emit_notnulls(program, &ctx, &insertion, resolver)?;
 
-    // Populate register-to-affinity and column-to-affinity maps so that
-    // partial index WHERE clauses and expression index expressions get
+    // Populate register-to-affinity map so partial index WHERE clauses get
     // correct column affinity during INSERT.
     //
     // Partial index WHEREs use rewrite_partial_index_where which converts
     // column refs to Expr::Register — register_affinities handles those.
-    // Expression index values use SelfTableContext::ForDML which keeps
-    // Expr::Column { SELF_TABLE } — self_table_column_affinities handles those.
     //
     // Without this, comparisons like `integer_col < '2'` lose their
     // INTEGER affinity and evaluate under type-ordering rules, producing
@@ -862,8 +860,6 @@ pub fn translate_insert(
     resolver
         .register_affinities
         .insert(insertion.key_register(), Affinity::Integer);
-    resolver.self_table_column_affinities =
-        ctx.table.columns().iter().map(|c| c.affinity()).collect();
 
     emit_preflight_constraint_checks(
         program,
@@ -918,7 +914,6 @@ pub fn translate_insert(
     }
 
     resolver.register_affinities.clear();
-    resolver.self_table_column_affinities.clear();
 
     let mut insert_flags = InsertFlags::new();
 
@@ -1395,6 +1390,7 @@ fn emit_commit_phase(
     Ok(())
 }
 
+#[turso_macros::trace_stack]
 fn translate_rows_and_open_tables(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -1888,6 +1884,7 @@ fn resolve_defaults_in_row(
     }
 }
 
+#[turso_macros::trace_stack]
 fn bind_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -2060,6 +2057,7 @@ fn bind_insert(
 /// default expressions registered for the columns, or NULLs, so they can be translated into
 /// registers later.
 #[allow(clippy::too_many_arguments, clippy::vec_box)]
+#[turso_macros::trace_stack]
 fn init_source_emission<'a>(
     program: &mut ProgramBuilder,
     table: &Table,

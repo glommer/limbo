@@ -160,6 +160,7 @@ pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOp
         .with_autovacuum(source_db.experimental_autovacuum_enabled())
         .with_attach(source_db.experimental_attach_enabled())
         .with_generated_columns(source_db.experimental_generated_columns_enabled())
+        .with_without_rowid(source_db.experimental_without_rowid_enabled())
 }
 
 pub(crate) fn reject_unsupported_vacuum_auto_vacuum_mode(mode: AutoVacuumMode) -> Result<()> {
@@ -246,8 +247,7 @@ pub(crate) fn open_vacuum_temp_db(
     page_size: u32,
     reserved_space: u8,
 ) -> Result<VacuumTempDb> {
-    // todo: let users specify the temp dir path
-    let temp_dir = tempfile::tempdir().map_err(|e| crate::error::io_error(e, "tempdir"))?;
+    let temp_dir = source_conn.create_tempdir()?;
     let source_db_name = std::path::Path::new(&source_db.path)
         .file_name()
         .and_then(|name| name.to_str())
@@ -272,7 +272,7 @@ pub(crate) fn open_vacuum_temp_db(
     let conn = db.connect_with_encryption(encryption_key)?;
     conn.reset_page_size(page_size)?;
     conn.set_reserved_bytes(reserved_space)?;
-    conn.wal_auto_checkpoint_disable();
+    conn.wal_auto_actions_disable();
 
     Ok(VacuumTempDb {
         conn,
@@ -540,7 +540,7 @@ pub(crate) fn vacuum_target_build_step(
                 state.target_conn.set_sync_mode(crate::SyncMode::Off);
                 state.target_conn.set_foreign_keys_enabled(false);
                 state.target_conn.set_check_constraints_ignored(true);
-                state.target_conn.wal_auto_checkpoint_disable();
+                state.target_conn.wal_auto_actions_disable();
 
                 // Wrap all operations in a single write transaction so helper
                 // statements share one durable target build and cleanup can
@@ -2398,8 +2398,8 @@ mod tests {
             self.inner.step()
         }
 
-        fn drain(&self) -> Result<()> {
-            self.inner.drain()
+        fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+            self.inner.drain_completions(completions)
         }
 
         fn cancel(&self, completions: &[Completion]) -> Result<()> {
@@ -2729,7 +2729,15 @@ mod tests {
             None,
         )?;
         let source_conn = source_db.connect()?;
-        let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
+        // Source is uninitialized so its header reserved_space isn't usable.
+        // Derive from the IOContext to keep reserved_space and the auto-
+        // installed checksum context consistent under `feature = "checksum"`.
+        let reserved_space = source_conn
+            .get_pager()
+            .io_ctx
+            .read()
+            .get_reserved_space_bytes();
+        let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, reserved_space)?;
 
         temp.conn.execute("BEGIN IMMEDIATE")?;
         temp.conn
@@ -2792,7 +2800,7 @@ mod tests {
         )?;
         let conn = db.connect()?;
         conn.set_sync_mode(crate::SyncMode::Off);
-        conn.wal_auto_checkpoint_disable();
+        conn.wal_auto_actions_disable();
 
         conn.execute("BEGIN IMMEDIATE")?;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
@@ -2831,7 +2839,7 @@ mod tests {
             io_dyn,
             "vacuum-source.db",
             OpenFlags::Create,
-            DatabaseOpts::new(),
+            DatabaseOpts::new().with_vacuum(true),
             None,
         )?;
         let conn = db.connect()?;
@@ -2872,7 +2880,7 @@ mod tests {
             io_dyn,
             "vacuum-source-full.db",
             OpenFlags::Create,
-            DatabaseOpts::new(),
+            DatabaseOpts::new().with_vacuum(true),
             None,
         )?;
         let conn = db.connect()?;
@@ -2974,7 +2982,10 @@ mod tests {
 
         assert!(Arc::ptr_eq(&temp._db.io, &source_db.io));
         assert_ne!(temp.path, source_db.path);
-        assert!(temp.conn.is_wal_auto_checkpoint_disabled());
+        assert_eq!(
+            temp.conn.wal_auto_actions(),
+            crate::storage::wal::WalAutoActions::empty()
+        );
         assert_eq!(temp.conn.get_page_size().get(), 4096);
         assert_eq!(temp.conn.get_reserved_bytes(), Some(0));
 

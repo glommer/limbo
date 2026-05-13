@@ -4803,16 +4803,14 @@ fn test_plain_vacuum_empty_table_after_updates(tmp_db: TempDatabase) -> anyhow::
     let updated_odd_payload = "c".repeat(900);
 
     for i in 0..240 {
-        conn.execute(format!("INSERT INTO t VALUES({i}, '{}')", initial_payload))?;
+        conn.execute(format!("INSERT INTO t VALUES({i}, '{initial_payload}')"))?;
     }
 
     conn.execute(format!(
-        "UPDATE t SET payload = '{}' WHERE id % 2 = 0",
-        updated_even_payload
+        "UPDATE t SET payload = '{updated_even_payload}' WHERE id % 2 = 0"
     ))?;
     conn.execute(format!(
-        "UPDATE t SET payload = '{}' WHERE id % 2 = 1",
-        updated_odd_payload
+        "UPDATE t SET payload = '{updated_odd_payload}' WHERE id % 2 = 1"
     ))?;
     conn.execute("DELETE FROM t")?;
 
@@ -5123,7 +5121,7 @@ fn test_plain_vacuum_empty_schema_physical_contract() -> anyhow::Result<()> {
         .expect_err("VACUUM on an uninitialized database should return an error");
     assert_eq!(
         err.to_string(),
-        "Internal error: begin_blocking_tx can be done on an initialized database (page 1 must already be allocated)",
+        "Internal error: begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)",
         "expected initialization error, got: {err}"
     );
     Ok(())
@@ -5132,13 +5130,6 @@ fn test_plain_vacuum_empty_schema_physical_contract() -> anyhow::Result<()> {
 /// Initialized DB whose user schema has been fully torn down — page 1 exists,
 /// but there are no user tables or indexes. VACUUM must succeed and leave the
 /// DB queryable at the minimum page count.
-///
-/// FIXME: currently ignored because Turso's VACUUM does not reclaim the root
-/// page of the dropped table. SQLite produces page_count=1 for the same
-/// sequence; Turso produces page_count > 1. The integrity_check passes, so
-/// this is a compaction/correctness gap in the target-pager rebuild rather
-/// than a data-loss bug.
-#[ignore = "VACUUM does not reclaim dropped-table root pages (diverges from SQLite)"]
 #[test]
 fn test_plain_vacuum_initialized_but_empty_schema() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_empty();
@@ -6165,6 +6156,42 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
         normalized_schema_snapshot(&conn),
         before_schema,
         "plain VACUUM should preserve normalized sqlite_schema entries"
+    );
+
+    Ok(())
+}
+
+/// Regression test for #6358: VACUUM INTO must not panic with
+/// "StepResult::IO returned but no completions available" when the destination
+/// INSERT statement returns StepResult::IO with no I/O completions to hand off.
+/// After the VACUUM INTO completes, the source database must still be usable
+/// for subsequent reads and writes (including index-driven queries).
+#[test]
+fn test_vacuum_into_followed_by_writes_and_indexed_read() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size = 512")?;
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c TEXT)")?;
+    conn.execute(
+        "INSERT INTO t \
+         SELECT value, 'b6_' || value, hex(zeroblob(20)) \
+         FROM generate_series(1, 80)",
+    )?;
+    conn.execute("DELETE FROM t WHERE a % 3 = 0")?;
+    conn.execute("CREATE INDEX i_c ON t(c, b)")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("anything.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    conn.execute("INSERT INTO t VALUES(100, 'b6_100', 'tail6')")?;
+    conn.execute("UPDATE t SET c = 'changed6_' || a WHERE a BETWEEN 10 AND 20")?;
+
+    assert_eq!(
+        scalar_i64(&conn, "SELECT count(*) FROM t INDEXED BY i_c WHERE c >= ''"),
+        55
     );
 
     Ok(())

@@ -1499,7 +1499,14 @@ impl Schema {
         for unparsed_sql_from_index in from_sql_indexes {
             let table = self
                 .get_btree_table(&unparsed_sql_from_index.table_name)
-                .unwrap();
+                .ok_or_else(|| {
+                    LimboError::Corrupt(format!(
+                        "sqlite_schema contains index for missing table '{}': rootpage={} sql={}",
+                        unparsed_sql_from_index.table_name,
+                        unparsed_sql_from_index.root_page,
+                        unparsed_sql_from_index.sql
+                    ))
+                })?;
             let index = Index::from_sql(
                 syms,
                 &unparsed_sql_from_index.sql,
@@ -1517,7 +1524,12 @@ impl Schema {
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
             // Hence, we can process the singles first (unique_set.columns.len() == 1), and then the compounds (unique_set.columns.len() > 1).
-            let table = self.get_btree_table(&automatic_index.0).unwrap();
+            let table = self.get_btree_table(&automatic_index.0).ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "sqlite_schema contains automatic index for missing table '{}': indexes={:?}",
+                    automatic_index.0, automatic_index.1
+                ))
+            })?;
             let mut automatic_indexes = automatic_index.1;
             automatic_indexes.reverse(); // reverse so we can pop() without shifting array elements, while still processing in left-to-right order
 
@@ -3502,6 +3514,28 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
     Ok(())
 }
 
+/// Re-render the SQL text of a generated-column expression using current column names. The input
+/// AST may have been previously resolved into `Expr::Column { table: SELF_TABLE, column: idx, .. }`
+/// nodes; we replace each such self-table reference with a fresh `Expr::Id(<col-name>)` before
+/// stringifying so the result round-trips through the parser, even if a referenced column was
+/// renamed since the original `original_sql` was captured.
+pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) -> Result<String> {
+    let mut clone = expr.clone();
+    walk_expr_mut(&mut clone, &mut |e| -> Result<WalkControl> {
+        if let Expr::Column { table, column, .. } = e {
+            if table.is_self_table() {
+                if let Some(col) = columns.get(*column) {
+                    if let Some(name) = col.name.as_ref() {
+                        *e = Expr::Id(Name::exact(name.clone()));
+                    }
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(clone.to_string())
+}
+
 pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
     use ast::Expr;
     match expr {
@@ -3651,11 +3685,22 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         } => {
             has_rowid = !options.contains_without_rowid();
             is_strict = options.contains_strict();
+            let column_fk_count = columns
+                .iter()
+                .flat_map(|col| col.constraints.iter())
+                .filter(|constraint| {
+                    matches!(
+                        &constraint.constraint,
+                        ast::ColumnConstraint::ForeignKey { .. }
+                    )
+                })
+                .count();
 
             // we need to preserve order of unique sets definition
             // but also, we analyze constraints first in order to check PRIMARY KEY constraint and recognize rowid alias properly
             // that's why we maintain 2 unique_set sequences and merge them together in the end
 
+            let mut table_fk_order = column_fk_count;
             for c in constraints {
                 if let ast::TableConstraint::PrimaryKey {
                     columns,
@@ -3783,7 +3828,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             })
                             .unwrap_or(RefAct::NoAction),
                         deferred,
+                        decl_order: table_fk_order,
                     };
+                    table_fk_order += 1;
                     foreign_keys.push(Arc::new(fk));
                 } else if let ast::TableConstraint::Check(expr) = &c.constraint {
                     check_constraints.push(CheckConstraint::new(c.name.as_ref(), expr, None));
@@ -3795,6 +3842,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             // Issue: https://github.com/tursodatabase/turso/issues/3665
             let mut primary_key_desc_columns_constraint = false;
 
+            let mut column_fk_order = 0;
             for ast::ColumnDefinition {
                 col_name,
                 col_type,
@@ -3969,7 +4017,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     }
                                     None => false,
                                 },
+                                decl_order: column_fk_order,
                             };
+                            column_fk_order += 1;
                             foreign_keys.push(Arc::new(fk));
                         }
                     }
@@ -4231,6 +4281,10 @@ pub struct ForeignKey {
     pub on_update: RefAct,
     /// DEFERRABLE INITIALLY DEFERRED
     pub deferred: bool,
+    /// Declaration order among this table's foreign key constraints.
+    ///
+    /// SQLite reports PRAGMA foreign_key_list rows in reverse declaration order.
+    pub decl_order: usize,
 }
 #[inline]
 fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
@@ -4602,6 +4656,17 @@ impl Column {
         match &mut self.generated_type {
             GeneratedType::Virtual { expr, .. } => Some(expr.as_mut()),
             GeneratedType::NotGenerated => None,
+        }
+    }
+
+    #[inline]
+    pub fn set_generated_original_sql(&mut self, new_sql: String) {
+        if let GeneratedType::Virtual {
+            ref mut original_sql,
+            ..
+        } = self.generated_type
+        {
+            *original_sql = new_sql;
         }
     }
 

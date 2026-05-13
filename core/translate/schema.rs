@@ -1140,6 +1140,16 @@ pub fn translate_create_table(
         }
     }
 
+    if !connection.experimental_without_rowid_enabled() {
+        if let ast::CreateTableBody::ColumnsAndConstraints { options, .. } = &body {
+            if options.contains_without_rowid() {
+                bail_parse_error!(
+                    "WITHOUT ROWID tables are an experimental feature. Enable with --experimental-without-rowid flag"
+                );
+            }
+        }
+    }
+
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 
@@ -1997,8 +2007,10 @@ pub fn translate_drop_table(
     }
 
     //  2. Destroy the indices within a loop
-    let indices = resolver.schema().get_indices(tbl_name.name.as_str());
-    for index in indices {
+    let indices: Vec<_> = resolver.with_schema(database_id, |s| {
+        s.get_indices(tbl_name.name.as_str()).cloned().collect()
+    });
+    for index in &indices {
         if index.index_method.is_some() && !index.is_backing_btree_index() {
             // Index methods without backing btree need special destroy handling
             let cursor_id = program.alloc_cursor_index(None, index)?;

@@ -1270,6 +1270,7 @@ fn copy_key_from_values(
     parent_bt: &BTreeTable,
     parent_cols: &[String],
     values_start: usize,
+    layout: &ColumnLayout,
     rowid_reg: usize,
     dest_start: usize,
 ) -> Result<()> {
@@ -1283,7 +1284,7 @@ fn copy_key_from_values(
             if col.is_rowid_alias() {
                 rowid_reg
             } else {
-                values_start + pos
+                layout.to_register(values_start, pos)
             }
         };
         program.emit_insn(Insn::Copy {
@@ -1741,6 +1742,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                                 &parent_bt,
                                 parent_cols,
                                 replace_values_start,
+                                &ColumnLayout::from_btree(&parent_bt),
                                 replace_rowid_reg,
                                 new_key_start,
                             )?;
@@ -1882,6 +1884,13 @@ pub fn fire_fk_update_actions(
         .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
         .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
 
+    // OLD-image registers are allocated one-per-schema-column in declaration order; the NEW image
+    // lives in the UPDATE's packed DML layout (non-virtual first, virtual after).
+    let old_image_layout = ColumnLayout::Identity {
+        column_count: parent_bt.columns().len(),
+    };
+    let new_image_layout = ColumnLayout::from_btree(&parent_bt);
+
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(parent_table_name)
     })? {
@@ -1895,6 +1904,7 @@ pub fn fire_fk_update_actions(
             &parent_bt,
             parent_cols,
             old_values_start,
+            &old_image_layout,
             old_rowid_reg,
             old_key_start,
         )?;
@@ -1905,6 +1915,7 @@ pub fn fire_fk_update_actions(
             &parent_bt,
             parent_cols,
             new_values_start,
+            &new_image_layout,
             new_rowid_reg,
             new_key_start,
         )?;

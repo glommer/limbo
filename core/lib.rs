@@ -54,6 +54,7 @@ mod pseudo;
 mod regexp;
 #[cfg(feature = "series")]
 mod series;
+mod stack;
 mod statement;
 mod stats;
 #[allow(dead_code)]
@@ -86,8 +87,8 @@ use crate::{
     },
     sync::{
         atomic::{
-            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize,
-            Ordering,
+            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8,
+            AtomicUsize, Ordering,
         },
         Arc, LazyLock, Mutex, RwLock, Weak,
     },
@@ -144,7 +145,7 @@ pub use storage::{
     database::{DatabaseStorage, IOContext},
     encryption::{CipherMode, EncryptionContext, EncryptionKey},
     pager::{Page, PageRef, Pager},
-    wal::{CheckpointMode, CheckpointResult, Wal, WalFile, WalFileShared},
+    wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
 pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use turso_macros::{
@@ -208,6 +209,7 @@ pub struct DatabaseOpts {
     pub enable_attach: bool,
     pub enable_generated_columns: bool,
     pub enable_multiprocess_wal: bool,
+    pub enable_without_rowid: bool,
     pub unsafe_testing: bool,
     pub enable_postgres: bool,
     enable_load_extension: bool,
@@ -266,6 +268,11 @@ impl DatabaseOpts {
 
     pub fn with_multiprocess_wal(mut self, enable: bool) -> Self {
         self.enable_multiprocess_wal = enable;
+        self
+    }
+
+    pub fn with_without_rowid(mut self, enable: bool) -> Self {
+        self.enable_without_rowid = enable;
         self
     }
 
@@ -1799,7 +1806,7 @@ impl Database {
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
-            wal_auto_checkpoint_disabled: AtomicBool::new(false),
+            wal_auto_actions: AtomicU8::new(WalAutoActions::all_enabled().bits()),
             capture_data_changes: RwLock::new(None),
             cdc_transaction_id: AtomicI64::new(-1),
             closed: AtomicBool::new(false),
@@ -1812,6 +1819,8 @@ impl Database {
             attached_mv_txs: RwLock::new(HashMap::default()),
             #[cfg(any(test, injected_yields))]
             yield_injector: RwLock::new(None),
+            #[cfg(any(test, injected_yields))]
+            failure_injector: RwLock::new(None),
             #[cfg(any(test, injected_yields))]
             yield_instance_id_counter: AtomicU64::new(1),
             view_transaction_states: AllViewsTxState::new(),
@@ -2531,6 +2540,10 @@ impl Database {
 
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
         self.opts.enable_multiprocess_wal
+    }
+
+    pub fn experimental_without_rowid_enabled(&self) -> bool {
+        self.opts.enable_without_rowid
     }
 
     /// check if database is currently in MVCC mode

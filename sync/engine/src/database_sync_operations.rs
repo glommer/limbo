@@ -106,9 +106,10 @@ pub enum WalPushResult {
 
 pub fn connect_untracked(tape: &DatabaseTape) -> Result<Arc<turso_core::Connection>> {
     let conn = tape.connect_untracked()?;
-    assert!(
-        conn.is_wal_auto_checkpoint_disabled(),
-        "tape must be configured to have autocheckpoint disabled"
+    assert_eq!(
+        conn.wal_auto_actions(),
+        turso_core::WalAutoActions::empty(),
+        "tape must be configured to have all auto-WAL actions disabled"
     );
     Ok(conn)
 }
@@ -1090,7 +1091,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                 sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
             }
             DatabaseRowTransformResult::Keep => {
-                let replay_info = generator.replay_info(ctx.coro, &change).await?;
+                let replay_info = generator.replay_info(ctx.coro, change).await?;
                 // for now we try to support DDL statements which "extends" the schema (CREATE INDEX, CREATE TABLE, ALTER TABLE ADD COLUMN) and they have `IF NOT EXISTS` semantic
                 // as ALTER TABLE has no such syntax - we ignore error for such statements from remote for now
                 let is_alter_add_column =

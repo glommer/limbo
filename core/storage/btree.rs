@@ -2847,7 +2847,7 @@ impl BTreeCursor {
                                 mark_unlikely();
                                 tracing::error!("error reading page {}: {}", pgno, e);
                                 group.cancel();
-                                self.pager.io.drain()?;
+                                self.pager.io.drain_completions(group.completions())?;
                                 return Err(e);
                             }
                             Ok((page, c)) => {
@@ -6764,22 +6764,31 @@ impl PageStack {
             .map(|page| page.get_contents())
     }
 
-    fn unpin_all_if_pinned(&mut self) {
-        self.stack.iter_mut().flatten().for_each(|page| {
-            let _ = page.try_unpin();
-        });
+    /// Unpin and remove every page currently held in the stack.
+    /// Slots are taken so that stale page references cannot survive past a
+    /// reset — a leftover `Some(page)` after a clear could otherwise be
+    /// unpinned again on the next reset, decrementing the pin count of a
+    /// page another cursor's stack still relies on.
+    fn unpin_all_and_clear_slots(&mut self) {
+        for slot in self.stack.iter_mut() {
+            if let Some(page) = slot.take() {
+                let _ = page.try_unpin();
+            }
+        }
+        for state in self.node_states.iter_mut() {
+            *state = BTreeNodeState::default();
+        }
     }
 
     fn clear(&mut self) {
-        self.unpin_all_if_pinned();
-
+        self.unpin_all_and_clear_slots();
         self.current_page = -1;
     }
 }
 
 impl Drop for PageStack {
     fn drop(&mut self) {
-        self.unpin_all_if_pinned();
+        self.unpin_all_and_clear_slots();
     }
 }
 
@@ -8320,7 +8329,8 @@ mod tests {
         },
         types::Text,
         vdbe::Register,
-        BufferPool, Completion, Connection, IOContext, StepResult, Wal, WalFile, WalFileShared,
+        BufferPool, Completion, Connection, IOContext, StepResult, Wal, WalAutoActions, WalFile,
+        WalFileShared,
     };
     use arc_swap::ArcSwapOption;
     use std::{mem::transmute, ops::Deref, sync::Arc};
@@ -8674,7 +8684,11 @@ mod tests {
 
         // force allocate page1 with a transaction
         pager.begin_read_tx().unwrap();
-        run_until_done(|| pager.begin_write_tx(), &pager).unwrap();
+        run_until_done(
+            || pager.begin_write_tx(WalAutoActions::all_enabled()),
+            &pager,
+        )
+        .unwrap();
         run_until_done(|| pager.commit_tx(&conn, true), &pager).unwrap();
 
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
@@ -8951,7 +8965,11 @@ mod tests {
             for insert_id in 0..inserts {
                 let do_validate = do_validate_btree || (insert_id % VALIDATE_INTERVAL == 0);
                 pager.begin_read_tx().unwrap();
-                run_until_done(|| pager.begin_write_tx(), &pager).unwrap();
+                run_until_done(
+                    || pager.begin_write_tx(WalAutoActions::all_enabled()),
+                    &pager,
+                )
+                .unwrap();
                 let size = size(&mut rng);
                 let key = {
                     let result;
@@ -9096,7 +9114,10 @@ mod tests {
             tracing::info!("seed: {seed}");
             for i in 0..inserts {
                 pager.begin_read_tx().unwrap();
-                pager.io.block(|| pager.begin_write_tx()).unwrap();
+                pager
+                    .io
+                    .block(|| pager.begin_write_tx(WalAutoActions::all_enabled()))
+                    .unwrap();
                 let key = {
                     let result;
                     loop {
@@ -9271,7 +9292,10 @@ mod tests {
                 let print_progress = i % 100 == 0;
                 pager.begin_read_tx().unwrap();
 
-                pager.io.block(|| pager.begin_write_tx()).unwrap();
+                pager
+                    .io
+                    .block(|| pager.begin_write_tx(WalAutoActions::all_enabled()))
+                    .unwrap();
 
                 // Decide whether to insert or delete (80% chance of insert)
                 let is_insert = rng.next_u64() % 100 < (insert_chance * 100.0) as u64;

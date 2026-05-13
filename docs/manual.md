@@ -466,7 +466,7 @@ turso> SELECT * FROM t;
 
 Turso supports a JavaScript API, both with native and WebAssembly package options.
 
-Please read the [JavaScript API reference](docs/javascript-api-reference.md) for more information.
+Please read the [JavaScript API reference](javascript-api-reference.md) for more information.
 
 ### Installation
 

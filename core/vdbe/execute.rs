@@ -5,7 +5,10 @@ use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
-use crate::schema::{Schema, Table, SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME};
+use crate::schema::{
+    render_gencol_expr_sql_with_new_names, Schema, Table, SCHEMA_TABLE_NAME,
+    SQLITE_SEQUENCE_TABLE_NAME,
+};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -62,7 +65,7 @@ use crate::{
     },
     CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, Database,
     DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState,
-    ValueRef, MAIN_DB_ID, TEMP_DB_ID,
+    ValueRef, WalAutoActions, MAIN_DB_ID, TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -96,7 +99,7 @@ use std::{
     num::NonZero,
     sync::{atomic::Ordering, Arc},
 };
-use turso_macros::match_ignore_ascii_case;
+use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
 
 use crate::pseudo::PseudoCursor;
 
@@ -977,7 +980,10 @@ pub fn op_comparison(
         }
     }
 
-    let (new_lhs, new_rhs) = (affinity.convert(lhs_value), affinity.convert(rhs_value));
+    let (new_lhs, new_rhs) = (
+        affinity.convert_for_compare(lhs_value),
+        affinity.convert_for_compare(rhs_value),
+    );
 
     let should_jump = op.compare(
         new_lhs
@@ -3616,7 +3622,7 @@ pub fn op_transaction_inner(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new write transaction"
                         );
-                        let begin_w_tx_res = pager.begin_write_tx();
+                        let begin_w_tx_res = pager.begin_write_tx(conn.wal_auto_actions());
                         if matches!(
                             begin_w_tx_res,
                             Err(LimboError::Busy | LimboError::BusySnapshot)
@@ -3671,7 +3677,8 @@ pub fn op_transaction_inner(
             // 3b. For attached databases, begin the write transaction after
             // begin_read_tx has already completed in the Start state.
             OpTransactionState::AttachedBeginWriteTx => {
-                let res = pager.begin_write_tx()?;
+                let conn = program.connection.clone();
+                let res = pager.begin_write_tx(conn.wal_auto_actions())?;
                 if let IOResult::IO(io) = res {
                     return Ok(InsnFunctionStepResult::IO(io));
                 }
@@ -3845,87 +3852,94 @@ pub fn op_auto_commit(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    // The logic in this opcode can be a bit confusing, so to make things a bit clearer lets be
-    // very explicit about the currently existing and requested state.
-    let requested_autocommit = *auto_commit;
-    let requested_rollback = *rollback;
-    let changed = requested_autocommit != had_autocommit;
-    let is_txn_end_eq = changed && requested_autocommit;
-    // what the requested operation is
-    let is_begin_req = had_autocommit && !requested_autocommit && !requested_rollback;
-    let is_commit_req = !had_autocommit && requested_autocommit && !requested_rollback;
-    let is_rollback_req = !had_autocommit && requested_autocommit && requested_rollback;
-
-    if is_txn_end_eq && conn.n_active_writes.load(Ordering::SeqCst) > 0 {
-        return Err(LimboError::Busy);
+    #[derive(Debug)]
+    enum TxOp {
+        Begin,
+        Commit,
+        Rollback,
     }
+    let tx_op = match (*auto_commit, *rollback) {
+        (false, false) => TxOp::Begin,
+        (true, false) => TxOp::Commit,
+        (true, true) => TxOp::Rollback,
+        (false, true) => {
+            return Err(LimboError::InternalError(
+                "Insn::AutoCommit {{ auto_commit: false, rollback: true }} is not valid".into(),
+            ))
+        }
+    };
 
-    if changed {
-        if requested_rollback {
-            // ROLLBACK transition
-            if let Some(mv_store) = mv_store.as_ref() {
-                if let Some(tx_id) = conn.get_mv_tx_id() {
-                    mv_store.rollback_tx(tx_id, pager.clone(), &conn, MAIN_DB_ID);
+    // BEGIN disables autocommit; COMMIT/ROLLBACK enables it. Anything else (BEGIN within a txn,
+    // or COMMIT/ROLLBACK without one) is invalid.
+    let valid_transition = matches!(
+        (&tx_op, had_autocommit),
+        (TxOp::Begin, true) | (TxOp::Commit | TxOp::Rollback, false)
+    );
+
+    if valid_transition {
+        if matches!(tx_op, TxOp::Commit | TxOp::Rollback)
+            && conn.n_active_writes.load(Ordering::SeqCst) > 0
+        {
+            return Err(LimboError::Busy);
+        }
+
+        match tx_op {
+            TxOp::Rollback => {
+                if let Some(mv_store) = mv_store.as_ref() {
+                    if let Some(tx_id) = conn.get_mv_tx_id() {
+                        mv_store.rollback_tx(tx_id, pager.clone(), &conn, MAIN_DB_ID);
+                    }
+                    pager.end_read_tx();
+                    conn.rollback_attached_mvcc_txs(true);
+                } else {
+                    pager.rollback_tx(&conn);
                 }
-                pager.end_read_tx();
-                conn.rollback_attached_mvcc_txs(true);
-            } else {
-                pager.rollback_tx(&conn);
+                conn.rollback_attached_wal_txns();
+                conn.rollback_temp_schema();
+                conn.set_tx_state(TransactionState::None);
+                conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.set_cdc_transaction_id(-1);
             }
-            conn.rollback_attached_wal_txns();
-            conn.rollback_temp_schema();
-            conn.set_tx_state(TransactionState::None);
-            conn.auto_commit.store(true, Ordering::SeqCst);
-            conn.set_cdc_transaction_id(-1);
-        } else {
-            // BEGIN (true->false) or COMMIT (false->true)
-            if is_commit_req {
+            TxOp::Commit => {
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
+                conn.auto_commit.store(true, Ordering::SeqCst);
             }
-            conn.auto_commit
-                .store(requested_autocommit, Ordering::SeqCst);
+            TxOp::Begin => {
+                conn.auto_commit.store(false, Ordering::SeqCst);
+                return Ok(InsnFunctionStepResult::Done);
+            }
         }
     } else {
-        // No autocommit flip.
-        let mvcc_tx_active = conn.get_mv_tx().is_some();
-        if !mvcc_tx_active {
-            if !requested_autocommit {
-                return Err(LimboError::TxError(
-                    "cannot start a transaction within a transaction".to_string(),
-                ));
-            } else if requested_rollback {
-                return Err(LimboError::TxError(
-                    "cannot rollback - no transaction is active".to_string(),
-                ));
-            } else {
-                return Err(LimboError::TxError(
-                    "cannot commit - no transaction is active".to_string(),
-                ));
-            }
-        } else if is_begin_req {
-            return Err(LimboError::TxError(
-                "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
-            ));
-        }
+        return match &tx_op {
+            TxOp::Begin => Err(LimboError::TxError(
+                "cannot start a transaction within a transaction".to_string(),
+            )),
+            TxOp::Commit => Err(LimboError::TxError(
+                "cannot commit - no transaction is active".to_string(),
+            )),
+            TxOp::Rollback => Err(LimboError::TxError(
+                "cannot rollback - no transaction is active".to_string(),
+            )),
+        };
     }
 
+    turso_debug_assert!(matches!(tx_op, TxOp::Commit | TxOp::Rollback), "tx_op should be commit or rollback by now", {"tx_op": tx_op});
+
     // For explicit COMMIT, flush any pending index method writes first
-    if is_commit_req {
+    if matches!(tx_op, TxOp::Commit) {
         index_method_pre_commit_all(state, pager)?;
     }
 
-    let res = program
-        .commit_txn(pager.clone(), state, mv_store.as_ref(), requested_rollback)
-        .map(Into::into);
-
-    if mv_store.is_none()
-        && matches!(
-            res,
-            Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
-        )
-        && (is_rollback_req || is_commit_req)
+    let res = match program
+        .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
+        .map(Into::<InsnFunctionStepResult>::into)?
     {
+        res @ (InsnFunctionStepResult::Done | InsnFunctionStepResult::Step) => res,
+        res @ (InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row) => return Ok(res),
+    };
+
+    if mv_store.is_none() {
         pager.clear_savepoints()?;
         // Non-main pagers (temp + attached) accumulate savepoints from the
         // mirror path; they're not cleared by the main pager's commit/
@@ -3942,27 +3956,15 @@ pub fn op_auto_commit(
     }
 
     // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
-    if fk_on
-        && matches!(
-            res,
-            Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
-        )
-        && (is_rollback_req || is_commit_req)
-    {
+    if fk_on {
         conn.clear_deferred_foreign_key_violations();
     }
 
     // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
-    if matches!(
-        res,
-        Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
-    ) && (is_rollback_req || is_commit_req)
-    {
-        conn.set_cdc_transaction_id(-1);
-        conn.clear_named_savepoints();
-    }
+    conn.set_cdc_transaction_id(-1);
+    conn.clear_named_savepoints();
 
-    res
+    Ok(res)
 }
 
 pub fn op_savepoint(
@@ -3999,6 +4001,12 @@ pub fn op_savepoint(
                         deferred_fk_violations,
                     );
                 } else {
+                    if !pager.holds_read_lock() {
+                        pager.begin_read_tx()?;
+                    }
+                    if matches!(conn.get_tx_state(), TransactionState::None) {
+                        conn.set_tx_state(TransactionState::Read);
+                    }
                     pager.open_subjournal()?;
                     let db_size =
                         return_if_io!(pager.with_header(|header| header.database_size.get()));
@@ -5778,35 +5786,30 @@ fn update_agg_payload(
                     "Avg: payload[2] is not an integer".to_string(),
                 ));
             };
-            let val = match arg {
-                Value::Numeric(Numeric::Integer(i)) => i as f64,
-                Value::Numeric(Numeric::Float(f)) => f64::from(f),
+            let mut sum_state = SumAggState {
+                r_err,
+                ..Default::default()
+            };
+            match arg {
+                Value::Numeric(Numeric::Integer(i)) => {
+                    apply_kbn_step_int(sum_val, i, &mut sum_state);
+                }
+                Value::Numeric(Numeric::Float(f)) => {
+                    apply_kbn_step(sum_val, f64::from(f), &mut sum_state);
+                }
                 Value::Text(t) => match try_for_float(t.as_str().as_bytes()).1 {
-                    ParsedNumber::Integer(i) => i as f64,
-                    ParsedNumber::Float(f) => f,
-                    ParsedNumber::None => 0.0,
+                    ParsedNumber::Integer(i) => apply_kbn_step_int(sum_val, i, &mut sum_state),
+                    ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
+                    ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
                 },
                 Value::Blob(b) => match try_for_float(&b).1 {
-                    ParsedNumber::Integer(i) => i as f64,
-                    ParsedNumber::Float(f) => f,
-                    ParsedNumber::None => 0.0,
+                    ParsedNumber::Integer(i) => apply_kbn_step_int(sum_val, i, &mut sum_state),
+                    ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
+                    ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
                 },
                 _ => unreachable!(),
-            };
-            // Use Kahan-Babuška-Neumaier compensation for better floating-point precision
-            let s = sum_val.to_float_or_zero();
-            let t = s + val;
-            // When t is infinite, the KBN correction computes inf - inf = NaN,
-            // which is meaningless. Skip compensation in that case.
-            if t.is_finite() {
-                let correction = if s.abs() > val.abs() {
-                    (s - t) + val
-                } else {
-                    (val - t) + s
-                };
-                *r_err_val = Value::from_f64(r_err + correction);
             }
-            *sum_val = Value::from_f64(t);
+            *r_err_val = Value::from_f64(sum_state.r_err);
             *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         }
         AggFunc::Sum | AggFunc::Total => {
@@ -8668,16 +8671,11 @@ pub fn op_function(
                                 }
 
                                 for column in &mut columns {
-                                    match column.expr.as_mut() {
-                                        ast::Expr::Id(id)
-                                            if normalize_ident(id.as_str()) == rename_from =>
-                                        {
-                                            *id = Name::exact(
-                                                column_def.col_name.as_str().to_owned(),
-                                            );
-                                        }
-                                        _ => {}
-                                    }
+                                    rename_identifiers(
+                                        column.expr.as_mut(),
+                                        &rename_from,
+                                        column_def.col_name.as_str(),
+                                    );
                                 }
 
                                 if let Some(ref mut wc) = where_clause {
@@ -9719,7 +9717,7 @@ pub fn op_idx_delete(
             state.active_op_state.idx_delete()
         );
         match state.active_op_state.idx_delete() {
-            Some(OpIdxDeleteState::Seeking) => {
+            OpIdxDeleteState::Seeking => {
                 let found = match seek_internal(
                     program,
                     state,
@@ -9753,9 +9751,9 @@ pub fn op_idx_delete(
                     state.active_op_state.clear();
                     return Ok(InsnFunctionStepResult::Step);
                 }
-                *state.active_op_state.idx_delete() = Some(OpIdxDeleteState::Verifying);
+                *state.active_op_state.idx_delete() = OpIdxDeleteState::Verifying;
             }
-            Some(OpIdxDeleteState::Verifying) => {
+            OpIdxDeleteState::Verifying => {
                 let rowid = {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
@@ -9770,9 +9768,9 @@ pub fn op_idx_delete(
                         "IdxDelete: no matching index entry found for key while verifying: {reg_values:?}"
                     )));
                 }
-                *state.active_op_state.idx_delete() = Some(OpIdxDeleteState::Deleting);
+                *state.active_op_state.idx_delete() = OpIdxDeleteState::Deleting;
             }
-            Some(OpIdxDeleteState::Deleting) => {
+            OpIdxDeleteState::Deleting => {
                 {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
@@ -9783,9 +9781,6 @@ pub fn op_idx_delete(
                 state.pc += 1;
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
-            }
-            None => {
-                *state.active_op_state.idx_delete() = Some(OpIdxDeleteState::Seeking);
             }
         }
     }
@@ -11224,7 +11219,7 @@ fn op_parse_schema_step(
                 let io = inner
                     .stmt
                     .take_io_completions()
-                    .expect("IO returned but no completions");
+                    .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                 return Ok(InsnFunctionStepResult::IO(io));
             }
             StepResult::Row => {
@@ -11483,7 +11478,7 @@ fn drive_init_cdc_version(
                 let io = inner
                     .stmt
                     .take_io_completions()
-                    .expect("IO returned but no completions");
+                    .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                 return Ok(InsnFunctionStepResult::IO(io));
             }
             StepResult::Row => match &inner.phase {
@@ -12112,7 +12107,7 @@ pub fn op_open_ephemeral(
             pager
                 .begin_read_tx() // we have to begin a read tx before beginning a write
                 .expect("Failed to start read transaction");
-            return_if_io!(pager.begin_write_tx());
+            return_if_io!(pager.begin_write_tx(WalAutoActions::all_enabled()));
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
                 temp_file: temp_file.take(),
@@ -12742,6 +12737,7 @@ fn rewrite_trigger_for_column_rename(
     new_col: &str,
 ) -> crate::Result<()> {
     let trigger_tbl = normalize_ident(&trigger.table_name);
+    let old_sql = trigger.sql.clone();
     if let Some(ref mut when) = trigger.when_clause {
         rename_identifiers_scoped_when_clause(when, table_name, &trigger_tbl, old_col, new_col);
     }
@@ -12762,6 +12758,13 @@ fn rewrite_trigger_for_column_rename(
             "error in trigger {} after rename: no such column: {}",
             trigger.name, old_col
         )));
+    }
+    // Keep trigger.sql in sync with the rewritten in-memory AST so a subsequent
+    // RENAME COLUMN sees the current column name (the translate step uses the
+    // in-memory trigger.sql as the source of the next rewrite).
+    let new_sql = regenerate_trigger_sql(trigger);
+    if new_sql != old_sql {
+        trigger.sql = new_sql;
     }
     Ok(())
 }
@@ -12965,9 +12968,10 @@ pub fn op_drop_column(
         Ok(())
     })?;
 
-    // Update index.pos_in_table for all indexes.
-    // For example, if the dropped column had index 2, then anything that was indexed on column 3 or higher should be decremented by 1.
-    conn.with_database_schema_mut(*db, |schema| {
+    // Shift left pos_in_table in all indexes, and self-table placeholders in generated column
+    // expressions, to account for the dropped column. For example, if the dropped column had index
+    // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
+    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
                 let index = Arc::get_mut(index).expect("this should be the only strong reference");
@@ -12975,10 +12979,24 @@ pub fn op_drop_column(
                     if index_column.pos_in_table > *column_index {
                         index_column.pos_in_table -= 1;
                     }
+                    if let Some(ref mut expr) = index_column.expr {
+                        crate::translate::expr::walk_expr_mut(expr, &mut |e| {
+                            if let ast::Expr::Column {
+                                table, column: c, ..
+                            } = e
+                            {
+                                if table.is_self_table() && *c > *column_index {
+                                    *c -= 1;
+                                }
+                            }
+                            Ok(crate::translate::expr::WalkControl::Continue)
+                        })?;
+                    }
                 }
             }
         }
-    });
+        Ok(())
+    })?;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         for (view_name, view) in schema.views.iter() {
@@ -13170,6 +13188,19 @@ pub fn op_alter_column(
         }
         if *rename {
             btree.columns_mut()[*column_index].name = Some(new_name.clone());
+
+            // Refresh the cached sql in generated columns
+            let column_count = btree.columns().len();
+            for i in 0..column_count {
+                let cols_view = btree.columns();
+                if let Some(new_sql) = cols_view[i]
+                    .generated_expr()
+                    .map(|expr| render_gencol_expr_sql_with_new_names(expr, cols_view))
+                    .transpose()?
+                {
+                    btree.columns_mut()[i].set_generated_original_sql(new_sql)
+                }
+            }
         } else {
             btree.columns_mut()[*column_index] = new_column.clone();
         }
@@ -15463,7 +15494,7 @@ mod tests {
             io,
             "in-place-vacuum-design-b.db",
             OpenFlags::Create,
-            DatabaseOpts::new(),
+            DatabaseOpts::new().with_vacuum(true),
             None,
         )
         .unwrap();
@@ -15507,7 +15538,7 @@ mod tests {
             io,
             "in-place-vacuum-busy-before-copyback.db",
             OpenFlags::Create,
-            DatabaseOpts::new(),
+            DatabaseOpts::new().with_vacuum(true),
             None,
         )
         .unwrap();
@@ -15584,7 +15615,7 @@ mod tests {
         );
         assert_eq!(state.pc, 0, "pc should not advance on invariant violation");
         assert!(
-            matches!(state.active_op_state.hash_probe(), None),
+            state.active_op_state.hash_probe().is_none(),
             "HashProbe should not stash resumable state for the removed fallback path"
         );
     }
@@ -15964,6 +15995,37 @@ mod tests {
         ];
         let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_finalize_avg_large_integers() {
+        let mut payload = vec![
+            Value::from_f64(0.0),
+            Value::from_f64(0.0),
+            Value::from_i64(0),
+        ];
+
+        update_agg_payload(
+            &AggFunc::Avg,
+            Value::from_i64(9007199254740994),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+            &None,
+        )
+        .unwrap();
+        update_agg_payload(
+            &AggFunc::Avg,
+            Value::from_i64(-9007199254740993),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+            &None,
+        )
+        .unwrap();
+
+        let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
+        assert_eq!(result, Value::from_f64(0.5));
     }
 
     #[test]

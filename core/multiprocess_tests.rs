@@ -489,7 +489,7 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
-    conn.wal_auto_checkpoint_disable();
+    conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
     conn.execute("begin immediate").unwrap();
@@ -567,7 +567,7 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
-    conn.wal_auto_checkpoint_disable();
+    conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
     conn.execute("begin immediate").unwrap();
@@ -639,7 +639,7 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
-    conn.wal_auto_checkpoint_disable();
+    conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
     conn.execute("begin immediate").unwrap();
@@ -925,9 +925,16 @@ fn plain_vacuum_rejects_multiprocess_wal_database() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("vacuum-multiprocess.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
 
-    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let db = Database::open_file_with_flags(
+        io,
+        db_path_str,
+        OpenFlags::default(),
+        multiprocess_wal_db_opts().with_vacuum(true),
+        None,
+    )
+    .unwrap();
     let conn = db.connect().unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
@@ -1208,7 +1215,7 @@ fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
 
     let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
-    conn.wal_auto_checkpoint_disable();
+    conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
     conn.execute("begin immediate").unwrap();
@@ -1302,7 +1309,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
-    conn.wal_auto_checkpoint_disable();
+    conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
     conn.execute("begin immediate").unwrap();
@@ -1539,7 +1546,7 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
-    conn.wal_auto_checkpoint_disable();
+    conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
     conn.execute("begin immediate").unwrap();

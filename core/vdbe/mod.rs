@@ -57,7 +57,7 @@ use crate::{
         metrics::StatementMetrics,
         vacuum::VacuumInPlaceOpContext,
     },
-    ValueRef,
+    ValueRef, WalAutoActions,
 };
 use smallvec::SmallVec;
 
@@ -190,6 +190,20 @@ enum CommitState {
         db_id: usize,
         mv_store: Arc<MvStore>,
     },
+}
+
+impl CommitState {
+    fn cleanup_mvcc_checkpoint_state(&mut self) {
+        match self {
+            CommitState::CommittingMvcc { state_machine } => {
+                state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
+            }
+            CommitState::CommittingAttachedMvcc { state_machine, .. } => {
+                state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
+            }
+            CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -386,7 +400,7 @@ enum ActiveOpState {
     None,
     Delete(OpDeleteState),
     Destroy(OpDestroyState),
-    IdxDelete(Option<OpIdxDeleteState>),
+    IdxDelete(OpIdxDeleteState),
     IntegrityCheck(OpIntegrityCheckState),
     OpenEphemeral(OpOpenEphemeralState),
     Program(OpProgramState),
@@ -480,7 +494,12 @@ impl ActiveOpStateSlot {
         OpDestroyState,
         OpDestroyState::CreateCursor
     );
-    active_state_accessor!(idx_delete, IdxDelete, Option<OpIdxDeleteState>, None);
+    active_state_accessor!(
+        idx_delete,
+        IdxDelete,
+        OpIdxDeleteState,
+        OpIdxDeleteState::Seeking
+    );
     active_state_accessor!(
         integrity_check,
         IntegrityCheck,
@@ -805,7 +824,11 @@ impl ProgramState {
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
-        // Reset state machines
+        // A caller can reset or drop a statement after an MVCC auto-checkpoint
+        // has yielded I/O. Waiting for that I/O does not step the nested
+        // CheckpointStateMachine again, so release its checkpoint lock before
+        // replacing commit_state with Ready.
+        self.commit_state.cleanup_mvcc_checkpoint_state();
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         self.current_collation = None;
@@ -1310,6 +1333,7 @@ impl Program {
         state.is_interrupted()
     }
 
+    #[turso_macros::trace_stack]
     pub fn step(
         &self,
         state: &mut ProgramState,
@@ -1536,6 +1560,7 @@ impl Program {
             let insn_function = insn.to_function();
             if enable_tracing {
                 trace_insn(self, state.pc as InsnReference, insn);
+                crate::stack::trace_remaining("program_step:opcode");
             }
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
@@ -1870,7 +1895,7 @@ impl Program {
         // Phase 1: Commit main DB MVCC transaction
         if matches!(program_state.commit_state, CommitState::Ready) {
             if let Some(tx_id) = conn.get_mv_tx_id() {
-                let state_machine = mv_store.commit_tx(tx_id, &conn)?;
+                let state_machine = mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?;
                 program_state.commit_state = CommitState::CommittingMvcc { state_machine };
             }
             // If no main MVCC tx, commit_state stays Ready and we fall
@@ -1939,7 +1964,7 @@ impl Program {
                 conn.set_mv_tx_for_db(db_id, None);
                 continue;
             };
-            let mut state_machine = match attached_mv_store.commit_tx(tx_id, &conn) {
+            let mut state_machine = match attached_mv_store.commit_tx(tx_id, &conn, db_id) {
                 Ok(sm) => sm,
                 Err(e) => {
                     tracing::error!(
@@ -2082,7 +2107,11 @@ impl Program {
                     // Commit dirty pages to WAL, then end write+read transactions.
                     // We disable auto-checkpoint and avoid pager.commit_tx() since
                     // the checkpoint logic can leave read locks held.
-                    match attached_pager.commit_dirty_pages(true, SyncMode::Normal, false) {
+                    match attached_pager.commit_dirty_pages(
+                        WalAutoActions::empty(),
+                        SyncMode::Normal,
+                        false,
+                    ) {
                         Ok(IOResult::Done(_)) => {}
                         Ok(IOResult::IO(io)) => {
                             // IO pending — return so the caller can yield and re-enter.
@@ -2157,6 +2186,12 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        // MVCC auto-checkpoint is owned by commit_state, not by normal_step().
+        // If its yielded I/O fails, normal_step sees the error before
+        // CommitStateMachine::Checkpoint gets another step, so the checkpoint
+        // state machine cannot run its own error cleanup. abort() is the first
+        // statement cleanup path that still owns that commit_state.
+        state.commit_state.cleanup_mvcc_checkpoint_state();
 
         // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
         // releases nested guards. Clean it before checking whether this program

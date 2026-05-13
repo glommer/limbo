@@ -29,7 +29,10 @@ pub extern "C" fn turso_enable_experimental() {
 fn default_db_opts() -> DatabaseOpts {
     let mut opts = DatabaseOpts::new();
     if EXPERIMENTAL_ENABLED.load(Ordering::Acquire) {
-        opts = opts.with_generated_columns(true).with_vacuum(true);
+        opts = opts
+            .with_generated_columns(true)
+            .with_vacuum(true)
+            .with_without_rowid(true);
     }
     opts
 }
@@ -2383,10 +2386,18 @@ pub unsafe extern "C" fn sqlite3_blob_close(_blob: *mut ffi::c_void) -> ffi::c_i
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_stricmp(
-    _a: *const ffi::c_char,
-    _b: *const ffi::c_char,
+    a: *const ffi::c_char,
+    b: *const ffi::c_char,
 ) -> ffi::c_int {
-    stub!();
+    let a = std::ffi::CStr::from_ptr(a).to_bytes();
+    let b = std::ffi::CStr::from_ptr(b).to_bytes();
+    for (x, y) in a.iter().zip(b.iter()) {
+        let diff = x.to_ascii_lowercase() as ffi::c_int - y.to_ascii_lowercase() as ffi::c_int;
+        if diff != 0 {
+            return diff;
+        }
+    }
+    a.len() as ffi::c_int - b.len() as ffi::c_int
 }
 
 #[no_mangle]
@@ -2552,8 +2563,15 @@ pub unsafe extern "C" fn sqlite3_extended_errcode(db: *mut sqlite3) -> ffi::c_in
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_complete(_sql: *const ffi::c_char) -> ffi::c_int {
-    stub!();
+pub unsafe extern "C" fn sqlite3_complete(sql: *const ffi::c_char) -> ffi::c_int {
+    if sql.is_null() {
+        return 0;
+    }
+    let s = CStr::from_ptr(sql).to_bytes();
+    s.iter()
+        .rev()
+        .find(|&&b| !b.is_ascii_whitespace())
+        .map_or(0, |&b| (b == b';') as ffi::c_int)
 }
 
 #[no_mangle]
@@ -2818,7 +2836,7 @@ pub unsafe extern "C" fn libsql_wal_disable_checkpoint(db: *mut sqlite3) -> ffi:
     }
     let db: &mut sqlite3 = &mut *db;
     let db = db.inner.lock().unwrap();
-    db.conn.wal_auto_checkpoint_disable();
+    db.conn.wal_auto_actions_disable();
     SQLITE_OK
 }
 
