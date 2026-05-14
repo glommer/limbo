@@ -2627,6 +2627,139 @@ impl InternalVirtualTableCursor for PgAttrdefCursor {
     }
 }
 
+/// Virtual table implementation for pg_catalog.pg_sequences
+/// Reads sequence metadata from Schema.sequences at scan time.
+#[derive(Debug)]
+pub struct PgSequencesTable;
+
+impl PgSequencesTable {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl InternalVirtualTable for PgSequencesTable {
+    fn name(&self) -> String {
+        "pg_sequences".to_string()
+    }
+
+    fn open(
+        &self,
+        conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgSequencesCursor {
+            conn,
+            rows: Vec::new(),
+            current_row: 0,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 100.0,
+            estimated_rows: 10,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE pg_sequences (
+            schemaname TEXT,
+            sequencename TEXT,
+            sequenceowner TEXT,
+            data_type TEXT,
+            start_value INTEGER,
+            min_value INTEGER,
+            max_value INTEGER,
+            increment_by INTEGER,
+            cycle INTEGER,
+            cache_size INTEGER,
+            last_value INTEGER
+        )"
+        .to_string()
+    }
+}
+
+struct PgSequencesCursor {
+    conn: Arc<Connection>,
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl PgSequencesCursor {
+    fn load_sequences(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.rows.clear();
+        let schema = self.conn.schema.read().clone();
+        let mut names: Vec<_> = schema.sequences.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            if let Some(seq) = schema.sequences.get(&name) {
+                let seq_name = seq.name.clone();
+                let last_val = seq.current_value.load(Ordering::Relaxed);
+                self.rows.push(vec![
+                    Value::build_text("public"),           // schemaname
+                    Value::build_text(seq_name),           // sequencename
+                    Value::build_text("turso"),            // sequenceowner
+                    Value::build_text("bigint"),           // data_type
+                    Value::from_i64(seq.start_value),      // start_value
+                    Value::from_i64(seq.min_value),        // min_value
+                    Value::from_i64(seq.max_value),        // max_value
+                    Value::from_i64(seq.increment_by),     // increment_by
+                    Value::from_i64(i64::from(seq.cycle)), // cycle
+                    Value::from_i64(seq.cache),            // cache_size
+                    Value::from_i64(last_val),             // last_value
+                ]);
+            }
+        }
+    }
+}
+
+impl InternalVirtualTableCursor for PgSequencesCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        self.load_sequences();
+        Ok(!self.rows.is_empty())
+    }
+}
+
 /// Create PostgreSQL system catalog virtual tables
 pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
     use crate::vtab::VirtualTable;
@@ -2784,6 +2917,16 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
                 Arc::new(RwLock::new(PgInputErrorInfoTable::new())),
             )
             .expect("pg_input_error_info virtual table creation should not fail"),
+        ),
+        // pg_sequences virtual table
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_sequences".to_string(),
+                PgSequencesTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgSequencesTable::new())),
+            )
+            .expect("pg_sequences virtual table creation should not fail"),
         ),
     ]
 }

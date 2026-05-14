@@ -83,6 +83,25 @@ impl Connection {
             return Ok(Some(stmt));
         }
 
+        // CREATE TABLE with serial columns → create implicit sequences first
+        let translator = PostgreSQLTranslator::new();
+        let result = translator
+            .translate_with_prereqs(&parse_result)
+            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+
+        if !result.prereqs.is_empty() {
+            // Execute prerequisite CREATE SEQUENCE statements via direct AST compilation
+            for prereq in result.prereqs {
+                let prereq_sql = prereq.to_string();
+                if let Some(mut stmt) = self.run_cmd(Cmd::Stmt(prereq), &prereq_sql)? {
+                    stmt.run_ignore_rows()?;
+                }
+            }
+            // Compile the main CREATE TABLE — use original PG SQL as input
+            // so that sqlite_schema stores valid PG SQL (not Turso AST with STRICT)
+            return self.run_cmd(Cmd::Stmt(result.stmt), sql);
+        }
+
         Ok(None)
     }
 

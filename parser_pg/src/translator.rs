@@ -9,6 +9,16 @@ use pg_query::{NodeRef, ParseResult};
 use turso_parser::ast;
 use turso_parser::ast::GroupBy;
 
+/// Result of translating a PostgreSQL statement, which may include
+/// prerequisite statements (e.g., implicit CREATE SEQUENCE for serial columns).
+pub struct TranslateResult {
+    /// Prerequisite statements that must be executed before the main statement.
+    /// For example, serial columns generate implicit CREATE SEQUENCE statements.
+    pub prereqs: Vec<ast::Stmt>,
+    /// The main translated statement.
+    pub stmt: ast::Stmt,
+}
+
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
@@ -85,39 +95,63 @@ impl PostgreSQLTranslator {
         }
     }
 
-    /// Translate a PostgreSQL parse result into Turso's format
+    /// Translate a PostgreSQL parse result into Turso's format.
+    /// For statements that may generate prerequisites (e.g., serial columns),
+    /// use `translate_with_prereqs` instead.
     pub fn translate(&self, parse_result: &ParseResult) -> Result<ast::Stmt, ParseError> {
+        self.translate_with_prereqs(parse_result).map(|r| r.stmt)
+    }
+
+    /// Translate a PostgreSQL parse result, returning both the main statement
+    /// and any prerequisite statements (e.g., implicit CREATE SEQUENCE for serial columns).
+    pub fn translate_with_prereqs(
+        &self,
+        parse_result: &ParseResult,
+    ) -> Result<TranslateResult, ParseError> {
         if parse_result.protobuf.nodes().is_empty() {
             return Err(ParseError::ParseError("No statements found".to_string()));
         }
 
         let node = &parse_result.protobuf.nodes()[0];
 
-        match &node.0 {
+        // CREATE TABLE is special: serial columns generate prerequisite CREATE SEQUENCE stmts
+        if let NodeRef::CreateStmt(create) = &node.0 {
+            return self.translate_create_table_with_prereqs(create);
+        }
+
+        // All other statements have no prerequisites
+        let stmt = match &node.0 {
             NodeRef::SelectStmt(select) => {
                 let select_ast = self.translate_select(select)?;
-                Ok(ast::Stmt::Select(select_ast))
+                ast::Stmt::Select(select_ast)
             }
-            NodeRef::InsertStmt(insert) => self.translate_insert(insert),
-            NodeRef::UpdateStmt(update) => self.translate_update(update),
-            NodeRef::DeleteStmt(delete) => self.translate_delete(delete),
-            NodeRef::TransactionStmt(txn) => self.translate_transaction(txn),
-            NodeRef::DropStmt(drop) => self.translate_drop(drop),
-            NodeRef::AlterTableStmt(alter) => self.translate_alter_table(alter),
-            NodeRef::RenameStmt(rename) => self.translate_rename_stmt(rename),
-            NodeRef::IndexStmt(idx) => self.translate_create_index(idx),
-            NodeRef::CreateStmt(create) => self.translate_create_table(create),
-            NodeRef::TruncateStmt(truncate) => self.translate_truncate(truncate),
-            NodeRef::ViewStmt(view) => self.translate_create_view(view),
-            NodeRef::CreateTableAsStmt(ctas) => self.translate_create_table_as(ctas),
-            NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt),
-            NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain),
-            NodeRef::CopyStmt(copy) => self.translate_copy(copy),
-            _ => Err(ParseError::ParseError(format!(
-                "{} is not supported",
-                node_ref_name(&node.0)
-            ))),
-        }
+            NodeRef::InsertStmt(insert) => self.translate_insert(insert)?,
+            NodeRef::UpdateStmt(update) => self.translate_update(update)?,
+            NodeRef::DeleteStmt(delete) => self.translate_delete(delete)?,
+            NodeRef::TransactionStmt(txn) => self.translate_transaction(txn)?,
+            NodeRef::DropStmt(drop) => self.translate_drop(drop)?,
+            NodeRef::AlterTableStmt(alter) => self.translate_alter_table(alter)?,
+            NodeRef::RenameStmt(rename) => self.translate_rename_stmt(rename)?,
+            NodeRef::IndexStmt(idx) => self.translate_create_index(idx)?,
+            NodeRef::TruncateStmt(truncate) => self.translate_truncate(truncate)?,
+            NodeRef::ViewStmt(view) => self.translate_create_view(view)?,
+            NodeRef::CreateTableAsStmt(ctas) => self.translate_create_table_as(ctas)?,
+            NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt)?,
+            NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
+            NodeRef::CopyStmt(copy) => self.translate_copy(copy)?,
+            NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
+            _ => {
+                return Err(ParseError::ParseError(format!(
+                    "{} is not supported",
+                    node_ref_name(&node.0)
+                )))
+            }
+        };
+
+        Ok(TranslateResult {
+            prereqs: vec![],
+            stmt,
+        })
     }
 
     /// Translate a PostgreSQL CREATE TABLE statement into Turso AST.
@@ -125,7 +159,7 @@ impl PostgreSQLTranslator {
     fn translate_create_table(
         &self,
         create: &pg_query::protobuf::CreateStmt,
-    ) -> Result<ast::Stmt, ParseError> {
+    ) -> Result<(ast::Stmt, Vec<String>), ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
@@ -144,19 +178,11 @@ impl PostgreSQLTranslator {
 
         let mut columns = Vec::new();
         let mut table_constraints = Vec::new();
-        let mut has_autoincrement = false;
+        // Collect implicit sequence names for serial columns
+        let mut serial_sequences: Vec<String> = Vec::new();
 
-        // First pass: detect SERIAL columns for autoincrement
-        for elt in &create.table_elts {
-            let Some(ref inner) = elt.node else { continue };
-            if let Node::ColumnDef(col_def) = inner {
-                let pg_type = extract_type_name(col_def)?;
-                if is_serial_type(&pg_type) {
-                    has_autoincrement = true;
-                    break;
-                }
-            }
-        }
+        // Extract table name for serial sequence naming
+        let tbl_name_str = tbl_name.name.as_str().to_string();
 
         // Check for table-level PK (to suppress column-level PK emission)
         let mut has_table_pk = false;
@@ -178,8 +204,9 @@ impl PostgreSQLTranslator {
                 Node::ColumnDef(col_def) => {
                     let col = self.translate_create_table_column(
                         col_def,
-                        has_autoincrement,
                         has_table_pk,
+                        &tbl_name_str,
+                        &mut serial_sequences,
                     )?;
                     columns.push(col);
                 }
@@ -202,7 +229,7 @@ impl PostgreSQLTranslator {
                                             nulls: None,
                                         })
                                         .collect(),
-                                    auto_increment: has_autoincrement,
+                                    auto_increment: false,
                                     conflict_clause: None,
                                 },
                             });
@@ -249,7 +276,7 @@ impl PostgreSQLTranslator {
             }
         }
 
-        Ok(ast::Stmt::CreateTable {
+        let stmt = ast::Stmt::CreateTable {
             temporary: false,
             if_not_exists: create.if_not_exists,
             tbl_name,
@@ -261,16 +288,43 @@ impl PostgreSQLTranslator {
                     strict_text: Some("STRICT".to_string()),
                 },
             },
-        })
+        };
+        Ok((stmt, serial_sequences))
+    }
+
+    /// Translate CREATE TABLE, generating prerequisite CREATE SEQUENCE statements
+    /// for any serial columns.
+    fn translate_create_table_with_prereqs(
+        &self,
+        create: &pg_query::protobuf::CreateStmt,
+    ) -> Result<TranslateResult, ParseError> {
+        let (stmt, serial_sequences) = self.translate_create_table(create)?;
+
+        let prereqs = serial_sequences
+            .into_iter()
+            .map(|seq_name| ast::Stmt::CreateSequence {
+                if_not_exists: true,
+                seq_name: ast::QualifiedName::single(ast::Name::from_string(seq_name)),
+                start: None,
+                increment: None,
+                min_value: None,
+                max_value: None,
+                cache: None,
+                cycle: false,
+            })
+            .collect();
+
+        Ok(TranslateResult { prereqs, stmt })
     }
 
     /// Translate a single PG column definition for CREATE TABLE to a Turso AST ColumnDefinition.
-    /// Handles SERIAL/BIGSERIAL autoincrement, column-level PK/FK, and type mapping.
+    /// Handles SERIAL/BIGSERIAL as NOT NULL + DEFAULT nextval(), column-level PK/FK, and type mapping.
     fn translate_create_table_column(
         &self,
         col_def: &pg_query::protobuf::ColumnDef,
-        has_autoincrement: bool,
         has_table_pk: bool,
+        table_name: &str,
+        serial_sequences: &mut Vec<String>,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
@@ -285,7 +339,8 @@ impl PostgreSQLTranslator {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
         })?;
 
-        let mut is_primary_key = is_serial;
+        // Serial does NOT imply PRIMARY KEY in PostgreSQL
+        let mut is_primary_key = false;
         let mut is_not_null = col_def.is_not_null || is_serial;
         let mut is_unique = false;
         let mut default_expr: Option<ast::Expr> = None;
@@ -336,6 +391,24 @@ impl PostgreSQLTranslator {
         // Build constraints list
         let mut constraints = Vec::new();
 
+        // For serial columns, add DEFAULT nextval('tablename_colname_seq')
+        if is_serial && default_expr.is_none() {
+            let seq_name = format!("{}_{}_seq", table_name.to_lowercase(), name.to_lowercase());
+            serial_sequences.push(seq_name.clone());
+            default_expr = Some(ast::Expr::FunctionCall {
+                name: ast::Name::from_string("nextval"),
+                distinctness: None,
+                args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                    "'{seq_name}'"
+                ))))],
+                order_by: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            });
+        }
+
         // PRIMARY KEY (only on column level if there's no table-level PK)
         if is_primary_key && !has_table_pk {
             constraints.push(ast::NamedColumnConstraint {
@@ -343,7 +416,7 @@ impl PostgreSQLTranslator {
                 constraint: ast::ColumnConstraint::PrimaryKey {
                     order: None,
                     conflict_clause: None,
-                    auto_increment: has_autoincrement,
+                    auto_increment: false,
                 },
             });
         }
@@ -841,6 +914,10 @@ impl PostgreSQLTranslator {
             ObjectType::ObjectDomain => Ok(ast::Stmt::DropDomain {
                 if_exists: drop.missing_ok,
                 domain_name: qualified_name.name.as_str().to_string(),
+            }),
+            ObjectType::ObjectSequence => Ok(ast::Stmt::DropSequence {
+                if_exists: drop.missing_ok,
+                seq_name: qualified_name,
             }),
             _ => Err(ParseError::ParseError(format!(
                 "DROP {} is not supported",
@@ -3519,6 +3596,62 @@ impl PostgreSQLTranslator {
         })
     }
 
+    fn translate_create_sequence(
+        &self,
+        seq: &pg_query::protobuf::CreateSeqStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        let relation = seq
+            .sequence
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("CREATE SEQUENCE missing name".into()))?;
+        let seq_name = self.qualified_name_from_range_var(relation);
+
+        let mut start = None;
+        let mut increment = None;
+        let mut min_value = None;
+        let mut max_value = None;
+        let mut cache = None;
+        let mut cycle = false;
+
+        for opt_node in &seq.options {
+            if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
+                match elem.defname.as_str() {
+                    "start" => {
+                        start = extract_def_elem_int(elem);
+                    }
+                    "increment" => {
+                        increment = extract_def_elem_int(elem);
+                    }
+                    "minvalue" => {
+                        min_value = extract_def_elem_int(elem);
+                    }
+                    "maxvalue" => {
+                        max_value = extract_def_elem_int(elem);
+                    }
+                    "cache" => {
+                        cache = extract_def_elem_int(elem);
+                    }
+                    "cycle" => {
+                        // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
+                        cycle = extract_def_elem_bool(elem);
+                    }
+                    _ => {} // ignore unknown options
+                }
+            }
+        }
+
+        Ok(ast::Stmt::CreateSequence {
+            if_not_exists: seq.if_not_exists,
+            seq_name,
+            start,
+            increment,
+            min_value,
+            max_value,
+            cache,
+            cycle,
+        })
+    }
+
     fn translate_create_domain(
         &self,
         domain: &pg_query::protobuf::CreateDomainStmt,
@@ -3916,6 +4049,25 @@ fn extract_type_name_from_typename(
         }
     }
     Ok(name)
+}
+
+/// Extract an integer value from a DefElem's arg node.
+fn extract_def_elem_int(elem: &pg_query::protobuf::DefElem) -> Option<i64> {
+    use pg_query::protobuf::node::Node;
+    match elem.arg.as_ref().and_then(|n| n.node.as_ref()) {
+        Some(Node::Integer(i)) => Some(i.ival as i64),
+        Some(Node::Float(f)) => f.fval.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn extract_def_elem_bool(elem: &pg_query::protobuf::DefElem) -> bool {
+    use pg_query::protobuf::node::Node;
+    match elem.arg.as_ref().and_then(|n| n.node.as_ref()) {
+        Some(Node::Boolean(b)) => b.boolval,
+        Some(Node::Integer(i)) => i.ival != 0,
+        _ => false,
+    }
 }
 
 fn extract_type_name(col_def: &pg_query::protobuf::ColumnDef) -> Result<String, ParseError> {
@@ -6668,5 +6820,19 @@ mod tests {
         let copy = try_extract_copy_from(&parsed).unwrap();
         let cols = copy.columns.unwrap();
         assert_eq!(cols, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn test_create_sequence_cycle() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE SEQUENCE cyc_seq MINVALUE 1 MAXVALUE 3 CYCLE";
+        let parse_result = crate::parse(sql).unwrap();
+        let stmt = translator.translate(&parse_result).unwrap();
+        match stmt {
+            ast::Stmt::CreateSequence { cycle, .. } => {
+                assert!(cycle, "CYCLE should be true");
+            }
+            other => panic!("Expected CreateSequence, got {other:?}"),
+        }
     }
 }
