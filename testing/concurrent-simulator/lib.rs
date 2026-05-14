@@ -363,6 +363,16 @@ impl WhopperOpts {
     }
 }
 
+/// Parameters for a created sequence.
+#[derive(Debug, Clone)]
+pub struct SequenceParams {
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+}
+
 /// Statistics collected during simulation.
 #[derive(Default, Debug, Clone)]
 pub struct Stats {
@@ -376,6 +386,8 @@ pub struct Stats {
     pub elle_reads: usize,
     /// Multiprocess: corruption events detected and survived
     pub corruption_events: usize,
+    /// Sequence nextval calls
+    pub sequence_nextvals: usize,
 }
 
 /// Result of a single simulation step.
@@ -419,6 +431,8 @@ pub struct SimulatorState {
     pub simple_tables_keys: HashMap<String, SamplesContainer<String>>,
     /// Elle tables for consistency checking
     pub elle_tables: MergableMap<String, ()>,
+    /// Created sequences: seq_name -> parameters
+    pub sequences: MergableMap<String, SequenceParams>,
     /// Counter for generating unique execution IDs
     pub execution_id: u64,
     /// Counter for generating unique transaction IDs
@@ -441,6 +455,7 @@ impl SimulatorState {
             simple_tables: MergableMap::new(),
             simple_tables_keys: HashMap::new(),
             elle_tables: MergableMap::new(),
+            sequences: MergableMap::new(),
             execution_id: 0,
             txn_id: 0,
         }
@@ -791,7 +806,9 @@ impl Whopper {
                     | turso_core::LimboError::BusySnapshot
                     | turso_core::LimboError::WriteWriteConflict
                     | turso_core::LimboError::CommitDependencyAborted
-                    | turso_core::LimboError::InvalidArgument(..) => {
+                    | turso_core::LimboError::InvalidArgument(..)
+                    | turso_core::LimboError::ParseError(..)
+                    | turso_core::LimboError::TxError(..) => {
                         if ctx.fiber.state.is_in_tx() && !ctx.fiber.connection.get_auto_commit() {
                             ctx.fiber.current_op = Some(Operation::Rollback);
                         } else {
@@ -1001,8 +1018,27 @@ impl Whopper {
         );
 
         let fibers = &mut self.context.fibers;
-        // Run all active statements to completion
+        // Run all active statements to completion.
+        // Cap iterations to avoid livelocks where two fibers block each other
+        // (e.g., a COMMIT waiting on a checkpoint that can't acquire its lock
+        // while another fiber's INSERT is also yielding on IO).
+        let max_drain_iters: u64 = 100_000;
+        let mut drain_iters = 0u64;
         while fibers.iter().any(|f| f.statement.borrow().is_some()) {
+            drain_iters += 1;
+            if drain_iters > max_drain_iters {
+                debug!(
+                    "reopen: drain loop hit {} iterations, force-dropping remaining statements",
+                    drain_iters,
+                );
+                for fiber in fibers.iter_mut() {
+                    if let Some(stmt) = fiber.statement.borrow_mut().take() {
+                        drop(stmt);
+                    }
+                    fiber.rows.clear();
+                }
+                break;
+            }
             for (fiber_idx, fiber) in fibers.iter_mut().enumerate() {
                 if fiber.statement.borrow().is_some() {
                     let done = {
@@ -1076,10 +1112,95 @@ impl Whopper {
         // Reopen connections (creates new Database instance)
         self.open_connections()?;
 
+        // Query persisted sequence values from sqlite_sequence after restart.
+        let persisted_seq_values = if !self.context.fibers.is_empty() {
+            self.query_persisted_sequence_values()?
+        } else {
+            HashMap::new()
+        };
+
+        // Notify properties that a restart occurred, passing persisted state.
+        for prop in &self.properties {
+            prop.lock().unwrap().on_restart(&persisted_seq_values)?;
+        }
+
+        // Rebuild sequence state from the reopened database.
+        if !self.context.fibers.is_empty() {
+            self.rebuild_sequences_after_restart()?;
+        }
+
         debug!(
             "Database restarted with {} fibers",
             self.context.fibers.len()
         );
+        Ok(())
+    }
+
+    /// Query sqlite_sequence to get persisted (name → most-advanced seq) values after restart.
+    /// Direction-aware: ascending sequences keep the max, descending keep the min.
+    fn query_persisted_sequence_values(&self) -> anyhow::Result<HashMap<String, i64>> {
+        let conn = &self.context.fibers[0].connection;
+
+        // Check if sqlite_sequence exists
+        let mut check_stmt = conn.prepare(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'",
+        )?;
+        let mut has_table = false;
+        check_stmt.run_with_row_callback(|row| {
+            has_table = row.get::<i64>(0)? > 0;
+            Ok(())
+        })?;
+
+        if !has_table {
+            return Ok(HashMap::new());
+        }
+
+        let sequences = &self.context.state.sequences;
+        let mut stmt = conn.prepare("SELECT name, seq FROM sqlite_sequence")?;
+        let mut values: HashMap<String, i64> = HashMap::new();
+        stmt.run_with_row_callback(|row| {
+            let name: &str = row.get(0)?;
+            let seq: i64 = row.get(1)?;
+            // Keep the most-advanced value per name (there may be multiple rows
+            // from append-only writes that haven't been compacted yet).
+            // Descending sequences (negative increment) keep the minimum.
+            let name_owned = name.to_string();
+            let is_descending = sequences
+                .get(&name_owned)
+                .map(|p| p.increment < 0)
+                .unwrap_or(false);
+            let entry = values.entry(name_owned).or_insert(seq);
+            let is_better = if is_descending {
+                seq < *entry
+            } else {
+                seq > *entry
+            };
+            if is_better {
+                *entry = seq;
+            }
+            Ok(())
+        })?;
+        Ok(values)
+    }
+
+    /// Rebuild sim_state.sequences by querying sqlite_master for sequence objects.
+    fn rebuild_sequences_after_restart(&mut self) -> anyhow::Result<()> {
+        let conn = &self.context.fibers[0].connection;
+        let mut stmt =
+            conn.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'sequence'")?;
+
+        let mut new_sequences = MergableMap::new();
+        stmt.run_with_row_callback(|row| {
+            let name: &str = row.get(0)?;
+            let sql: &str = row.get(1)?;
+            // Parse sequence parameters from the CREATE SEQUENCE SQL.
+            if let Some(params) = parse_sequence_params(sql) {
+                new_sequences.insert(name.to_string(), params);
+            }
+            Ok(())
+        })?;
+
+        self.context.state.sequences = new_sequences;
         Ok(())
     }
 
@@ -1118,6 +1239,77 @@ impl Whopper {
 
         Ok(())
     }
+}
+
+/// Parse sequence parameters from a CREATE SEQUENCE SQL statement.
+/// Returns None if the SQL cannot be parsed.
+fn parse_sequence_params(sql: &str) -> Option<SequenceParams> {
+    let tokens: Vec<&str> = sql.split_whitespace().collect();
+    let mut i = 2; // skip "CREATE SEQUENCE"
+    if tokens.get(i).is_some_and(|t| t.eq_ignore_ascii_case("IF")) {
+        i += 3; // skip "IF NOT EXISTS"
+    }
+    i += 1; // skip the sequence name
+
+    let mut start = None;
+    let mut increment = None;
+    let mut min_value = None;
+    let mut max_value = None;
+    let mut cache = None;
+    let mut cycle = false;
+
+    while i < tokens.len() {
+        match tokens[i].to_uppercase().as_str() {
+            "START" => {
+                i += 2; // skip "WITH"
+                start = tokens.get(i).and_then(|t| t.parse().ok());
+                i += 1;
+            }
+            "INCREMENT" => {
+                i += 2; // skip "BY"
+                increment = tokens.get(i).and_then(|t| t.parse().ok());
+                i += 1;
+            }
+            "MINVALUE" => {
+                i += 1;
+                min_value = tokens.get(i).and_then(|t| t.parse().ok());
+                i += 1;
+            }
+            "MAXVALUE" => {
+                i += 1;
+                max_value = tokens.get(i).and_then(|t| t.parse().ok());
+                i += 1;
+            }
+            "CACHE" => {
+                i += 1;
+                cache = tokens.get(i).and_then(|t| t.parse().ok());
+                i += 1;
+            }
+            "CYCLE" => {
+                cycle = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let seq = turso_core::schema::Sequence::new(
+        String::new(),
+        start,
+        increment,
+        min_value,
+        max_value,
+        cache,
+        cycle,
+    )
+    .ok()?;
+    Some(SequenceParams {
+        start: seq.start_value,
+        increment: seq.increment_by,
+        min_value: seq.min_value,
+        max_value: seq.max_value,
+        cycle: seq.cycle,
+    })
 }
 
 fn may_be_set_encryption(

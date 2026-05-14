@@ -558,6 +558,7 @@ pub fn op_checkpoint(
                 "Only TRUNCATE checkpoint mode is supported for MVCC".to_string(),
             ));
         }
+
         use crate::state_machine::{StateTransition, TransitionResult};
         let mut ckpt_sm = CheckpointStateMachine::new(
             pager.clone(),
@@ -565,6 +566,7 @@ pub fn op_checkpoint(
             program.connection.clone(),
             true,
             program.connection.get_sync_mode(),
+            *database,
         );
         let CheckpointResult {
             wal_max_frame,
@@ -583,6 +585,7 @@ pub fn op_checkpoint(
                 Err(err) => return Err(err),
             }
         };
+
         // https://sqlite.org/pragma.html#pragma_wal_checkpoint
         // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
         state.registers[*dest].set_int(0);
@@ -3032,6 +3035,8 @@ pub fn halt(
                 program.connection.set_capture_data_changes_info(cdc_info);
             }
             program.connection.set_cdc_transaction_id(-1);
+            // Flush dirty sequence values to sqlite_sequence for crash recovery.
+            flush_dirty_sequences(&program.connection);
         }
         result
     } else {
@@ -3964,7 +3969,222 @@ pub fn op_auto_commit(
     conn.set_cdc_transaction_id(-1);
     conn.clear_named_savepoints();
 
+    // Flush dirty sequence values to sqlite_sequence after successful commit.
+    if !*rollback {
+        flush_dirty_sequences(&conn);
+    } else {
+        // On rollback, just discard the dirty list
+        conn.take_dirty_sequences();
+    }
+
     Ok(res)
+}
+
+/// Flush dirty sequence values to sqlite_sequence for crash recovery.
+/// This runs after a successful commit, writing the current sequence values
+/// to sqlite_sequence as a separate auto-committed statement.
+///
+/// In non-MVCC (WAL) mode, uses UPDATE-or-INSERT to maintain a single row per
+/// sequence name.
+///
+/// In MVCC mode, uses INSERT-append: each commit appends a new row with the
+/// current value. This avoids write-write conflicts because each INSERT gets a
+/// unique rowid. Duplicate rows are compacted during checkpoint.
+fn flush_dirty_sequences(conn: &Arc<Connection>) {
+    use crate::schema::SQLITE_SEQUENCE_TABLE_NAME;
+    use rustc_hash::FxHashMap;
+
+    let dirty = conn.take_dirty_sequences();
+    if dirty.is_empty() {
+        return;
+    }
+
+    // Group dirty sequences by database_id
+    let mut by_db: FxHashMap<usize, Vec<String>> = FxHashMap::default();
+    for (db_id, seq_name) in dirty {
+        by_db.entry(db_id).or_default().push(seq_name);
+    }
+
+    for (db_id, seq_names) in by_db {
+        let is_mvcc = conn.mv_store_for_db(db_id).is_some();
+
+        // Check if sqlite_sequence table exists in this database
+        let has_seq_table = conn.with_schema(db_id, |s| {
+            s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME).is_some()
+        });
+
+        // Collect sequences, separating autoincrement (sqlite_sequence) from
+        // user sequences (backing table).
+        let mut autoinc_pairs: Vec<(String, i64)> = Vec::new();
+        let mut user_seqs: Vec<(String, i64, bool)> = Vec::new(); // (name, value, is_called)
+        let mut all_seq_arcs: Vec<Arc<crate::schema::Sequence>> = Vec::new();
+
+        conn.with_schema(db_id, |schema| {
+            for seq_name in &seq_names {
+                let Some(seq) = schema.get_sequence(seq_name) else {
+                    continue;
+                };
+                let current = seq.current_value.load(std::sync::atomic::Ordering::SeqCst);
+                all_seq_arcs.push(Arc::clone(seq));
+
+                if let Some(table_name) = seq_name.strip_prefix("_autoincrement_") {
+                    autoinc_pairs.push((table_name.to_string(), current));
+                } else {
+                    let is_called = seq.is_called.load(std::sync::atomic::Ordering::SeqCst);
+                    user_seqs.push((seq_name.clone(), current, is_called));
+                }
+            }
+        });
+
+        // Get the db alias for qualifying table references in non-main databases
+        let db_prefix = if db_id == crate::MAIN_DB_ID {
+            String::new()
+        } else {
+            match conn.get_database_name_by_index(db_id) {
+                Some(name) => format!("\"{name}\"."),
+                None => continue,
+            }
+        };
+
+        // Flush autoincrement sequences to sqlite_sequence
+        if has_seq_table && !autoinc_pairs.is_empty() {
+            if is_mvcc {
+                flush_dirty_sequences_mvcc(conn, &autoinc_pairs, &db_prefix);
+            } else {
+                flush_dirty_sequences_wal(conn, &autoinc_pairs, &db_prefix);
+            }
+        }
+
+        // Flush user sequences to their backing tables.
+        // Switch to SQLite dialect so the UPDATE SQL parses correctly
+        // regardless of the user's active dialect.
+        if !user_seqs.is_empty() {
+            let saved_dialect = conn.get_sql_dialect();
+            conn.set_sql_dialect(crate::SqlDialect::Sqlite);
+            for (name, value, is_called) in &user_seqs {
+                flush_user_sequence_to_backing_table(conn, name, *value, *is_called, &db_prefix);
+            }
+            conn.set_sql_dialect(saved_dialect);
+        }
+
+        for seq in &all_seq_arcs {
+            seq.mark_clean();
+        }
+    }
+}
+
+/// WAL mode: UPDATE existing row or INSERT if missing (one row per name).
+fn flush_dirty_sequences_wal(
+    conn: &Arc<Connection>,
+    flush_data: &[(String, i64)],
+    db_prefix: &str,
+) {
+    use crate::schema::SQLITE_SEQUENCE_TABLE_NAME;
+
+    for (persist_name, current) in flush_data {
+        let escaped_name = persist_name.replace('\'', "''");
+        let result: crate::Result<()> = (|| {
+            // Reset changes counter before the UPDATE so we can check
+            // whether the UPDATE actually modified a row.
+            conn.changes.store(0, std::sync::atomic::Ordering::SeqCst);
+            let mut update_stmt = conn.prepare_internal(format!(
+                "UPDATE {db_prefix}{SQLITE_SEQUENCE_TABLE_NAME} SET seq = MAX(seq, {current}) WHERE name = '{escaped_name}'"
+            ))?;
+            update_stmt.run_with_row_callback(|_| Ok(()))?;
+
+            // If no rows were updated, insert
+            let changes = conn.changes.load(std::sync::atomic::Ordering::SeqCst);
+            if changes == 0 {
+                let mut insert_stmt = conn.prepare_internal(format!(
+                    "INSERT INTO {db_prefix}{SQLITE_SEQUENCE_TABLE_NAME}(name, seq) VALUES ('{escaped_name}', {current})"
+                ))?;
+                insert_stmt.run_with_row_callback(|_| Ok(()))?;
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            tracing::warn!(
+                "Failed to flush sequence '{}' to sqlite_sequence: {}",
+                persist_name,
+                e
+            );
+        }
+    }
+}
+
+/// MVCC mode: INSERT-append a new row for each dirty sequence.
+/// Each INSERT gets a unique rowid, so concurrent transactions never conflict.
+/// Duplicate rows per name are compacted during checkpoint.
+fn flush_dirty_sequences_mvcc(
+    conn: &Arc<Connection>,
+    flush_data: &[(String, i64)],
+    db_prefix: &str,
+) {
+    use crate::schema::SQLITE_SEQUENCE_TABLE_NAME;
+    use crate::SqlDialect;
+
+    // Save and temporarily switch to SQLite dialect for the internal INSERT.
+    // We use conn.prepare() (not prepare_internal()) because we're running
+    // after the main transaction has committed — the connection is fully idle
+    // (tx_state=None, mv_tx=None, autocommit=true). prepare_internal() uses
+    // StatementOrigin::InternalHelper which sets a nested guard that may
+    // prevent the inner MVCC transaction from committing.
+    let saved_dialect = conn.get_sql_dialect();
+    conn.set_sql_dialect(SqlDialect::Sqlite);
+
+    for (persist_name, current) in flush_data {
+        let escaped_name = persist_name.replace('\'', "''");
+        let result: crate::Result<()> = (|| {
+            let mut insert_stmt = conn.prepare(format!(
+                "INSERT INTO {db_prefix}{SQLITE_SEQUENCE_TABLE_NAME}(name, seq) VALUES ('{escaped_name}', {current})"
+            ))?;
+            insert_stmt.run_with_row_callback(|_| Ok(()))?;
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            tracing::warn!(
+                "Failed to flush sequence '{}' to sqlite_sequence (MVCC): {}",
+                persist_name,
+                e
+            );
+        }
+    }
+
+    conn.set_sql_dialect(saved_dialect);
+}
+
+/// Flush a user sequence's current state to its backing table.
+fn flush_user_sequence_to_backing_table(
+    conn: &Arc<Connection>,
+    name: &str,
+    value: i64,
+    is_called: bool,
+    db_prefix: &str,
+) {
+    let escaped = name.replace('"', "\"\"");
+    let is_called_int = i64::from(is_called);
+    let sql = format!(
+        "UPDATE {db_prefix}\"{escaped}\" SET __turso_seq_value = {value}, __turso_seq_is_called = {is_called_int}"
+    );
+    let result: crate::Result<()> = (|| {
+        // Use conn.prepare() (not prepare_internal()) because the flush runs
+        // after the main transaction commits and the connection is fully idle.
+        // prepare_internal() sets a nested guard that prevents the inner
+        // transaction from committing, leaving dirty pages in the pager.
+        let mut stmt = conn.prepare(sql)?;
+        stmt.run_with_row_callback(|_| Ok(()))?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        tracing::warn!(
+            "Failed to flush sequence '{}' to backing table: {}",
+            name,
+            e
+        );
+    }
 }
 
 pub fn op_savepoint(
@@ -7281,6 +7501,85 @@ pub fn op_function(
                 let b = state.registers[*start_reg + 1].get_value();
                 let ne = a != b;
                 state.registers[*dest].set_value(Value::from_i64(if ne { 1 } else { 0 }));
+            }
+            ScalarFunc::NextVal => {
+                let seq_name = match state.registers[*start_reg].get_value() {
+                    Value::Text(t) => t.as_str().to_string(),
+                    _ => {
+                        return Err(crate::LimboError::ParseError(
+                            "nextval() requires a text argument".to_string(),
+                        ));
+                    }
+                };
+                match program.connection.find_sequence(&seq_name) {
+                    Some((db_id, seq)) => {
+                        let val = seq.nextval()?;
+                        program.connection.set_sequence_currval(&seq_name, val);
+                        program.connection.mark_sequence_dirty(db_id, &seq_name);
+                        state.registers[*dest].set_value(Value::from_i64(val));
+                    }
+                    None => {
+                        return Err(crate::LimboError::ParseError(format!(
+                            "sequence \"{seq_name}\" does not exist",
+                        )));
+                    }
+                }
+            }
+            ScalarFunc::CurrVal => {
+                let seq_name = match state.registers[*start_reg].get_value() {
+                    Value::Text(t) => t.as_str().to_string(),
+                    _ => {
+                        return Err(crate::LimboError::ParseError(
+                            "currval() requires a text argument".to_string(),
+                        ));
+                    }
+                };
+                match program.connection.get_sequence_currval(&seq_name) {
+                    Some(val) => {
+                        state.registers[*dest].set_value(Value::from_i64(val));
+                    }
+                    None => {
+                        return Err(crate::LimboError::ParseError(format!(
+                            "currval of sequence \"{seq_name}\" is not yet defined in this session",
+                        )));
+                    }
+                }
+            }
+            ScalarFunc::SetVal => {
+                let seq_name = match state.registers[*start_reg].get_value() {
+                    Value::Text(t) => t.as_str().to_string(),
+                    _ => {
+                        return Err(crate::LimboError::ParseError(
+                            "setval() requires a text argument".to_string(),
+                        ));
+                    }
+                };
+                let value = state.registers[*start_reg + 1]
+                    .get_value()
+                    .as_int()
+                    .unwrap_or(0);
+                let is_called = if arg_count > 2 {
+                    state.registers[*start_reg + 2]
+                        .get_value()
+                        .as_int()
+                        .unwrap_or(1)
+                        != 0
+                } else {
+                    true
+                };
+                match program.connection.find_sequence(&seq_name) {
+                    Some((db_id, seq)) => {
+                        seq.setval(value, is_called)?;
+                        program.connection.set_sequence_currval(&seq_name, value);
+                        program.connection.mark_sequence_dirty(db_id, &seq_name);
+                        state.registers[*dest].set_value(Value::from_i64(value));
+                    }
+                    None => {
+                        return Err(crate::LimboError::ParseError(format!(
+                            "sequence \"{seq_name}\" does not exist",
+                        )));
+                    }
+                }
             }
             ScalarFunc::Abs
             | ScalarFunc::Lower
@@ -10980,6 +11279,103 @@ pub fn op_drop_type(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_add_sequence(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        AddSequence {
+            db,
+            name,
+            start,
+            increment,
+            min_value,
+            max_value,
+            cache,
+            cycle,
+        },
+        insn
+    );
+    let seq = crate::schema::Sequence::new(
+        name.clone(),
+        Some(*start),
+        Some(*increment),
+        Some(*min_value),
+        Some(*max_value),
+        Some(*cache),
+        *cycle,
+    )?;
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        schema
+            .sequences
+            .insert(crate::util::normalize_ident(name), std::sync::Arc::new(seq));
+    });
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_drop_sequence(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(DropSequence { db, seq_name }, insn);
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.remove_sequence(seq_name);
+    });
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_advance_sequence(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        AdvanceSequence {
+            db,
+            seq_name_reg,
+            value_reg,
+        },
+        insn
+    );
+    let seq_name = match state.registers[*seq_name_reg].get_value() {
+        Value::Text(t) => t.as_str().to_string(),
+        _ => {
+            return Err(crate::LimboError::ParseError(
+                "AdvanceSequence: seq_name_reg must be text".to_string(),
+            ));
+        }
+    };
+    let value = state.registers[*value_reg]
+        .get_value()
+        .as_int()
+        .unwrap_or(0);
+    let schema = program
+        .connection
+        .with_schema(*db, |s| s.get_sequence(&seq_name).cloned());
+    match schema {
+        Some(seq) => {
+            seq.advance_past(value);
+            program.connection.mark_sequence_dirty(*db, &seq_name);
+        }
+        None => {
+            return Err(crate::LimboError::ParseError(format!(
+                "sequence \"{seq_name}\" does not exist",
+            )));
+        }
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_add_type(
     program: &Program,
     state: &mut ProgramState,
@@ -14635,6 +15031,7 @@ fn op_journal_mode_inner(
                                 program.connection.clone(),
                                 true,
                                 program.connection.get_sync_mode(),
+                                *db,
                             ))));
                     }
 
@@ -14736,6 +15133,18 @@ fn op_journal_mode_inner(
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
                     program.connection.demote_to_mvcc_connection();
                     mv_store.bootstrap(program.connection.clone())?;
+                    // Bootstrap calls reparse_schema which creates a fresh Schema,
+                    // discarding sequence state from initialize_sequences_from_sqlite_sequence.
+                    // Re-initialize sequences now that MVCC root page mappings are available.
+                    if let Err(e) = program
+                        .connection
+                        .initialize_sequences_from_sqlite_sequence()
+                    {
+                        tracing::warn!(
+                            "Failed to re-initialize sequences after MVCC bootstrap: {}",
+                            e
+                        );
+                    }
                 }
 
                 if matches!(new_mode, journal_mode::JournalMode::Wal) {

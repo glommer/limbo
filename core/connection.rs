@@ -282,6 +282,11 @@ pub struct Connection {
     /// MUST be incremented whenever any setting that affects PrepareContext changes,
     /// and this is not currently centralized; each setter bumps the generation individually.
     pub(crate) prepare_context_generation: AtomicU64,
+    /// Per-connection last-returned value for each sequence (for currval()).
+    pub(crate) sequence_currvals: parking_lot::RwLock<HashMap<String, i64>>,
+    /// Sequences modified in the current transaction, flushed to sqlite_sequence at commit.
+    /// Each entry is (database_id, sequence_name).
+    pub(crate) dirty_sequences: parking_lot::Mutex<Vec<(usize, String)>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -1010,20 +1015,31 @@ impl Connection {
         // Capture built-in table-valued functions (e.g. generate_series, json_each)
         // before dropping the old schema. These are registered programmatically and
         // don't survive re-parsing from sqlite_schema alone.
-        let table_valued_functions: Vec<_> = self
-            .schema
-            .read()
-            .tables
-            .values()
-            .filter_map(|table| match table.as_ref() {
-                crate::schema::Table::Virtual(vtab)
-                    if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) =>
-                {
-                    Some(vtab.clone())
-                }
-                _ => None,
-            })
-            .collect();
+        let (table_valued_functions, preserved_sequences) = {
+            let schema = self.schema.read();
+            let tvfs: Vec<_> = schema
+                .tables
+                .values()
+                .filter_map(|table| match table.as_ref() {
+                    crate::schema::Table::Virtual(vtab)
+                        if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) =>
+                    {
+                        Some(vtab.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            // Preserve sequences across reparsing. Sequences are stored in-memory
+            // and backed by real tables in sqlite_schema — but handle_schema_row
+            // only detects the backing table, not the sequence. We rehydrate any
+            // sequences whose backing table still exists after reparsing.
+            let seqs: Vec<_> = schema
+                .sequences
+                .iter()
+                .map(|(name, seq)| (name.clone(), Arc::clone(seq)))
+                .collect();
+            (tvfs, seqs)
+        };
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -1066,6 +1082,15 @@ impl Connection {
                 .tables
                 .entry(normalized)
                 .or_insert_with(|| Arc::new(crate::schema::Table::Virtual(vtab.clone())));
+        }
+
+        // Rehydrate sequences whose backing tables still exist in the fresh
+        // schema. Sequences that were DROPped will have no backing table and
+        // are naturally excluded.
+        for (name, seq) in preserved_sequences {
+            if fresh.tables.contains_key(&name) {
+                fresh.sequences.entry(name).or_insert(seq);
+            }
         }
 
         // Load custom types from __turso_internal_types if the table exists
@@ -1659,6 +1684,7 @@ impl Connection {
                 self.clone(),
                 true,
                 self.get_sync_mode(),
+                crate::MAIN_DB_ID,
             );
             loop {
                 match ckpt_sm.step(&()) {
@@ -2899,6 +2925,198 @@ impl Connection {
         self.reset_temp_database();
         self.temp_store.set(value);
         self.bump_prepare_context_generation();
+    }
+
+    /// Mark a sequence as dirty (modified in the current transaction).
+    pub fn mark_sequence_dirty(&self, db: usize, name: &str) {
+        let normalized = crate::util::normalize_ident(name);
+        let mut dirty = self.dirty_sequences.lock();
+        if !dirty.iter().any(|(d, n)| *d == db && *n == normalized) {
+            dirty.push((db, normalized));
+        }
+    }
+
+    /// Take all dirty sequences, clearing the list.
+    pub fn take_dirty_sequences(&self) -> Vec<(usize, String)> {
+        std::mem::take(&mut *self.dirty_sequences.lock())
+    }
+
+    /// Find a sequence by name across all databases (main, then attached).
+    /// Returns (database_id, sequence_arc) or None.
+    pub fn find_sequence(&self, name: &str) -> Option<(usize, Arc<crate::schema::Sequence>)> {
+        let normalized = crate::util::normalize_ident(name);
+        // Check main schema first
+        {
+            let schema = self.schema.read();
+            if let Some(seq) = schema.get_sequence(&normalized) {
+                return Some((MAIN_DB_ID, Arc::clone(seq)));
+            }
+        }
+        // Check connection-local database_schemas (staged mutations)
+        {
+            let schemas = self.database_schemas.read();
+            for (&db_id, schema) in schemas.iter() {
+                if let Some(seq) = schema.get_sequence(&normalized) {
+                    return Some((db_id, Arc::clone(seq)));
+                }
+            }
+        }
+        // Check attached database schemas
+        {
+            let attached_dbs = self.attached_databases.read();
+            for (&db_id, (db, _pager)) in attached_dbs.index_to_data.iter() {
+                let schema = db.schema.lock();
+                if let Some(seq) = schema.get_sequence(&normalized) {
+                    return Some((db_id, Arc::clone(seq)));
+                }
+            }
+        }
+        None
+    }
+
+    /// Record that this connection has seen a value from the named sequence (for currval).
+    pub fn set_sequence_currval(&self, name: &str, value: i64) {
+        let normalized = crate::util::normalize_ident(name);
+        self.sequence_currvals.write().insert(normalized, value);
+    }
+
+    /// Get the last value returned by nextval/setval for the named sequence on this connection.
+    pub fn get_sequence_currval(&self, name: &str) -> Option<i64> {
+        let normalized = crate::util::normalize_ident(name);
+        self.sequence_currvals.read().get(&normalized).copied()
+    }
+
+    /// Read sqlite_sequence and initialize sequence high-water marks.
+    /// For each row (name, seq), if a matching sequence exists in the schema
+    /// (either user-created or implicit `_autoincrement_<table>`),
+    /// advance its current_value to the persisted value.
+    ///
+    /// Also initializes user-created sequences from their backing tables.
+    pub(crate) fn initialize_sequences_from_sqlite_sequence(self: &Arc<Connection>) -> Result<()> {
+        use crate::schema::{Sequence, SQLITE_SEQUENCE_TABLE_NAME};
+        use crate::util::normalize_ident;
+
+        // --- Autoincrement sequences from sqlite_sequence ---
+        let has_seq_table = {
+            let s = self.schema.read();
+            s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME).is_some()
+        };
+        if has_seq_table {
+            let mut stmt = self.prepare_internal(format!(
+                "SELECT name, seq FROM {SQLITE_SEQUENCE_TABLE_NAME}"
+            ))?;
+
+            let mut rows: Vec<(String, i64)> = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                let name = row.get::<&str>(0)?.to_string();
+                let seq = row.get::<i64>(1)?;
+                rows.push((name, seq));
+                Ok(())
+            })?;
+
+            let schema = self.schema.read();
+            for (name, seq_val) in rows {
+                let autoinc_name = format!("_autoincrement_{name}");
+                if let Some(sequence) = schema.get_sequence(&autoinc_name) {
+                    sequence.advance_past(seq_val);
+                    sequence.mark_clean();
+                }
+                if let Some(sequence) = schema.get_sequence(&name) {
+                    sequence.advance_past(seq_val);
+                    sequence.mark_clean();
+                }
+            }
+        }
+
+        // --- User sequences from their backing tables ---
+        // Collect (database_id, db_prefix, seq_name) tuples from all databases.
+        let mut seq_entries: Vec<(usize, String, String)> = Vec::new();
+
+        // Main database (no prefix needed)
+        {
+            let schema = self.schema.read();
+            for (name, table) in &schema.tables {
+                if let Some(bt) = table.btree() {
+                    if bt
+                        .columns()
+                        .first()
+                        .and_then(|c| c.name.as_deref())
+                        .is_some_and(|n| n == "__turso_seq_value")
+                    {
+                        seq_entries.push((crate::MAIN_DB_ID, String::new(), name.clone()));
+                    }
+                }
+            }
+        }
+
+        // Attached databases
+        {
+            let attached_dbs = self.attached_databases.read();
+            for (alias, &db_id) in attached_dbs.name_to_index.iter() {
+                if let Some((db, _pager)) = attached_dbs.index_to_data.get(&db_id) {
+                    let schema = db.schema.lock();
+                    for (name, table) in &schema.tables {
+                        if let Some(bt) = table.btree() {
+                            if bt
+                                .columns()
+                                .first()
+                                .and_then(|c| c.name.as_deref())
+                                .is_some_and(|n| n == "__turso_seq_value")
+                            {
+                                seq_entries.push((db_id, format!("{alias}."), name.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (database_id, db_prefix, seq_name) in &seq_entries {
+            let escaped = seq_name.replace('"', "\"\"");
+            let sql = format!(
+                "SELECT __turso_seq_value, __turso_seq_is_called, \
+                 __turso_seq_start, __turso_seq_inc, __turso_seq_min, \
+                 __turso_seq_max, __turso_seq_cache, __turso_seq_cycle \
+                 FROM {db_prefix}\"{escaped}\" LIMIT 1"
+            );
+            let mut cols = [0i64; 8];
+            let mut found = false;
+            {
+                let mut stmt = self.prepare_internal(sql)?;
+                stmt.run_with_row_callback(|row| {
+                    for (i, col) in cols.iter_mut().enumerate() {
+                        *col = row.get::<i64>(i)?;
+                    }
+                    found = true;
+                    Ok(())
+                })?;
+            }
+
+            if found {
+                let [value, is_called, start, inc, min, max, cache, cycle] = cols;
+                let seq = Sequence::new(
+                    seq_name.clone(),
+                    Some(start),
+                    Some(inc),
+                    Some(min),
+                    Some(max),
+                    Some(cache),
+                    cycle != 0,
+                )?;
+                seq.current_value
+                    .store(value, std::sync::atomic::Ordering::SeqCst);
+                seq.is_called
+                    .store(is_called != 0, std::sync::atomic::Ordering::SeqCst);
+                let database_id = *database_id;
+                self.with_database_schema_mut(database_id, |schema| {
+                    schema
+                        .sequences
+                        .insert(normalize_ident(seq_name), std::sync::Arc::new(seq));
+                });
+            }
+        }
+
+        Ok(())
     }
 
     pub fn get_sql_dialect(&self) -> SqlDialect {

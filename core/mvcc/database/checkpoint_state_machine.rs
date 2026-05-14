@@ -16,7 +16,7 @@ use crate::storage::wal::{CheckpointMode, TursoRwLock, WalAutoActions};
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
-use crate::types::{IOCompletions, IOResult, ImmutableRecord};
+use crate::types::{IOCompletions, IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult};
 use crate::{turso_assert, turso_assert_eq};
 use crate::{
     CheckpointResult, Completion, Connection, IOExt, LimboError, Numeric, Pager, Result, SyncMode,
@@ -51,6 +51,8 @@ pub enum CheckpointState {
     DeleteIndexRowStateMachine {
         index_write_set_index: usize,
     },
+    /// Compact sqlite_sequence: keep only the row with the most advanced value per name.
+    CompactSqliteSequence,
     CommitPagerTxn,
     CheckpointWal,
     /// Fsync the database file after checkpoint, before truncating WAL.
@@ -164,6 +166,47 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     staged_checkpoint_header: Option<DatabaseHeader>,
     /// Guard to avoid restaging page 1 across CommitPagerTxn async retries.
     header_staged_for_commit: bool,
+    /// Which database this checkpoint operates on (MAIN_DB_ID or attached).
+    database_id: usize,
+    /// Sub-state machine for compacting sqlite_sequence during checkpoint.
+    compact_seq_state: CompactSeqState,
+    /// Rows scanned during sqlite_sequence compaction: (rowid, name, seq).
+    compact_seq_scanned_rows: Vec<(i64, String, i64)>,
+    /// Cursor for sqlite_sequence during compaction.
+    compact_seq_cursor: Option<Arc<RwLock<BTreeCursor>>>,
+}
+
+/// Sub-state machine for sqlite_sequence compaction.
+/// Scans all rows, keeps only the most advanced value per name, deletes the rest.
+#[derive(Debug)]
+enum CompactSeqState {
+    /// Initial state: look up sqlite_sequence root page from schema.
+    Init,
+    /// Rewind cursor to the first row.
+    Rewind,
+    /// Scan rows: read rowid, then record, collect (rowid, name, seq).
+    ScanRowid,
+    /// Read the record for the current row during scan.
+    ScanRecord { rowid: i64 },
+    /// Advance cursor to the next row during scan.
+    ScanNext,
+    /// Compute which rowids to delete, then start deleting.
+    ComputeDeletes {
+        /// (rowid, name, seq) for all scanned rows.
+        rows: Vec<(i64, String, i64)>,
+    },
+    /// Seek to the rowid to delete.
+    DeleteSeek {
+        rowids_to_delete: Vec<i64>,
+        delete_idx: usize,
+    },
+    /// Delete the row at the current cursor position.
+    DeleteRow {
+        rowids_to_delete: Vec<i64>,
+        delete_idx: usize,
+    },
+    /// Done — transition to CommitPagerTxn.
+    Done,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -296,12 +339,23 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         connection: Arc<Connection>,
         update_transaction_state: bool,
         sync_mode: SyncMode,
+        database_id: usize,
     ) -> Self {
         let checkpoint_lock = mvstore.blocking_checkpoint_lock.clone();
         // Prevent stale per-connection schema during checkpoint by using the shared DB schema.
         // Unlike in WAL mode we actually write stuff from mv store to pager in checkpoint
         // so this is important.
-        let schema = connection.db.clone_schema();
+        let schema = if database_id == crate::MAIN_DB_ID {
+            connection.db.clone_schema()
+        } else {
+            connection
+                .attached_databases()
+                .read()
+                .index_to_data
+                .get(&database_id)
+                .map(|(db, _)| db.schema.lock().clone())
+                .unwrap_or_else(|| connection.db.clone_schema())
+        };
         let index_id_to_index = schema
             .indexes
             .values()
@@ -360,6 +414,25 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             durable_mvcc_metadata,
             staged_checkpoint_header: None,
             header_staged_for_commit: false,
+            database_id,
+            compact_seq_state: CompactSeqState::Init,
+            compact_seq_scanned_rows: Vec::new(),
+            compact_seq_cursor: None,
+        }
+    }
+
+    /// Clone the schema for the database being checkpointed.
+    fn clone_checkpoint_schema(&self) -> Arc<crate::Schema> {
+        if self.database_id == crate::MAIN_DB_ID {
+            self.connection.db.clone_schema()
+        } else {
+            self.connection
+                .attached_databases()
+                .read()
+                .index_to_data
+                .get(&self.database_id)
+                .map(|(db, _)| db.schema.lock().clone())
+                .unwrap_or_else(|| self.connection.db.clone_schema())
         }
     }
 
@@ -635,6 +708,23 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             }
                         }
                     }
+                } else if is_delete
+                    && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
+                    && !version.btree_resident
+                {
+                    // Schema row without a B-tree identity (e.g. sequence, trigger, view).
+                    // If it was never checkpointed to the B-tree, skip the delete — there
+                    // is nothing to remove from the pager.
+                    let begin_ts = match &version.begin {
+                        Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
+                        _ => None,
+                    };
+                    let was_checkpointed = self.durable_txid_max_old.is_some_and(|txid_max_old| {
+                        begin_ts.is_some_and(|b| b <= u64::from(txid_max_old))
+                    });
+                    if !was_checkpointed {
+                        skip_write = true;
+                    }
                 }
                 if !skip_write {
                     tracing::trace!("adding to write_set {:?}", (&version, &special_write));
@@ -859,6 +949,271 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         Ok(())
     }
 
+    /// Compact sqlite_sequence: keep only the row with the most advanced value per
+    /// sequence name, delete the rest. This runs inside the checkpoint's pager
+    /// transaction so deletions are flushed atomically with everything else.
+    fn step_compact_sqlite_sequence(&mut self) -> Result<TransitionResult<CheckpointResult>> {
+        use crate::schema::SQLITE_SEQUENCE_TABLE_NAME;
+
+        loop {
+            match std::mem::replace(&mut self.compact_seq_state, CompactSeqState::Done) {
+                CompactSeqState::Init => {
+                    // Look up sqlite_sequence root page from the MvStore's mapping.
+                    // We can't use schema.root_page directly because in MVCC mode the
+                    // root page may have been allocated during this very checkpoint.
+                    let schema = self.clone_checkpoint_schema();
+                    let seq_table = schema.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME);
+                    let Some(table) = seq_table else {
+                        // No sqlite_sequence table — nothing to compact.
+                        self.state = CheckpointState::CommitPagerTxn;
+                        return Ok(TransitionResult::Continue);
+                    };
+                    let num_columns = table.columns().len();
+
+                    // Get the table_id for sqlite_sequence, then look up its
+                    // actual root page from the MvStore mapping (which reflects
+                    // any BTreeCreate that happened during this checkpoint).
+                    let table_id = self.mvstore.get_table_id_from_root_page(table.root_page);
+                    let root_page = self
+                        .mvstore
+                        .table_id_to_rootpage
+                        .get(&table_id)
+                        .and_then(|entry| *entry.value());
+                    let Some(root_page) = root_page else {
+                        // sqlite_sequence B-tree hasn't been allocated yet.
+                        self.state = CheckpointState::CommitPagerTxn;
+                        return Ok(TransitionResult::Continue);
+                    };
+
+                    // Reuse cursor from the WriteRow phase if available,
+                    // otherwise create a new one.
+                    let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
+                        cursor.clone()
+                    } else {
+                        let cursor =
+                            BTreeCursor::new(self.pager.clone(), root_page as i64, num_columns);
+                        Arc::new(RwLock::new(cursor))
+                    };
+                    self.compact_seq_cursor = Some(cursor);
+                    self.compact_seq_scanned_rows.clear();
+                    self.compact_seq_state = CompactSeqState::Rewind;
+                }
+                CompactSeqState::Rewind => {
+                    let cursor = self.compact_seq_cursor.as_ref().unwrap();
+                    let mut cursor = cursor.write();
+                    match cursor.rewind()? {
+                        IOResult::IO(io) => {
+                            self.compact_seq_state = CompactSeqState::Rewind;
+                            return Ok(TransitionResult::Io(io));
+                        }
+                        IOResult::Done(()) => {
+                            if cursor.is_empty() {
+                                // Empty table — nothing to compact.
+                                self.compact_seq_state = CompactSeqState::Done;
+                                self.state = CheckpointState::CommitPagerTxn;
+                                return Ok(TransitionResult::Continue);
+                            }
+                            self.compact_seq_state = CompactSeqState::ScanRowid;
+                        }
+                    }
+                }
+                CompactSeqState::ScanRowid => {
+                    let cursor = self.compact_seq_cursor.as_ref().unwrap();
+                    let mut cursor = cursor.write();
+                    match cursor.rowid()? {
+                        IOResult::IO(io) => {
+                            self.compact_seq_state = CompactSeqState::ScanRowid;
+                            return Ok(TransitionResult::Io(io));
+                        }
+                        IOResult::Done(None) => {
+                            // End of table — compute deletes.
+                            let rows = std::mem::take(&mut self.compact_seq_scanned_rows);
+                            self.compact_seq_state = CompactSeqState::ComputeDeletes { rows };
+                        }
+                        IOResult::Done(Some(rowid)) => {
+                            self.compact_seq_state = CompactSeqState::ScanRecord { rowid };
+                        }
+                    }
+                }
+                CompactSeqState::ScanRecord { rowid } => {
+                    let cursor = self.compact_seq_cursor.as_ref().unwrap();
+                    let mut cursor = cursor.write();
+                    match cursor.record()? {
+                        IOResult::IO(io) => {
+                            self.compact_seq_state = CompactSeqState::ScanRecord { rowid };
+                            return Ok(TransitionResult::Io(io));
+                        }
+                        IOResult::Done(None) => {
+                            // No record at this position — skip.
+                            self.compact_seq_state = CompactSeqState::ScanNext;
+                        }
+                        IOResult::Done(Some(record)) => {
+                            // sqlite_sequence has columns: name (TEXT), seq (INTEGER)
+                            if let Ok((name_val, seq_val)) = record.get_two_values(0, 1) {
+                                let name = match name_val {
+                                    ValueRef::Text(t) => t.as_str().to_string(),
+                                    _ => {
+                                        // Unexpected type, skip
+                                        self.compact_seq_state = CompactSeqState::ScanNext;
+                                        continue;
+                                    }
+                                };
+                                let seq = match seq_val {
+                                    ValueRef::Numeric(Numeric::Integer(i)) => i,
+                                    _ => {
+                                        self.compact_seq_state = CompactSeqState::ScanNext;
+                                        continue;
+                                    }
+                                };
+                                self.compact_seq_scanned_rows.push((rowid, name, seq));
+                            }
+                            self.compact_seq_state = CompactSeqState::ScanNext;
+                        }
+                    }
+                }
+                CompactSeqState::ScanNext => {
+                    let cursor = self.compact_seq_cursor.as_ref().unwrap();
+                    let mut cursor = cursor.write();
+                    match cursor.next()? {
+                        IOResult::IO(io) => {
+                            self.compact_seq_state = CompactSeqState::ScanNext;
+                            return Ok(TransitionResult::Io(io));
+                        }
+                        IOResult::Done(()) => {
+                            if !cursor.has_record() {
+                                // End of table.
+                                let rows = std::mem::take(&mut self.compact_seq_scanned_rows);
+                                self.compact_seq_state = CompactSeqState::ComputeDeletes { rows };
+                            } else {
+                                self.compact_seq_state = CompactSeqState::ScanRowid;
+                            }
+                        }
+                    }
+                }
+                CompactSeqState::ComputeDeletes { rows } => {
+                    if rows.len() <= 1 {
+                        // 0 or 1 rows — nothing to compact.
+                        self.compact_seq_state = CompactSeqState::Done;
+                        self.state = CheckpointState::CommitPagerTxn;
+                        return Ok(TransitionResult::Continue);
+                    }
+
+                    // For each name, keep only the most-advanced seq value.
+                    // Ascending sequences (including autoincrement): keep max.
+                    // Descending sequences (negative increment): keep min.
+                    let schema = self.clone_checkpoint_schema();
+                    let mut best_per_name: HashMap<String, (i64, i64)> = HashMap::default();
+                    for (rowid, name, seq) in &rows {
+                        let entry = best_per_name.entry(name.clone()).or_insert((*rowid, *seq));
+                        let is_descending = schema
+                            .get_sequence(name)
+                            .map(|s| s.direction_sign() < 0)
+                            .unwrap_or(false);
+                        let is_better = if is_descending {
+                            // Descending: keep the minimum (most advanced).
+                            *seq < entry.1 || (*seq == entry.1 && *rowid > entry.0)
+                        } else {
+                            // Ascending (default, autoincrement): keep the maximum.
+                            *seq > entry.1 || (*seq == entry.1 && *rowid > entry.0)
+                        };
+                        if is_better {
+                            *entry = (*rowid, *seq);
+                        }
+                    }
+
+                    let best_rowids: HashSet<i64> =
+                        best_per_name.values().map(|(rowid, _)| *rowid).collect();
+                    let rowids_to_delete: Vec<i64> = rows
+                        .iter()
+                        .map(|(rowid, _, _)| *rowid)
+                        .filter(|rowid| !best_rowids.contains(rowid))
+                        .collect();
+
+                    if rowids_to_delete.is_empty() {
+                        self.compact_seq_state = CompactSeqState::Done;
+                        self.state = CheckpointState::CommitPagerTxn;
+                        return Ok(TransitionResult::Continue);
+                    }
+
+                    self.compact_seq_state = CompactSeqState::DeleteSeek {
+                        rowids_to_delete,
+                        delete_idx: 0,
+                    };
+                }
+                CompactSeqState::DeleteSeek {
+                    rowids_to_delete,
+                    delete_idx,
+                } => {
+                    if delete_idx >= rowids_to_delete.len() {
+                        self.compact_seq_state = CompactSeqState::Done;
+                        self.state = CheckpointState::CommitPagerTxn;
+                        return Ok(TransitionResult::Continue);
+                    }
+
+                    let rowid = rowids_to_delete[delete_idx];
+                    let cursor = self.compact_seq_cursor.as_ref().unwrap();
+                    let mut cursor = cursor.write();
+                    let seek_key = SeekKey::TableRowId(rowid);
+                    match cursor.seek(seek_key, SeekOp::GE { eq_only: true })? {
+                        IOResult::IO(io) => {
+                            self.compact_seq_state = CompactSeqState::DeleteSeek {
+                                rowids_to_delete,
+                                delete_idx,
+                            };
+                            return Ok(TransitionResult::Io(io));
+                        }
+                        IOResult::Done(seek_result) => {
+                            if seek_result == SeekResult::Found {
+                                self.compact_seq_state = CompactSeqState::DeleteRow {
+                                    rowids_to_delete,
+                                    delete_idx,
+                                };
+                            } else {
+                                // Row not found (already deleted or never existed) — skip it.
+                                self.compact_seq_state = CompactSeqState::DeleteSeek {
+                                    rowids_to_delete,
+                                    delete_idx: delete_idx + 1,
+                                };
+                            }
+                        }
+                    }
+                }
+                CompactSeqState::DeleteRow {
+                    rowids_to_delete,
+                    delete_idx,
+                } => {
+                    let cursor = self.compact_seq_cursor.as_ref().unwrap();
+                    let mut cursor = cursor.write();
+                    match cursor.delete()? {
+                        IOResult::IO(io) => {
+                            self.compact_seq_state = CompactSeqState::DeleteRow {
+                                rowids_to_delete,
+                                delete_idx,
+                            };
+                            return Ok(TransitionResult::Io(io));
+                        }
+                        IOResult::Done(()) => {
+                            let next_idx = delete_idx + 1;
+                            if next_idx >= rowids_to_delete.len() {
+                                self.compact_seq_state = CompactSeqState::Done;
+                                self.state = CheckpointState::CommitPagerTxn;
+                                return Ok(TransitionResult::Continue);
+                            }
+                            self.compact_seq_state = CompactSeqState::DeleteSeek {
+                                rowids_to_delete,
+                                delete_idx: next_idx,
+                            };
+                        }
+                    }
+                }
+                CompactSeqState::Done => {
+                    self.state = CheckpointState::CommitPagerTxn;
+                    return Ok(TransitionResult::Continue);
+                }
+            }
+        }
+    }
+
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
         match &self.state {
             CheckpointState::AcquireLock => {
@@ -940,8 +1295,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if !self.has_more_rows(write_set_index) {
                     // Done writing all table rows, now process index rows
                     if self.index_write_set.is_empty() {
-                        // No index rows to write, skip to commit
-                        self.state = CheckpointState::CommitPagerTxn;
+                        // No index rows to write, compact sqlite_sequence then commit
+                        self.state = CheckpointState::CompactSqliteSequence;
                     } else {
                         // Start writing index rows
                         self.state = CheckpointState::WriteIndexRow {
@@ -1285,8 +1640,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let requires_seek = *requires_seek;
 
                 if index_write_set_index >= self.index_write_set.len() {
-                    // Done writing all index rows
-                    self.state = CheckpointState::CommitPagerTxn;
+                    // Done writing all index rows, compact sqlite_sequence then commit
+                    self.state = CheckpointState::CompactSqliteSequence;
                     return Ok(TransitionResult::Continue);
                 }
 
@@ -1415,6 +1770,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     }
                 }
             }
+
+            CheckpointState::CompactSqliteSequence => self.step_compact_sqlite_sequence(),
 
             CheckpointState::CommitPagerTxn => {
                 if !self.header_staged_for_commit {

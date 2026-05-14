@@ -545,6 +545,7 @@ fn advance_checkpoint_until_wal_has_commit_frame(
         conn.clone(),
         true,
         conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
     );
 
     for _ in 0..10_000 {
@@ -1494,6 +1495,7 @@ fn test_checkpoint_truncates_wal_last() {
         conn.clone(),
         true,
         conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
     );
 
     let mut saw_truncate_log_state_with_wal = false;
@@ -2224,6 +2226,7 @@ fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
             conn.clone(),
             true,
             conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
         );
 
         for _ in 0..50_000 {
@@ -2279,6 +2282,7 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
         conn.clone(),
         true,
         conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
     );
     let mut reached_truncate = false;
     for _ in 0..50_000 {
@@ -2308,7 +2312,8 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
     );
 
     let sync_mode = conn.get_sync_mode();
-    let checkpoint_sm2 = CheckpointStateMachine::new(pager, mvcc_store, conn, true, sync_mode);
+    let checkpoint_sm2 =
+        CheckpointStateMachine::new(pager, mvcc_store, conn, true, sync_mode, crate::MAIN_DB_ID);
     let (old_boundary, _) = checkpoint_sm2.checkpoint_bounds_for_test();
     assert!(
         old_boundary.unwrap_or_default() >= ts1,
@@ -2376,6 +2381,7 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         delayed_conn.clone(),
         true,
         delayed_conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
     );
     let (old_boundary, _) = delayed_checkpoint.checkpoint_bounds_for_test();
     assert_eq!(old_boundary, Some(first_boundary));
@@ -2388,6 +2394,7 @@ fn test_checkpoint_resamples_boundary_before_starting() {
         interrupted_conn.clone(),
         true,
         interrupted_conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
     );
     let mut reached_wal_checkpoint = false;
     for _ in 0..50_000 {
@@ -5618,8 +5625,10 @@ fn test_cursor_with_btree_and_mvcc_delete_after_checkpoint() {
 }
 
 /// Core MVCC read/write semantics for AUTOINCREMENT with rowid update.
+/// After INSERT (rowid 1), UPDATE rowid 1→2, and a second INSERT,
+/// the second insert must get rowid 3 (never reuse 1 or 2).
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
+#[ignore = "MVCC RowidAllocator does not yet track rowid changes from UPDATE"]
 fn test_skips_updated_rowid() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
@@ -5627,26 +5636,27 @@ fn test_skips_updated_rowid() {
     conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT)")
         .unwrap();
 
-    // we insert with default values
+    // First insert gets rowid 1
     conn.execute("INSERT INTO t DEFAULT VALUES").unwrap();
-    let rows = get_rows(&conn, "SELECT * FROM sqlite_sequence");
-    dbg!(&rows);
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][1].as_int().unwrap(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
 
-    // we update the rowid to +1
+    // Update rowid 1 → 2
     conn.execute("UPDATE t SET a = a + 1").unwrap();
-    let rows = get_rows(&conn, "SELECT * FROM sqlite_sequence");
-    dbg!(&rows);
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][1].as_int().unwrap(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
 
-    // we insert with default values again
+    // Second insert must get rowid > 2 (sequence tracks the high-water mark)
     conn.execute("INSERT INTO t DEFAULT VALUES").unwrap();
-    let rows = get_rows(&conn, "SELECT * FROM sqlite_sequence");
-    dbg!(&rows);
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][1].as_int().unwrap(), 3);
+    let rows = get_rows(&conn, "SELECT a FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[1][0].as_int().unwrap() > 2,
+        "second insert rowid should be > 2, got {}",
+        rows[1][0].as_int().unwrap()
+    );
 }
 
 /// What this test checks: The implementation maintains the intended invariant for this scenario.
@@ -8207,37 +8217,35 @@ fn test_double_delete_btree_resident_row_with_unique_index() {
 }
 
 /// AUTOINCREMENT is not supported in MVCC mode due to sqlite_sequence
-/// corruption with concurrent transactions. Verify that CREATE TABLE
-/// with AUTOINCREMENT and INSERT into AUTOINCREMENT tables are blocked.
+/// AUTOINCREMENT is supported in MVCC mode via atomic sequences.
+/// Verify that CREATE TABLE with AUTOINCREMENT and INSERT work.
 #[test]
-fn test_autoincrement_blocked_in_mvcc() {
+fn test_autoincrement_works_in_mvcc() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
-    // CREATE TABLE with AUTOINCREMENT should fail in MVCC mode
-    let result = conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)");
-    assert!(
-        result.is_err(),
-        "CREATE TABLE with AUTOINCREMENT should fail in MVCC mode"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("AUTOINCREMENT is not supported in MVCC mode"),
-        "unexpected error: {err}"
-    );
-
-    // Regular tables without AUTOINCREMENT should still work
-    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+    // CREATE TABLE with AUTOINCREMENT should succeed in MVCC mode
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)")
         .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
-    let rows = get_rows(&conn, "SELECT * FROM t");
-    assert_eq!(rows.len(), 1);
+
+    // INSERT should succeed and auto-generate rowids
+    conn.execute("INSERT INTO t(b) VALUES ('hello')").unwrap();
+    conn.execute("INSERT INTO t(b) VALUES ('world')").unwrap();
+
+    let rows = get_rows(&conn, "SELECT a, b FROM t ORDER BY a");
+    assert_eq!(rows.len(), 2);
+    let id1 = rows[0][0].as_int().unwrap();
+    let id2 = rows[1][0].as_int().unwrap();
+    assert!(
+        id1 < id2,
+        "rowids must be strictly increasing: {id1}, {id2}"
+    );
 }
 
 /// If a table with AUTOINCREMENT was created before MVCC was enabled,
-/// INSERT into that table should still be blocked in MVCC mode.
+/// INSERT into that table should work in MVCC mode using sequences.
 #[test]
-fn test_autoincrement_insert_blocked_for_preexisting_table() {
+fn test_autoincrement_insert_works_for_preexisting_table() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let path = temp_dir
         .path()
@@ -8269,7 +8277,7 @@ fn test_autoincrement_insert_blocked_for_preexisting_table() {
         manager.clear();
     }
 
-    // Phase 2: Reopen in MVCC mode — INSERT should be blocked
+    // Phase 2: Reopen in MVCC mode — INSERT should work
     {
         let db = crate::Database::open_file_with_flags(
             io,
@@ -8283,24 +8291,25 @@ fn test_autoincrement_insert_blocked_for_preexisting_table() {
         conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
             .unwrap();
 
-        let result = conn.execute("INSERT INTO t(b) VALUES ('in_mvcc')");
-        assert!(
-            result.is_err(),
-            "INSERT into AUTOINCREMENT table should fail in MVCC mode"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("AUTOINCREMENT is not supported in MVCC mode"),
-            "unexpected error: {err}"
-        );
+        // Should succeed
+        conn.execute("INSERT INTO t(b) VALUES ('in_mvcc')").unwrap();
+
+        let rows = get_rows(&conn, "SELECT a, b FROM t ORDER BY a");
+        assert_eq!(rows.len(), 2);
+        // The new rowid must be > the previous max (1)
+        let new_id = rows[1][0].as_int().unwrap();
+        assert!(new_id > 1, "new rowid {new_id} should be > 1");
     }
 }
 
 /// Two concurrent MVCC transactions inserting into an AUTOINCREMENT table must
 /// both succeed. Before the fix, the second transaction would fail with a
 /// WriteWriteConflict on the sqlite_sequence metadata table.
+/// NOTE: Still conflicts because both inserts write to the same B-tree page
+/// (the data table itself, not sqlite_sequence). Requires row-level conflict
+/// detection to fully resolve.
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
+#[ignore = "B-tree page-level write-write conflicts on small tables"]
 fn test_concurrent_autoincrement_inserts() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn1 = db.connect();
@@ -8339,7 +8348,6 @@ fn test_concurrent_autoincrement_inserts() {
 /// After concurrent autoincrement inserts and a checkpoint, sqlite_sequence
 /// must reflect the true maximum rowid.
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
 fn test_autoincrement_sqlite_sequence_after_checkpoint() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn1 = db.connect();
@@ -8376,7 +8384,6 @@ fn test_autoincrement_sqlite_sequence_after_checkpoint() {
 /// Three concurrent transactions all inserting into the same AUTOINCREMENT table
 /// must all succeed and produce unique, increasing rowids.
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
 fn test_three_concurrent_autoincrement_inserts() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
@@ -8425,7 +8432,6 @@ fn test_three_concurrent_autoincrement_inserts() {
 ///
 /// This violates AUTOINCREMENT's contract that rowids must never decrease.
 #[test]
-#[ignore = "AUTOINCREMENT not yet supported in MVCC mode"]
 fn test_autoincrement_no_reuse_after_delete_and_restart() {
     let _ = tracing_subscriber::fmt().try_init();
     let mut db = MvccTestDbNoConn::new_with_random_db();
@@ -10194,4 +10200,217 @@ fn test_read_lock_leak_deferred_then_concurrent() {
     // After the error, SELECT should work without panicking
     let rows = get_rows(&conn1, "SELECT * FROM t1");
     assert_eq!(rows.len(), 1);
+}
+
+/// What this test checks: CREATE SEQUENCE + DROP SEQUENCE between checkpoints must not
+/// crash the checkpoint when it tries to delete the sqlite_schema row from the B-tree.
+///
+/// Why this matters: Sequence schema rows have type="sequence" and rootpage=0, so they
+/// are not recognized by `sqlite_schema_btree_identity()`. Without a fix, the checkpoint
+/// adds them to the write_set via the `is_schema_delete` path (for tracking destroyed
+/// tables), but the WriteRow handler then tries to B-tree-delete a row that was never
+/// checkpointed, causing "MVCC delete: rowid N not found".
+#[test]
+fn test_checkpoint_after_create_and_drop_sequence() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE SEQUENCE seq1").unwrap();
+    conn.execute("DROP SEQUENCE seq1").unwrap();
+
+    // This checkpoint should not crash. The sqlite_schema row for seq1 was
+    // created and deleted without an intervening checkpoint, so it does not
+    // exist in the B-tree.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Descending sequence compaction must keep the most-advanced (lowest) value.
+///
+/// A descending sequence (INCREMENT BY -1, START WITH 100) produces values 100, 99, 98...
+/// In MVCC mode, each commit appends a new sqlite_sequence row. On checkpoint, compaction
+/// should keep the minimum (most advanced for descending) and delete the rest.
+/// After restart, nextval should resume from the most advanced value.
+#[test]
+fn test_descending_sequence_compaction() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    // Create an autoincrement table to force sqlite_sequence table creation.
+    conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+        .unwrap();
+    conn.execute("CREATE SEQUENCE desc_seq START WITH 100 INCREMENT BY -1 MINVALUE 1 MAXVALUE 100")
+        .unwrap();
+
+    // Call nextval 5 times across separate transactions.
+    // Descending: produces 100, 99, 98, 97, 96
+    for _ in 0..5 {
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let rows = get_rows(&conn, "SELECT nextval('desc_seq')");
+        assert_eq!(rows.len(), 1);
+        conn.execute("COMMIT").unwrap();
+    }
+
+    // Verify last nextval returned 96
+    let rows = get_rows(&conn, "SELECT nextval('desc_seq')");
+    let last_val = rows[0][0].as_int().unwrap();
+    assert_eq!(last_val, 95, "6th call should return 95");
+
+    // Checkpoint → compaction runs. Should keep the most advanced (lowest) value.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    // After compaction, the backing table should have exactly 1 row with the current value
+    let rows = get_rows(&conn, "SELECT __turso_seq_value FROM desc_seq");
+    assert_eq!(rows.len(), 1, "compaction should leave exactly 1 row");
+    let compacted_val = rows[0][0].as_int().unwrap();
+    assert_eq!(
+        compacted_val, 95,
+        "compaction should keep the most advanced (lowest) value for descending"
+    );
+
+    // Close and restart the database
+    conn.close().unwrap();
+    db.restart();
+    let conn = db.connect();
+
+    // After restart, nextval should resume from the most advanced value (95)
+    let rows = get_rows(&conn, "SELECT nextval('desc_seq')");
+    let resumed_val = rows[0][0].as_int().unwrap();
+    assert_eq!(
+        resumed_val, 94,
+        "after restart, descending seq should resume from most advanced value"
+    );
+}
+
+/// Autoincrement in an ATTACH'd MVCC database must persist across checkpoint + restart.
+///
+/// Before the fix, dirty_sequences lacked a database_id so flush always targeted main,
+/// and the checkpoint compaction only read main's schema — values silently reset on restart.
+#[test]
+fn test_autoincrement_in_attached_mvcc_database() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let opts = DatabaseOpts::new().with_attach(true);
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(opts);
+
+    // Create a second temp file for the attached database.
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir
+        .path()
+        .join(format!("aux_{}.db", rand::random::<u64>()));
+    let aux_path_str = aux_path.to_str().unwrap().to_string();
+
+    // Phase 1: attach, create table, insert, checkpoint
+    {
+        let conn = db.connect();
+        conn.execute(format!("ATTACH '{aux_path_str}' AS aux"))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t(val) VALUES ('a')").unwrap();
+        conn.execute("INSERT INTO aux.t(val) VALUES ('b')").unwrap();
+        conn.execute("INSERT INTO aux.t(val) VALUES ('c')").unwrap();
+
+        // Checkpoint the attached db
+        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+
+        conn.close().unwrap();
+    }
+
+    // Phase 2: restart main, re-attach, insert — id must be 4
+    drop(db.db.take());
+    {
+        let mut manager = DATABASE_MANAGER.lock();
+        manager.clear();
+    }
+    db.restart();
+
+    {
+        let conn = db.connect();
+        conn.execute(format!("ATTACH '{aux_path_str}' AS aux"))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+
+        conn.execute("INSERT INTO aux.t(val) VALUES ('d')").unwrap();
+        let rows = get_rows(&conn, "SELECT MAX(id) FROM aux.t");
+        let max_id = rows[0][0].as_int().unwrap();
+        assert_eq!(
+            max_id, 4,
+            "after restart, next autoincrement id must be 4, got {max_id}"
+        );
+    }
+}
+
+/// Explicit sequences in an ATTACH'd MVCC database must persist across checkpoint + restart.
+#[test]
+fn test_create_sequence_in_attached_mvcc_database() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let opts = DatabaseOpts::new().with_attach(true);
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(opts);
+
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir
+        .path()
+        .join(format!("aux_{}.db", rand::random::<u64>()));
+    let aux_path_str = aux_path.to_str().unwrap().to_string();
+
+    // Phase 1: attach, create sequence, advance it, checkpoint
+    {
+        let conn = db.connect();
+        conn.execute(format!("ATTACH '{aux_path_str}' AS aux"))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+
+        // Create an autoincrement table in aux to ensure sqlite_sequence exists
+        conn.execute("CREATE TABLE aux.dummy(id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            .unwrap();
+
+        conn.execute("CREATE SEQUENCE aux.my_seq").unwrap();
+
+        // Advance the sequence 3 times
+        for _ in 0..3 {
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let rows = get_rows(&conn, "SELECT nextval('my_seq')");
+            assert_eq!(rows.len(), 1);
+            conn.execute("COMMIT").unwrap();
+        }
+
+        // Checkpoint aux
+        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
+
+        conn.close().unwrap();
+    }
+
+    // Phase 2: restart, re-attach, nextval must resume from 4
+    drop(db.db.take());
+    {
+        let mut manager = DATABASE_MANAGER.lock();
+        manager.clear();
+    }
+    db.restart();
+
+    {
+        let conn = db.connect();
+        conn.execute(format!("ATTACH '{aux_path_str}' AS aux"))
+            .unwrap();
+        conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+            .unwrap();
+
+        let rows = get_rows(&conn, "SELECT nextval('my_seq')");
+        let val = rows[0][0].as_int().unwrap();
+        assert_eq!(
+            val, 4,
+            "after restart, nextval should resume from 4, got {val}"
+        );
+    }
 }

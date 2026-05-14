@@ -1221,12 +1221,6 @@ pub fn translate_create_table(
         }
     }
 
-    if has_autoincrement && connection.mv_store_for_db(database_id).is_some() {
-        bail_parse_error!(
-            "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
-        );
-    }
-
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
 
     let create_btree_label = program.allocate_label();

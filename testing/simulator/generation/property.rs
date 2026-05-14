@@ -30,8 +30,8 @@ use crate::{
     common::print_diff,
     generation::{Shadow, WeightedDistribution, query::QueryDistribution},
     model::{
-        Query, QueryCapabilities, QueryDiscriminants, ReleaseSavepoint, ResultSet,
-        RollbackToSavepoint, Savepoint,
+        CreateSequence, DropSequence, Query, QueryCapabilities, QueryDiscriminants,
+        ReleaseSavepoint, ResultSet, RollbackToSavepoint, Savepoint,
         interactions::{
             Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
@@ -241,6 +241,9 @@ impl Property {
             }
             Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => {
                 unreachable!("No extensional queries")
+            }
+            Property::SequenceMonotonicity { .. } => {
+                unreachable!("No extensional queries for SequenceMonotonicity")
             }
             Property::SelectLimit { .. }
             | Property::SelectSelectOptimizer { .. }
@@ -1233,6 +1236,93 @@ impl Property {
                 interactions.push(assert_integrity_check(tables, connection_index));
                 interactions
             }
+            Property::SequenceMonotonicity {
+                create,
+                num_calls,
+                drop,
+            } => {
+                let mut interactions = Vec::new();
+                // Assumption clears the stack so assertion indices are deterministic
+                let seq_name_clone = create.name.clone();
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Assumption(Assertion::new(
+                        format!("sequence {seq_name_clone} monotonicity precondition"),
+                        move |_: &Vec<ResultSet>, _: &mut SimulatorEnv| Ok(Ok(())),
+                        vec![],
+                    )),
+                ));
+                // CREATE SEQUENCE
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::CreateSequence(create.clone())),
+                ));
+                // N nextval() calls
+                for _ in 0..*num_calls {
+                    interactions.push(InteractionBuilder::with_interaction(
+                        InteractionType::Query(Query::Nextval(crate::model::Nextval {
+                            name: create.name.clone(),
+                        })),
+                    ));
+                }
+                // Assertion: collected nextval results form expected arithmetic sequence
+                let expected_start = create.start;
+                let expected_increment = create.increment;
+                let expected_count = *num_calls;
+                let seq_name = create.name.clone();
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!("sequence {seq_name} should return monotonic values"),
+                    move |stack: &Vec<ResultSet>, _env: &mut SimulatorEnv| {
+                        // The stack contains: CREATE result + N nextval results
+                        // nextval results start at index 1 (index 0 is CREATE)
+                        let mut values = Vec::new();
+                        for (i, result) in stack.iter().enumerate().take(expected_count + 1).skip(1)
+                        {
+                            match result {
+                                Ok(rows) => {
+                                    if rows.len() != 1 || rows[0].len() != 1 {
+                                        return Ok(Err(format!(
+                                            "nextval call {i} returned unexpected shape: {rows:?}",
+                                        )));
+                                    }
+                                    if let Some(v) = rows[0][0].0.as_int() {
+                                        values.push(v);
+                                    } else {
+                                        return Ok(Err(format!(
+                                            "nextval call {i} returned non-integer: {:?}",
+                                            rows[0][0]
+                                        )));
+                                    }
+                                }
+                                Err(e) => {
+                                    return Ok(Err(format!("nextval call {i} failed: {e:?}",)));
+                                }
+                            }
+                        }
+                        // Verify the expected arithmetic sequence
+                        for (idx, val) in values.iter().enumerate() {
+                            let expected = expected_start + (idx as i64) * expected_increment;
+                            if *val != expected {
+                                return Ok(Err(format!(
+                                    "sequence {}: nextval call {} returned {} but expected {} (start={}, increment={})",
+                                    seq_name,
+                                    idx + 1,
+                                    val,
+                                    expected,
+                                    expected_start,
+                                    expected_increment
+                                )));
+                            }
+                        }
+                        Ok(Ok(()))
+                    },
+                    vec![],
+                ));
+                interactions.push(InteractionBuilder::with_interaction(assertion));
+                // DROP SEQUENCE cleanup
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::DropSequence(drop.clone())),
+                ));
+                interactions
+            }
         };
 
         assert!(!interactions.is_empty());
@@ -1887,6 +1977,34 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_sequence_monotonicity<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    _ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    use rand::seq::IndexedRandom;
+
+    let name = format!("seq_{}", rng.random_range(0..10000u32));
+    let increment = *[1i64, 2, 5, 10].choose(rng).unwrap();
+    let start = rng.random_range(1..100i64);
+    let num_calls = rng.random_range(3..8usize);
+    let create = CreateSequence {
+        name: name.clone(),
+        start,
+        increment,
+        min_value: 1,
+        max_value: i64::MAX,
+        cycle: false,
+    };
+    let drop = DropSequence { name };
+    Property::SequenceMonotonicity {
+        create,
+        num_calls,
+        drop,
+    }
+}
+
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -1914,6 +2032,7 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::SequenceMonotonicity => property_sequence_monotonicity,
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -2033,6 +2152,13 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::SequenceMonotonicity => {
+                if !env.profile.mvcc && remaining.create_sequence > 0 {
+                    5
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -2074,6 +2200,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            PropertyDiscriminants::SequenceMonotonicity => QueryCapabilities::SEQUENCE,
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }

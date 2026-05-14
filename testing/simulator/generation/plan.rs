@@ -190,6 +190,7 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                         stats,
                         env.profile.mvcc,
                         &conn_ctx,
+                        env.sequence_names(),
                     );
 
                     let Some(InteractionsType::Property(property)) = self
@@ -361,6 +362,7 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Interactions {
             stats,
             env.profile.mvcc,
             conn_ctx,
+            env.sequence_names(),
         );
 
         let queries = possible_queries(conn_ctx.tables());

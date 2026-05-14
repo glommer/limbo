@@ -1,11 +1,12 @@
 //! Property-based validation for simulation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail};
 use turso_core::{LimboError, Value};
 
+use crate::SequenceParams;
 use crate::elle::{ElleEventType, ElleOp};
 use crate::operations::{OpResult, Operation};
 
@@ -46,6 +47,15 @@ pub trait Property: Send + Sync {
     /// Properties can use this to discard or finalize any pending state that
     /// would otherwise leak across a crash boundary.
     fn abort_fiber(&mut self, _fiber_id: usize, _txn_id: Option<u64>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Called when the database is restarted (all connections closed and reopened).
+    /// `persisted_seq_values` contains (seq_name, value) pairs read from sqlite_sequence
+    /// after the restart, representing what the engine will use as starting points.
+    /// Properties can use this to reset in-flight state and set watermarks.
+    /// Default implementation does nothing.
+    fn on_restart(&mut self, _persisted_seq_values: &HashMap<String, i64>) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -782,6 +792,255 @@ fn nil_reads(ops: &[ElleOp]) -> Vec<ElleOp> {
             other => other.clone(),
         })
         .collect()
+}
+
+/// Property that validates sequence correctness: uniqueness, directionality,
+/// alignment, and rollback resistance.
+pub struct SequenceCorrectnessProperty {
+    /// seq_name -> all values ever returned by nextval
+    all_values: HashMap<String, HashSet<i64>>,
+    /// seq_name -> watermark (highest for ascending, lowest for descending)
+    watermark: HashMap<String, i64>,
+    /// seq_name -> sequence parameters (start, increment)
+    params: HashMap<String, SequenceParams>,
+    /// Values returned by nextval inside transactions that later rolled back.
+    /// Tracked per txn_id: txn_id -> vec of (seq_name, value)
+    pending_txn_values: HashMap<u64, Vec<(String, i64)>>,
+}
+
+impl Default for SequenceCorrectnessProperty {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SequenceCorrectnessProperty {
+    pub fn new() -> Self {
+        Self {
+            all_values: HashMap::new(),
+            watermark: HashMap::new(),
+            params: HashMap::new(),
+            pending_txn_values: HashMap::new(),
+        }
+    }
+}
+
+impl Property for SequenceCorrectnessProperty {
+    fn finish_op(
+        &mut self,
+        _step: usize,
+        _fiber_id: usize,
+        txn_id: Option<u64>,
+        _start_exec_id: u64,
+        _end_exec_id: u64,
+        op: &Operation,
+        result: &OpResult,
+    ) -> anyhow::Result<()> {
+        // Only check on success
+        let Ok(rows) = result else {
+            return Ok(());
+        };
+
+        match op {
+            Operation::CreateSequence {
+                seq_name,
+                start,
+                increment,
+                min_value,
+                max_value,
+                cycle,
+            } => {
+                self.params.insert(
+                    seq_name.clone(),
+                    SequenceParams {
+                        start: *start,
+                        increment: *increment,
+                        min_value: *min_value,
+                        max_value: *max_value,
+                        cycle: *cycle,
+                    },
+                );
+                self.all_values.insert(seq_name.clone(), HashSet::new());
+                // Set initial watermark so first value (start) passes directionality check
+                self.watermark.insert(seq_name.clone(), start - increment);
+            }
+            Operation::DropSequence { seq_name } => {
+                self.all_values.remove(seq_name);
+                self.watermark.remove(seq_name);
+                self.params.remove(seq_name);
+            }
+            Operation::SetVal {
+                seq_name,
+                value,
+                is_called,
+            } => {
+                let Some(params) = self.params.get(seq_name) else {
+                    return Ok(());
+                };
+                // setval resets the sequence position — clear uniqueness
+                // tracking since the sequence can now produce values from
+                // the new position (potentially re-visiting old values).
+                self.all_values.insert(seq_name.clone(), HashSet::new());
+                // If is_called=true, nextval will return value + increment,
+                // so watermark is value. If is_called=false, nextval will
+                // return value itself, so watermark is value - increment.
+                let wm = if *is_called {
+                    *value
+                } else {
+                    *value - params.increment
+                };
+                self.watermark.insert(seq_name.clone(), wm);
+            }
+            Operation::NextVal { seq_name } => {
+                // Extract the i64 value from rows[0][0]
+                let value = rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(|v| v.as_int())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "nextval('{}') returned no integer value: {:?}",
+                            seq_name,
+                            rows
+                        )
+                    })?;
+
+                let Some(params) = self.params.get(seq_name) else {
+                    // Sequence not tracked (created before property was added), skip
+                    return Ok(());
+                };
+
+                // 1. Bounds checking
+                if value < params.min_value || value > params.max_value {
+                    bail!(
+                        "sequence value out of bounds: seq={}, value={}, min={}, max={}",
+                        seq_name,
+                        value,
+                        params.min_value,
+                        params.max_value
+                    );
+                }
+
+                let values = self.all_values.entry(seq_name.clone()).or_default();
+
+                // 2. Uniqueness (only for non-cycling sequences)
+                if !params.cycle && !values.insert(value) {
+                    bail!(
+                        "duplicate sequence value: seq={}, value={}, increment={}",
+                        seq_name,
+                        value,
+                        params.increment
+                    );
+                }
+                if params.cycle {
+                    values.insert(value);
+                }
+
+                // 3. Directionality (skip for cycling sequences — wrap-around breaks monotonicity)
+                if !params.cycle {
+                    if let Some(wm) = self.watermark.get(seq_name) {
+                        if params.increment > 0 && value <= *wm {
+                            bail!(
+                                "sequence went in wrong direction: seq={}, value={}, watermark={}, increment={}",
+                                seq_name,
+                                value,
+                                wm,
+                                params.increment
+                            );
+                        }
+                        if params.increment < 0 && value >= *wm {
+                            bail!(
+                                "sequence went in wrong direction: seq={}, value={}, watermark={}, increment={}",
+                                seq_name,
+                                value,
+                                wm,
+                                params.increment
+                            );
+                        }
+                    }
+                }
+                self.watermark.insert(seq_name.clone(), value);
+
+                // 4. Alignment
+                if (value - params.start) % params.increment != 0 {
+                    bail!(
+                        "sequence value not aligned to increment grid: seq={}, value={}, start={}, increment={}",
+                        seq_name,
+                        value,
+                        params.start,
+                        params.increment
+                    );
+                }
+
+                // 5. Rollback resistance — track values in transactions
+                if let Some(txn_id) = txn_id {
+                    self.pending_txn_values
+                        .entry(txn_id)
+                        .or_default()
+                        .push((seq_name.clone(), value));
+                }
+            }
+            Operation::Rollback => {
+                // Values consumed during a rolled-back transaction must never be reused.
+                // Move them into all_values so they stay "consumed".
+                if let Some(txn_id) = txn_id {
+                    if let Some(values) = self.pending_txn_values.remove(&txn_id) {
+                        for (seq_name, value) in values {
+                            self.all_values.entry(seq_name).or_default().insert(value);
+                        }
+                    }
+                }
+            }
+            Operation::Commit => {
+                // Just clean up pending tracking — values are already in all_values
+                if let Some(txn_id) = txn_id {
+                    self.pending_txn_values.remove(&txn_id);
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn abort_fiber(&mut self, _fiber_id: usize, txn_id: Option<u64>) -> anyhow::Result<()> {
+        if let Some(txn_id) = txn_id {
+            // Treat abort like rollback — consumed values stay consumed
+            if let Some(values) = self.pending_txn_values.remove(&txn_id) {
+                for (seq_name, value) in values {
+                    self.all_values.entry(seq_name).or_default().insert(value);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn on_restart(&mut self, persisted_seq_values: &HashMap<String, i64>) -> anyhow::Result<()> {
+        // Discard pending (uncommitted) transaction state — those transactions
+        // were lost on restart.
+        self.pending_txn_values.clear();
+
+        // Clear uniqueness tracking — after restart, the sequence restarts from
+        // its persisted value and may reissue values from committed-but-
+        // uncheckpointed transactions.
+        for values in self.all_values.values_mut() {
+            values.clear();
+        }
+
+        // Set watermarks from sqlite_sequence so we validate that post-restart
+        // values are monotonically advancing from the persisted state.
+        for (seq_name, params) in &self.params {
+            let wm = if let Some(&persisted) = persisted_seq_values.get(seq_name) {
+                persisted
+            } else {
+                // Sequence has no persisted value — reset to initial position.
+                params.start - params.increment
+            };
+            self.watermark.insert(seq_name.clone(), wm);
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

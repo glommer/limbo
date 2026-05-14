@@ -3,7 +3,7 @@
 use rand_chacha::ChaCha8Rng;
 use turso_core::{LimboError, Value};
 
-use crate::{SamplesContainer, SimulatorFiber, SimulatorState, Stats};
+use crate::{SamplesContainer, SequenceParams, SimulatorFiber, SimulatorState, Stats};
 
 /// Maximum number of keys to remember per table
 const MAX_SAMPLE_KEYS_PER_TABLE: usize = 1000;
@@ -104,6 +104,25 @@ pub enum Operation {
     },
     /// Read a single value from an Elle rw-register key
     ElleRwRead { table_name: String, key: String },
+    /// Create a sequence with specified parameters
+    CreateSequence {
+        seq_name: String,
+        start: i64,
+        increment: i64,
+        min_value: i64,
+        max_value: i64,
+        cycle: bool,
+    },
+    /// Call nextval('seq_name') — returns an integer
+    NextVal { seq_name: String },
+    /// Call setval('seq_name', value, is_called)
+    SetVal {
+        seq_name: String,
+        value: i64,
+        is_called: bool,
+    },
+    /// Drop a sequence
+    DropSequence { seq_name: String },
 }
 pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
 /// Context passed to Operation::start_op and Operation::finish_op.
@@ -184,6 +203,35 @@ impl Operation {
             Operation::ElleRwRead { table_name, key } => {
                 format!("SELECT val FROM {table_name} WHERE key = '{key}'")
             }
+            Operation::CreateSequence {
+                seq_name,
+                start,
+                increment,
+                min_value,
+                max_value,
+                cycle,
+            } => {
+                let cycle_str = if *cycle { " CYCLE" } else { "" };
+                format!(
+                    "CREATE SEQUENCE IF NOT EXISTS {seq_name} START WITH {start} INCREMENT BY {increment} MINVALUE {min_value} MAXVALUE {max_value}{cycle_str}"
+                )
+            }
+            Operation::NextVal { seq_name } => {
+                format!("SELECT nextval('{seq_name}')")
+            }
+            Operation::SetVal {
+                seq_name,
+                value,
+                is_called,
+            } => {
+                format!(
+                    "SELECT setval('{seq_name}', {value}, {})",
+                    if *is_called { "true" } else { "false" }
+                )
+            }
+            Operation::DropSequence { seq_name } => {
+                format!("DROP SEQUENCE IF EXISTS {seq_name}")
+            }
         }
     }
 
@@ -262,6 +310,31 @@ impl Operation {
             }
             Operation::ElleRead { .. } | Operation::ElleRwRead { .. } => {
                 stats.elle_reads += 1;
+            }
+            Operation::CreateSequence {
+                seq_name,
+                start,
+                increment,
+                min_value,
+                max_value,
+                cycle,
+            } => {
+                sim_state.sequences.insert(
+                    seq_name.clone(),
+                    SequenceParams {
+                        start: *start,
+                        increment: *increment,
+                        min_value: *min_value,
+                        max_value: *max_value,
+                        cycle: *cycle,
+                    },
+                );
+            }
+            Operation::DropSequence { seq_name } => {
+                sim_state.sequences.remove(seq_name);
+            }
+            Operation::NextVal { .. } | Operation::SetVal { .. } => {
+                stats.sequence_nextvals += 1;
             }
             _ => {}
         }

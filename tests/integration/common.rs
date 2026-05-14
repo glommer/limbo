@@ -1075,4 +1075,68 @@ mod tests {
 
         Ok(())
     }
+
+    /// Regression test: DROP SEQUENCE previously used ParseSchema with
+    /// where_clause=None (full rescan) which re-encountered existing
+    /// tables via handle_schema_row → add_btree_table → "already exists"
+    /// error. That error leaked auto_commit=false, causing subsequent
+    /// writes to be silently uncommitted. Fixed by removing the invalid
+    /// ParseSchema call and relying on the schema cookie mechanism
+    /// (same pattern as DROP TABLE).
+    #[test]
+    fn test_drop_sequence_with_existing_tables() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_drop_seq_with_tables");
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        // Create a table and a sequence — the table's presence in
+        // sqlite_schema was what triggered the old bug.
+        conn.execute("CREATE TABLE t(x)")?;
+        conn.execute("CREATE SEQUENCE s1")?;
+
+        // DROP SEQUENCE must succeed even with other tables present
+        conn.execute("DROP SEQUENCE s1")?;
+
+        // Writes after DROP SEQUENCE must be committed and visible
+        conn.execute("INSERT INTO t VALUES (42)")?;
+        let conn2 = db.connect_limbo();
+        let rows: Vec<(i64,)> = conn2.exec_rows("SELECT x FROM t");
+        assert_eq!(rows, vec![(42,)]);
+
+        // The sequence must be gone — conn2 sees the updated schema
+        let err = conn2.execute("SELECT nextval('s1')");
+        assert!(err.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sequence_cross_connection_visibility() -> anyhow::Result<()> {
+        let path = TempDir::new()
+            .unwrap()
+            .keep()
+            .join("temp_sequence_cross_conn");
+        let db = TempDatabase::new_with_existent(&path);
+        let conn1 = db.connect_limbo();
+
+        // Conn1 creates sequence
+        conn1.execute("CREATE SEQUENCE cross_seq")?;
+
+        // Conn2 must see it
+        let conn2 = db.connect_limbo();
+        let rows: Vec<(i64,)> = conn2.exec_rows("SELECT nextval('cross_seq')");
+        assert_eq!(rows, vec![(1,)]);
+
+        // Conn1 drops it
+        conn1.execute("DROP SEQUENCE cross_seq")?;
+
+        // Conn2 must get error
+        let err = conn2.execute("SELECT nextval('cross_seq')");
+        assert!(err.is_err());
+
+        Ok(())
+    }
 }

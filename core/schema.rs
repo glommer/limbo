@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, AtomicI64};
+
 use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
@@ -610,6 +612,198 @@ pub fn allow_user_dml(table_name: &str) -> bool {
         || table_name.starts_with(TURSO_INTERNAL_PREFIX)) // internal name wouldn't be uppercase
 }
 
+/// A named sequence — an atomic counter that advances monotonically.
+/// The current value lives outside the btree/WAL system (AtomicI64),
+/// so it advances even on transaction rollback (matching PostgreSQL semantics).
+#[derive(Debug)]
+pub struct Sequence {
+    pub name: String,
+    pub start_value: i64,
+    pub increment_by: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cache: i64,
+    pub cycle: bool,
+    pub current_value: AtomicI64,
+    pub is_called: AtomicBool,
+    /// True when the sequence value has been modified since last persist to sqlite_sequence.
+    pub is_dirty: AtomicBool,
+}
+
+impl Sequence {
+    pub fn new(
+        name: String,
+        start: Option<i64>,
+        increment: Option<i64>,
+        min_value: Option<i64>,
+        max_value: Option<i64>,
+        cache: Option<i64>,
+        cycle: bool,
+    ) -> crate::Result<Self> {
+        let increment_by = increment.unwrap_or(1);
+        if increment_by == 0 {
+            return Err(crate::LimboError::ParseError(
+                "INCREMENT must not be zero".to_string(),
+            ));
+        }
+        let cache_val = cache.unwrap_or(1);
+        if cache_val < 1 {
+            return Err(crate::LimboError::ParseError(format!(
+                "CACHE ({cache_val}) must be greater than zero"
+            )));
+        }
+        let min_val = min_value.unwrap_or(if increment_by > 0 { 1 } else { i64::MIN });
+        let max_val = max_value.unwrap_or(if increment_by > 0 { i64::MAX } else { -1 });
+        if min_val >= max_val {
+            return Err(crate::LimboError::ParseError(format!(
+                "MINVALUE ({min_val}) must be less than MAXVALUE ({max_val})"
+            )));
+        }
+        let start_val = start.unwrap_or(if increment_by > 0 { min_val } else { max_val });
+        if increment_by > 0 && start_val < min_val {
+            return Err(crate::LimboError::ParseError(format!(
+                "START value ({start_val}) cannot be less than MINVALUE ({min_val})"
+            )));
+        }
+        if increment_by < 0 && start_val > max_val {
+            return Err(crate::LimboError::ParseError(format!(
+                "START value ({start_val}) cannot be greater than MAXVALUE ({max_val})"
+            )));
+        }
+        Ok(Self {
+            name,
+            start_value: start_val,
+            increment_by,
+            min_value: min_val,
+            max_value: max_val,
+            cache: cache_val,
+            cycle,
+            current_value: AtomicI64::new(start_val),
+            is_called: AtomicBool::new(false),
+            is_dirty: AtomicBool::new(false),
+        })
+    }
+
+    /// Advance the sequence and return the next value.
+    ///
+    /// NOTE: There is a narrow ABA race between reading `is_called` and `current_value`
+    /// in the CAS loop. In the worst case a concurrent caller may skip one value.
+    /// This is acceptable for sequences (PostgreSQL also doesn't guarantee gap-free).
+    pub fn nextval(&self) -> crate::Result<i64> {
+        use std::sync::atomic::Ordering;
+
+        loop {
+            let current = self.current_value.load(Ordering::SeqCst);
+            let is_called = self.is_called.load(Ordering::SeqCst);
+
+            let next = if !is_called {
+                // First call: return start_value (which is already current_value)
+                current
+            } else {
+                let n = current.checked_add(self.increment_by).ok_or_else(|| {
+                    crate::LimboError::ParseError(format!(
+                        "nextval: reached maximum value of sequence \"{}\"",
+                        self.name
+                    ))
+                })?;
+                // Check bounds
+                if self.increment_by > 0 && n > self.max_value {
+                    if self.cycle {
+                        self.min_value
+                    } else {
+                        return Err(crate::LimboError::ParseError(format!(
+                            "nextval: reached maximum value of sequence \"{}\"",
+                            self.name
+                        )));
+                    }
+                } else if self.increment_by < 0 && n < self.min_value {
+                    if self.cycle {
+                        self.max_value
+                    } else {
+                        return Err(crate::LimboError::ParseError(format!(
+                            "nextval: reached minimum value of sequence \"{}\"",
+                            self.name
+                        )));
+                    }
+                } else {
+                    n
+                }
+            };
+
+            if self
+                .current_value
+                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                self.is_called.store(true, Ordering::SeqCst);
+                self.is_dirty.store(true, Ordering::SeqCst);
+                return Ok(next);
+            }
+            // CAS failed, retry
+        }
+    }
+
+    /// Reset the sequence to a given value.
+    pub fn setval(&self, value: i64, is_called: bool) -> crate::Result<()> {
+        if value < self.min_value || value > self.max_value {
+            return Err(crate::LimboError::ParseError(format!(
+                "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
+                value, self.name, self.min_value, self.max_value
+            )));
+        }
+        use std::sync::atomic::Ordering;
+        self.current_value.store(value, Ordering::SeqCst);
+        self.is_called.store(is_called, Ordering::SeqCst);
+        self.is_dirty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Returns the sign of `increment_by`: 1 for ascending, -1 for descending.
+    pub fn direction_sign(&self) -> i64 {
+        self.increment_by.signum()
+    }
+
+    /// Atomically advance the sequence past the given value if it is "more advanced"
+    /// than the current value (direction-aware). Used by AUTOINCREMENT explicit rowids.
+    pub fn advance_past(&self, value: i64) {
+        use std::sync::atomic::Ordering;
+        let ascending = self.increment_by > 0;
+        loop {
+            let current = self.current_value.load(Ordering::SeqCst);
+            let should_advance = if ascending {
+                value > current
+            } else {
+                value < current
+            };
+            if !should_advance {
+                // Even when value <= current, ensure is_called is set so that
+                // the next nextval() returns current + increment (not current).
+                // This matters when initializing from sqlite_sequence: value ==
+                // current means the sequence was used up to this point.
+                if value == current && !self.is_called.load(Ordering::SeqCst) {
+                    self.is_called.store(true, Ordering::SeqCst);
+                }
+                return;
+            }
+            if self
+                .current_value
+                .compare_exchange(current, value, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                self.is_called.store(true, Ordering::SeqCst);
+                self.is_dirty.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+    }
+
+    /// Mark the sequence as clean (after persisting to sqlite_sequence).
+    pub fn mark_clean(&self) {
+        use std::sync::atomic::Ordering;
+        self.is_dirty.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Type of schema object for conflict checking
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaObjectType {
@@ -658,6 +852,8 @@ pub struct Schema {
     pub generated_columns_enabled: bool,
     /// PostgreSQL catalog tables (only visible in PostgreSQL dialect)
     pub postgres_catalog_tables: HashMap<String, Arc<Table>>,
+    /// Named sequences (CREATE SEQUENCE)
+    pub sequences: HashMap<String, Arc<Sequence>>,
 }
 
 impl Default for Schema {
@@ -793,6 +989,7 @@ impl Schema {
             type_registry,
             generated_columns_enabled: false,
             postgres_catalog_tables,
+            sequences: HashMap::default(),
         })
     }
 
@@ -1759,6 +1956,19 @@ impl Schema {
                         )));
                     }
 
+                    // Detect sequence-backing tables: first column is __turso_seq_value.
+                    // Just add the table (for B-tree access); sequences are created by
+                    // AddSequence at CREATE time or initialize_sequences at open time.
+                    if table
+                        .columns
+                        .first()
+                        .and_then(|c| c.name.as_deref())
+                        .is_some_and(|n| n == "__turso_seq_value")
+                    {
+                        self.add_btree_table(Arc::new(table))?;
+                        return Ok(());
+                    }
+
                     // Check if this is a DBSP state table
                     if table.name.starts_with(DBSP_TABLE_PREFIX) {
                         // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
@@ -1791,7 +2001,30 @@ impl Schema {
                     let mut table = table;
                     table.resolve_custom_type_affinities(self);
                     table.propagate_domain_constraints(self);
+                    let has_autoinc = table.has_autoincrement;
+                    let tbl_name = table.name.clone();
                     self.add_btree_table(Arc::new(table))?;
+
+                    // Create an implicit sequence for AUTOINCREMENT tables.
+                    // This sequence is used in MVCC mode to avoid write-write
+                    // conflicts on the sqlite_sequence B-tree table.
+                    if has_autoinc {
+                        let seq_name = format!("_autoincrement_{tbl_name}");
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            self.sequences.entry(normalize_ident(&seq_name))
+                        {
+                            let seq = Sequence::new(
+                                seq_name.clone(),
+                                Some(1),
+                                Some(1),
+                                None,
+                                None,
+                                None,
+                                false,
+                            )?;
+                            e.insert(Arc::new(seq));
+                        }
+                    }
                 }
             }
             "index" => {
@@ -1960,6 +2193,19 @@ impl Schema {
         };
 
         Ok(())
+    }
+
+    /// Get a sequence by name (case-insensitive).
+    pub fn get_sequence(&self, name: &str) -> Option<&Arc<Sequence>> {
+        self.sequences.get(&normalize_ident(name))
+    }
+
+    /// Remove a sequence and its backing table from the in-memory schema.
+    pub fn remove_sequence(&mut self, name: &str) {
+        let normalized = normalize_ident(name);
+        self.sequences.remove(&normalized);
+        // Also remove the backing table
+        self.tables.remove(&normalized);
     }
 
     /// Compute all resolved FKs *referencing* `table_name` (arg: `table_name` is the parent).
@@ -2254,6 +2500,7 @@ impl Clone for Schema {
             type_registry: self.type_registry.clone(),
             generated_columns_enabled: self.generated_columns_enabled,
             postgres_catalog_tables: self.postgres_catalog_tables.clone(),
+            sequences: self.sequences.clone(),
         }
     }
 }

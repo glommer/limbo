@@ -42,7 +42,7 @@ struct Args {
     /// Number of connections opened inside each worker process in multiprocess mode.
     #[arg(long, default_value_t = 1)]
     connections_per_process: usize,
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.01)]
     reopen_probability: f64,
     /// Max steps
     #[arg(long)]
@@ -350,6 +350,10 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (15, Box::new(DeleteWorkload)),
             (2, Box::new(CreateIndexWorkload)),
             (2, Box::new(DropIndexWorkload)),
+            (5, Box::new(CreateSequenceWorkload)),
+            (15, Box::new(NextValWorkload)),
+            (5, Box::new(SetValWorkload)),
+            (2, Box::new(DropSequenceWorkload)),
             (30, Box::new(BeginWorkload)),
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),
@@ -358,6 +362,7 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
         let p: Vec<Box<dyn Property>> = vec![
             Box::new(IntegrityCheckProperty),
             Box::new(SimpleKeysDoNotDisappear::new()),
+            Box::new(SequenceCorrectnessProperty::new()),
         ];
 
         (w, p, vec![], vec![])
@@ -404,8 +409,12 @@ fn format_stats(stats: &turso_whopper::Stats, elle_mode: bool) -> String {
         format!("{}/{}", stats.elle_writes, stats.elle_reads)
     } else {
         format!(
-            "{}/{}/{}/{}",
-            stats.inserts, stats.updates, stats.deletes, stats.integrity_checks
+            "{}/{}/{}/{}/{}",
+            stats.inserts,
+            stats.updates,
+            stats.deletes,
+            stats.integrity_checks,
+            stats.sequence_nextvals
         )
     }
 }
@@ -415,7 +424,7 @@ fn progress_art(elle_mode: bool) -> [&'static str; 11] {
         if elle_mode {
             "       .             W/R"
         } else {
-            "       .             I/U/D/C"
+            "       .             I/U/D/C/S"
         },
         "       .             ",
         "       .             ",

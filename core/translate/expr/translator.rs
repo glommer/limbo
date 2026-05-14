@@ -1944,9 +1944,14 @@ pub fn translate_expr(
                                 [src_reg <- 0],
                                 Insn::StructField { src_reg, field_index, dest: target_register })
                         }
-                        _ => {
-                            translate_function(program, args, referenced_tables, resolver, target_register, func_ctx)
-                        }
+                        _ => translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
                     }
                 }
                 Func::Math(math_func) => match math_func.arity() {

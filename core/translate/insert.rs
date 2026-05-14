@@ -1,3 +1,4 @@
+use crate::function::{Func, FuncCtx, ScalarFunc};
 use crate::schema::ColumnLayout;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
 use crate::turso_debug_assert;
@@ -65,8 +66,8 @@ use turso_parser::ast::{
 fn validate(
     table_name: &str,
     resolver: &Resolver,
-    table: &Table,
-    database_id: usize,
+    _table: &Table,
+    _database_id: usize,
     conn: &Arc<Connection>,
 ) -> Result<()> {
     // Check if this is a system table that should be protected from direct writes
@@ -80,13 +81,6 @@ fn validate(
     // Check if this is a materialized view
     if resolver.schema().is_materialized_view(table_name) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
-    }
-    if table.btree().is_some_and(|t| t.has_autoincrement)
-        && conn.mv_store_for_db(database_id).is_some()
-    {
-        crate::bail_parse_error!(
-            "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
-        );
     }
     resolver.schema().with_incompatible_dependent_views(table_name, |views| {
     if !views.is_empty() {
@@ -327,7 +321,9 @@ pub fn translate_insert(
         database_id,
     )?;
 
-    if inserting_multiple_rows && btree_table.has_autoincrement {
+    let is_mvcc = connection.mv_store_for_db(database_id).is_some();
+
+    if inserting_multiple_rows && btree_table.has_autoincrement && !is_mvcc {
         ensure_sequence_initialized(program, resolver, &btree_table, database_id)?;
     }
 
@@ -483,7 +479,7 @@ pub fn translate_insert(
 
     let has_user_provided_rowid = ctx.table.has_rowid && insertion.key.is_provided_by_user();
 
-    if ctx.table.has_autoincrement {
+    if ctx.table.has_autoincrement && !is_mvcc {
         init_autoincrement(program, &mut ctx, resolver)?;
     }
 
@@ -643,7 +639,7 @@ pub fn translate_insert(
     program.preassign_label_to_next_insn(ctx.key_labels.key_generation);
 
     if ctx.table.has_rowid {
-        emit_rowid_generation(program, &ctx, &insertion, resolver)?;
+        emit_rowid_generation(program, &ctx, &insertion, resolver, is_mvcc)?;
     }
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
@@ -682,7 +678,16 @@ pub fn translate_insert(
     // before CHECK constraints. SQLite updates sqlite_sequence even when
     // INSERT OR IGNORE skips the row due to a CHECK failure.
     if has_user_provided_rowid {
-        if let Some(AutoincMeta {
+        if is_mvcc && ctx.table.has_autoincrement {
+            // MVCC mode: use AdvanceSequence to update the implicit sequence
+            let seq_name = format!("_autoincrement_{}", ctx.table.name);
+            let seq_name_reg = program.emit_string8_new_reg(seq_name);
+            program.emit_insn(Insn::AdvanceSequence {
+                db: ctx.database_id,
+                seq_name_reg,
+                value_reg: insertion.key_register(),
+            });
+        } else if let Some(AutoincMeta {
             seq_cursor_id,
             r_seq,
             r_seq_rowid,
@@ -1015,45 +1020,47 @@ pub fn translate_insert(
         )?;
     }
 
-    if let Some(AutoincMeta {
-        seq_cursor_id,
-        r_seq,
-        r_seq_rowid,
-        table_name_reg,
-    }) = ctx.autoincrement_meta
-    {
-        reload_autoincrement_state(
-            program,
-            AutoincMeta {
-                seq_cursor_id,
-                r_seq,
-                r_seq_rowid,
-                table_name_reg,
-            },
-        );
-        let no_update_needed_label = program.allocate_label();
-        program.emit_insn(Insn::Le {
-            lhs: insertion.key_register(),
-            rhs: r_seq,
-            target_pc: no_update_needed_label,
-            flags: Default::default(),
-            collation: None,
-        });
-
-        emit_update_sqlite_sequence(
-            program,
-            resolver,
-            ctx.database_id,
+    if !is_mvcc {
+        if let Some(AutoincMeta {
             seq_cursor_id,
+            r_seq,
             r_seq_rowid,
             table_name_reg,
-            insertion.key_register(),
-        )?;
+        }) = ctx.autoincrement_meta
+        {
+            reload_autoincrement_state(
+                program,
+                AutoincMeta {
+                    seq_cursor_id,
+                    r_seq,
+                    r_seq_rowid,
+                    table_name_reg,
+                },
+            );
+            let no_update_needed_label = program.allocate_label();
+            program.emit_insn(Insn::Le {
+                lhs: insertion.key_register(),
+                rhs: r_seq,
+                target_pc: no_update_needed_label,
+                flags: Default::default(),
+                collation: None,
+            });
 
-        program.preassign_label_to_next_insn(no_update_needed_label);
-        program.emit_insn(Insn::Close {
-            cursor_id: seq_cursor_id,
-        });
+            emit_update_sqlite_sequence(
+                program,
+                resolver,
+                ctx.database_id,
+                seq_cursor_id,
+                r_seq_rowid,
+                table_name_reg,
+                insertion.key_register(),
+            )?;
+
+            program.preassign_label_to_next_insn(no_update_needed_label);
+            program.emit_insn(Insn::Close {
+                cursor_id: seq_cursor_id,
+            });
+        }
     }
 
     // Emit update in the CDC table if necessary (after the INSERT updated the table)
@@ -1438,8 +1445,66 @@ fn emit_rowid_generation(
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     resolver: &Resolver,
+    is_mvcc: bool,
 ) -> Result<()> {
-    if let Some(AutoincMeta {
+    if ctx.table.has_autoincrement && is_mvcc {
+        // MVCC mode: use the implicit sequence for conflict-free rowid allocation.
+        let seq_name = format!("_autoincrement_{}", ctx.table.name);
+        let seq_name_reg = program.emit_string8_new_reg(seq_name);
+
+        // Call nextval to get the next rowid from the atomic sequence
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: seq_name_reg,
+            dest: insertion.key_register(),
+            func: FuncCtx {
+                func: Func::Scalar(ScalarFunc::NextVal),
+                arg_count: 1,
+            },
+        });
+
+        // Also factor in the btree max so we don't reuse existing rowids
+        let r_max = program.alloc_register();
+        let dummy_reg = program.alloc_register();
+        program.emit_insn(Insn::NewRowid {
+            cursor: ctx.cursor_id,
+            rowid_reg: dummy_reg,
+            prev_largest_reg: r_max,
+        });
+        program.emit_insn(Insn::MemMax {
+            dest_reg: insertion.key_register(),
+            src_reg: r_max,
+        });
+
+        // Overflow check
+        let no_overflow_label = program.allocate_label();
+        let max_i64_reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            dest: max_i64_reg,
+            value: i64::MAX,
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: insertion.key_register(),
+            rhs: max_i64_reg,
+            target_pc: no_overflow_label,
+            flags: Default::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: crate::error::SQLITE_FULL,
+            description: "database or disk is full".to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(no_overflow_label);
+
+        // Advance the sequence past the chosen key so subsequent calls skip it
+        program.emit_insn(Insn::AdvanceSequence {
+            db: ctx.database_id,
+            seq_name_reg,
+            value_reg: insertion.key_register(),
+        });
+    } else if let Some(AutoincMeta {
         r_seq,
         seq_cursor_id,
         r_seq_rowid,

@@ -509,6 +509,9 @@ pub enum ScalarFunc {
     PgGetFunctionArguments,
     PgFunctionIsVisible,
     PgTypeIsVisible,
+    NextVal,
+    CurrVal,
+    SetVal,
     Lpad,
     Rpad,
     StatInit,
@@ -707,6 +710,7 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::PgInputIsValid
             | ScalarFunc::BoolEq
             | ScalarFunc::BoolNe => true,
+            ScalarFunc::NextVal | ScalarFunc::CurrVal | ScalarFunc::SetVal => false,
         }
     }
 }
@@ -811,6 +815,9 @@ impl Display for ScalarFunc {
             Self::PgGetFunctionArguments => "pg_get_function_arguments",
             Self::PgFunctionIsVisible => "pg_function_is_visible",
             Self::PgTypeIsVisible => "pg_type_is_visible",
+            Self::NextVal => "nextval",
+            Self::CurrVal => "currval",
+            Self::SetVal => "setval",
             Self::Lpad => "lpad",
             Self::Rpad => "rpad",
             Self::StatInit => "stat_init",
@@ -1029,6 +1036,9 @@ impl ScalarFunc {
             | Self::PgInputIsValid
             | Self::BoolEq
             | Self::BoolNe => &[2],
+            // Sequence functions
+            Self::NextVal | Self::CurrVal => &[1],
+            Self::SetVal => &[2, 3],
         }
     }
 
@@ -1417,6 +1427,9 @@ impl Func {
             }
             "pg_function_is_visible" => Ok(Some(Self::Scalar(ScalarFunc::PgFunctionIsVisible))),
             "pg_type_is_visible" => Ok(Some(Self::Scalar(ScalarFunc::PgTypeIsVisible))),
+            "nextval" => Ok(Some(Self::Scalar(ScalarFunc::NextVal))),
+            "currval" => Ok(Some(Self::Scalar(ScalarFunc::CurrVal))),
+            "setval" => Ok(Some(Self::Scalar(ScalarFunc::SetVal))),
             "lpad" => Ok(Some(Self::Scalar(ScalarFunc::Lpad))),
             "rpad" => Ok(Some(Self::Scalar(ScalarFunc::Rpad))),
             "gcd" => Ok(Some(Self::Scalar(ScalarFunc::Gcd))),

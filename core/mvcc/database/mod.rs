@@ -1977,6 +1977,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         self.connection.clone(),
                         false,
                         self.connection.get_sync_mode(),
+                        self.db_id,
                     ));
                     let state_machine = Mutex::new(state_machine);
                     self.state = CommitState::Checkpoint { state_machine };

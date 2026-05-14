@@ -1308,6 +1308,35 @@ pub enum Insn {
         /// The name of the type being dropped
         type_name: String,
     },
+    /// Add a fully-configured sequence to the in-memory schema.
+    /// Emitted by CREATE SEQUENCE after ParseSchema has added the backing table.
+    AddSequence {
+        db: usize,
+        name: String,
+        start: i64,
+        increment: i64,
+        min_value: i64,
+        max_value: i64,
+        cache: i64,
+        cycle: bool,
+    },
+    /// Drop a sequence from the in-memory schema
+    DropSequence {
+        /// The database within which this sequence needs to be dropped
+        db: usize,
+        /// The name of the sequence being dropped
+        seq_name: String,
+    },
+    /// Advance an autoincrement sequence past the given value (direction-aware).
+    /// Used when an explicit rowid is provided for an AUTOINCREMENT table.
+    AdvanceSequence {
+        /// The database index
+        db: usize,
+        /// Register containing the sequence name (text)
+        seq_name_reg: usize,
+        /// Register containing the value to advance past
+        value_reg: usize,
+    },
     /// Add a custom type to the in-memory schema by parsing its CREATE TYPE SQL
     AddType {
         /// The database within which this type needs to be added
@@ -1937,6 +1966,9 @@ impl InsnVariants {
             InsnVariants::DropTable => execute::op_drop_table,
             InsnVariants::DropTrigger => execute::op_drop_trigger,
             InsnVariants::DropType => execute::op_drop_type,
+            InsnVariants::AddSequence => execute::op_add_sequence,
+            InsnVariants::DropSequence => execute::op_drop_sequence,
+            InsnVariants::AdvanceSequence => execute::op_advance_sequence,
             InsnVariants::AddType => execute::op_add_type,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
@@ -2049,6 +2081,9 @@ impl Insn {
             | Self::DropIndex { .. }
             | Self::DropTrigger { .. }
             | Self::DropType { .. }
+            | Self::AddSequence { .. }
+            | Self::DropSequence { .. }
+            | Self::AdvanceSequence { .. }
             | Self::AddType { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
