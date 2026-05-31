@@ -13233,3 +13233,65 @@ fn test_global_header_regression_would_lose_committed_user_version() {
         "older out-of-order FinalizeCommit regressed committed PRAGMA user_version"
     );
 }
+
+/// Deterministic reproducer for Bug 3: CREATE INDEX exclusive acquisition race.
+///
+/// Reproduces the scenario where:
+/// 1. CREATE INDEX begins exclusive transaction acquisition
+/// 2. Concurrent writer commits during the acquisition window (before compare_exchange)
+/// 3. CREATE INDEX completes acquisition and backfills index at snapshot that misses concurrent row
+/// 4. Later operations fail because index is incomplete
+#[test]
+fn test_bug3_create_index_exclusive_acquisition_race() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    // Setup table with initial row
+    let conn_setup = db.connect();
+    conn_setup.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    conn_setup.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    conn_setup.close().unwrap();
+
+    let conn_a = db.connect(); // Concurrent writer
+    let conn_b = db.connect(); // CREATE INDEX
+
+    // Start concurrent writer transaction
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+
+    // Start CREATE INDEX transaction with read to establish begin_ts
+    conn_b.execute("BEGIN DEFERRED").unwrap();
+    let mut sel = conn_b.prepare("SELECT COUNT(*) FROM t").unwrap();
+    sel.run_ignore_rows().unwrap();
+    drop(sel);
+
+    // Execute concurrently to hit the race window
+    // The test yield in acquire_exclusive_tx creates the precise timing needed
+    std::thread::scope(|s| {
+        // CREATE INDEX will yield during exclusive acquisition
+        let handle_b = s.spawn(|| {
+            conn_b.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+            conn_b.execute("COMMIT").unwrap();
+        });
+
+        // Concurrent writer commits during the yield window
+        let handle_a = s.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            conn_a.execute("COMMIT").unwrap();
+        });
+
+        handle_b.join().unwrap();
+        handle_a.join().unwrap();
+    });
+
+    // Attempt operation that should fail due to incomplete index
+    let conn_c = db.connect();
+    let result = conn_c.execute("DELETE FROM t WHERE id = 2");
+
+    match &result {
+        Err(crate::LimboError::Corrupt(msg)) if msg.contains("IdxDelete") => {
+            // Bug 3 reproduced - index is incomplete
+        }
+        Ok(_) => panic!("DELETE should have failed due to incomplete index"),
+        Err(e) => panic!("Unexpected error: {:?}", e),
+    }
+}

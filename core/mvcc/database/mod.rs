@@ -4767,6 +4767,17 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 return Err(LimboError::Busy);
             }
         }
+
+        // Bug 3 test yield point: allows concurrent transactions to commit between
+        // the timestamp safeguard check and compare_exchange. This reproduces the race
+        // where the safeguard passes but a concurrent transaction commits before
+        // the exclusive lock is acquired, leading to an incomplete index.
+        #[cfg(test)]
+        {
+            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
         match self.exclusive_tx.compare_exchange(
             NO_EXCLUSIVE_TX,
             *tx_id,
