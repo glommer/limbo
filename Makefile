@@ -3,27 +3,18 @@ CURRENT_RUST_VERSION := $(shell rustc -V | sed -E 's/rustc ([0-9]+\.[0-9]+\.[0-9
 CURRENT_RUST_TARGET := $(shell rustc -vV | grep host | cut -d ' ' -f 2)
 RUSTUP := $(shell command -v rustup 2> /dev/null)
 UNAME_S := $(shell uname -s)
+MINIMUM_TCL_VERSION := 8.6
 
 # Executable used to execute the compatibility tests.
-SQLITE_EXEC ?= ./target/debug/limbo
+SQLITE_EXEC ?= scripts/limbo-sqlite3
+RUST_LOG := off
 
-# Static library to use for SQLite C API compatibility tests.
-BASE_SQLITE_LIB = ./target/$(CURRENT_RUST_TARGET)/debug/liblimbo_sqlite3.a
-# Static library headers to use for SQLITE C API compatibility tests
-BASE_SQLITE_LIB_HEADERS = ./target/$(CURRENT_RUST_TARGET)/debug/include/limbo_sqlite3
-
-
-# On darwin link core foundation
-ifeq ($(UNAME_S),Darwin)
-    SQLITE_LIB ?= ../../$(BASE_SQLITE_LIB) -framework CoreFoundation
-else
-    SQLITE_LIB ?= ../../$(BASE_SQLITE_LIB)
-endif
-
-SQLITE_LIB_HEADERS ?= ../../$(BASE_SQLITE_LIB_HEADERS)
-
-all: check-rust-version check-wasm-target limbo limbo-wasm
+all: check-rust-version build 
 .PHONY: all
+
+install-sqlite:
+	./scripts/install-sqlite3.sh
+.PHONY: install-sqlite
 
 check-rust-version:
 	@echo "Checking Rust version..."
@@ -41,38 +32,216 @@ check-rust-version:
 	fi
 .PHONY: check-rust-version
 
-check-wasm-target:
-	@echo "Checking wasm32-wasi target..."
-	@if ! rustup target list | grep -q "wasm32-wasi (installed)"; then \
-		echo "Installing wasm32-wasi target..."; \
-		rustup target add wasm32-wasi; \
-	fi
-.PHONY: check-wasm-target
+check-tcl-version:
+	@printf '%s\n' \
+		'set need "$(MINIMUM_TCL_VERSION)"' \
+		'set have [info patchlevel]' \
+		'if {[package vcompare $$have $$need] < 0} {' \
+		'    puts stderr "tclsh $$have found — need $$need+"' \
+		'    exit 1' \
+		'}' \
+	| tclsh
+.PHONY: check-tcl-version
 
-limbo:
+build: check-rust-version
 	cargo build
-.PHONY: limbo
+.PHONY: build
 
-limbo-c:
+turso-c:
 	cargo cbuild
-.PHONY: limbo-c
+.PHONY: turso-c
 
-limbo-wasm:
-	rustup target add wasm32-wasi
-	cargo build --package limbo-wasm --target wasm32-wasi
-.PHONY: limbo-wasm
+uv-sync:
+	uv sync --all-packages
+.PHONE: uv-sync
 
-test: limbo test-compat test-sqlite3 test-shell
+uv-sync-test:
+	uv sync --all-extras --dev --package turso_test
+.PHONE: uv-sync
+
+test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-runner test-runner-js test-runner-cli
 .PHONY: test
 
-test-shell: limbo
-	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/shelltests.py
+test-runner:
+	@make -C testing/sqltests run
+.PHONY: test-runner
+
+test-runner-js:
+	@make -C testing/sqltests run-js
+.PHONY: test-runner-js
+
+test-runner-cli:
+	@make -C testing/sqltests run-cli
+.PHONY: test-runner-cli
+
+test-extensions: build uv-sync-test
+	RUST_LOG=$(RUST_LOG) uv run --project limbo_test test-extensions
+.PHONY: test-extensions
+
+test-shell: build uv-sync-test
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-shell
 .PHONY: test-shell
 
-test-compat:
-	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/all.test
+test-compat: check-tcl-version
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/system/all.test
+
+test-single: check-tcl-version
+	@if [ -z "$(TEST)" ]; then \
+		echo "Usage: make test-single TEST=path/to/test.test"; \
+		exit 1; \
+	fi
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/system/$(TEST)
+.PHONY: test-single
 .PHONY: test-compat
 
-test-sqlite3: limbo-c
-	LIBS="$(SQLITE_LIB)" HEADERS="$(SQLITE_LIB_HEADERS)" make -C sqlite3/tests test
+reset-db:
+	./scripts/clone_test_db.sh
+.PHONY: reset-db
+
+test-fuzz:
+	RUST_LOG=$(RUST_LOG) cargo test -p core_tester --release -- fuzz
+	RUST_LOG=$(RUST_LOG) cargo run -p differential-fuzzer --bin custom_types_fuzzer -- --seed $(or $(SEED), $$(date +%s)) -n $(or $(N),200) -t $(or $(TABLES),2)
+.PHONY: test-fuzz
+
+test-sqlite3: reset-db
+	cargo test -p turso_sqlite3 --test compat -- --test-threads=1
+	./scripts/clone_test_db.sh
+	cargo test -p turso_sqlite3 --test compat --features sqlite3 -- --test-threads=1
 .PHONY: test-sqlite3
+
+test-memory: build uv-sync-test
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-memory
+.PHONY: test-memory
+
+test-write: build uv-sync-test
+	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
+		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-write; \
+	else \
+		echo "Skipping test-write: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
+	fi
+.PHONY: test-write
+
+test-update: build uv-sync-test
+	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
+		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-update; \
+	else \
+		echo "Skipping test-update: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
+	fi
+.PHONY: test-update
+
+test-collate: build uv-sync-test
+	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
+		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-collate; \
+	else \
+		echo "Skipping test-collate: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
+	fi
+.PHONY: test-collate
+
+test-constraint: build uv-sync-test
+	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
+		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-constraint; \
+	else \
+		echo "Skipping test-constraint: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
+	fi
+.PHONY: test-constraint
+
+test-multiprocess:
+	cargo run --release -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01
+.PHONY: test-multiprocess
+
+WHOPPER_ARGS ?=
+WHOPPER_RUNS ?=
+
+whopper-coverage:
+	./testing/concurrent-simulator/bin/coverage "$(WHOPPER_RUNS)" $(WHOPPER_ARGS)
+.PHONY: whopper-coverage
+
+bench-vfs: uv-sync-test build-release
+	RUST_LOG=$(RUST_LOG) uv run --project limbo_test bench-vfs "$(SQL)" "$(N)"
+
+bench-sqlite: uv-sync-test build-release
+	RUST_LOG=$(RUST_LOG) uv run --project limbo_test bench-sqlite "$(VFS)" "$(SQL)" "$(N)"
+
+clickbench:
+	./perf/clickbench/benchmark.sh
+.PHONY: clickbench
+
+build-release: check-rust-version
+	cargo build --bin tursodb --release --features=tracing_release
+
+bench-exclude-tpc-h:
+	@benchmarks=$$(cargo bench --bench 2>&1 | grep -A 1000 '^Available bench targets:' | grep -v '^Available bench targets:' | grep -v '^ *$$' | grep -v 'tpc_h_benchmark' | xargs -I {} printf -- "--bench %s " {}); \
+	if [ -z "$$benchmarks" ]; then \
+		echo "No benchmarks found (excluding tpc_h_benchmark)."; \
+		exit 1; \
+	else \
+		cargo bench $$benchmarks --features bench; \
+	fi
+.PHONY: bench-exclude-tpc-h
+
+codspeed-build-bench-exclude-tpc-h:
+	@benchmarks=$$(cargo bench --bench 2>&1 | grep -A 1000 '^Available bench targets:' | grep -v '^Available bench targets:' | grep -v '^ *$$' | grep -v 'tpc_h_benchmark' | xargs -I {} printf -- "--bench %s " {}); \
+	if [ -z "$$benchmarks" ]; then \
+		echo "No benchmarks found (excluding tpc_h_benchmark)."; \
+		exit 1; \
+	else \
+		cargo codspeed build $$benchmarks --features codspeed; \
+	fi
+.PHONY: codspeed-build-bench-exclude-tpc-h
+
+docker-cli-build:
+	docker build -f Dockerfile.cli -t turso-cli .
+
+docker-cli-run:
+	docker run -it -v ./:/app turso-cli
+
+bench-tpc-c:
+	@cd perf/tpc-c/tpcc-turso && ./run_bench.sh
+.PHONY: bench-tpc-c
+
+merge-pr:
+ifndef PR
+	$(error PR is required. Usage: make merge-pr PR=123)
+endif
+	@echo "Setting up environment for PR merge..."
+	@if [ -z "$(GITHUB_REPOSITORY)" ]; then \
+		REPO=$$(git remote get-url origin | sed -E 's|.*github\.com[:/]([^/]+/[^/]+?)(\.git)?$$|\1|'); \
+		if [ -z "$$REPO" ]; then \
+			echo "Error: Could not detect repository from git remote"; \
+			exit 1; \
+		fi; \
+		export GITHUB_REPOSITORY="$$REPO"; \
+	else \
+		export GITHUB_REPOSITORY="$(GITHUB_REPOSITORY)"; \
+	fi; \
+	echo "Repository: $$REPO"; \
+	AUTH=$$(gh auth status); \
+	if [ -z "$$AUTH" ]; then \
+		echo "auth: $$AUTH"; \
+		echo "GitHub CLI not authenticated. Starting login process..."; \
+		gh auth login --scopes repo,workflow; \
+	else \
+		if ! echo "$$AUTH" | grep -q "workflow"; then \
+			echo "Warning: 'workflow' scope not detected. You may need to re-authenticate if merging PRs with workflow changes."; \
+			echo "Run: gh auth refresh -s repo,workflow"; \
+		fi; \
+	fi; \
+	if [ "$(LOCAL)" = "1" ]; then \
+	    echo "merging PR #$(PR) locally"; \
+		uv run scripts/merge-pr.py $(PR) --local; \
+	else \
+	    echo "merging PR #$(PR) on GitHub"; \
+		uv run scripts/merge-pr.py $(PR); \
+	fi
+
+.PHONY: merge-pr
+
+sim-schema: 
+	mkdir -p  simulator/configs/custom
+	cargo run -p limbo_sim -- print-schema > simulator/configs/custom/profile-schema.json
+
+test-shuttle:
+	RUSTFLAGS='--cfg tokio_unstable --cfg shuttle' cargo nextest run --profile shuttle --package turso_core
+
+test-loom:
+	RUSTFLAGS='--cfg tokio_unstable --cfg loom' cargo nextest run --profile loom --package turso_core

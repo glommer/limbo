@@ -1,6 +1,5 @@
-mod connection;
-mod cursor;
 mod errors;
-mod limbo_db;
-mod macros;
+mod turso_connection;
+mod turso_db;
+mod turso_statement;
 mod utils;

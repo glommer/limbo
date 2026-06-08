@@ -1,106 +1,117 @@
-use crate::{Completion, File, LimboError, OpenFlags, Result, IO};
-use log::trace;
-use std::cell::RefCell;
+use crate::error::io_error;
+use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
+use crate::{Clock, Completion, File, OpenFlags, Result, IO};
+use crate::sync::RwLock;
 use std::io::{Read, Seek, Write};
-use std::rc::Rc;
-
+use crate::sync::Arc;
+use tracing::{debug, instrument, trace, Level};
 pub struct GenericIO {}
 
 impl GenericIO {
     pub fn new() -> Result<Self> {
+        debug!("Using IO backend 'syscall'");
         Ok(Self {})
     }
 }
 
 impl IO for GenericIO {
-    fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Rc<dyn File>> {
+    #[instrument(skip_all, level = Level::TRACE)]
+    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(matches!(flags, OpenFlags::Create))
-            .open(path)?;
-        Ok(Rc::new(GenericFile {
-            file: RefCell::new(file),
+        let mut file = std::fs::File::options();
+        file.read(true);
+
+        if !flags.contains(OpenFlags::ReadOnly) {
+            file.write(true);
+            file.create(flags.contains(OpenFlags::Create));
+        }
+
+        let file = file.open(path).map_err(|e| io_error(e, "open"))?;
+        Ok(Arc::new(GenericFile {
+            file: RwLock::new(file),
         }))
     }
 
-    fn run_once(&self) -> Result<()> {
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn remove_file(&self, path: &str) -> Result<()> {
+        trace!("remove_file(path = {})", path);
+        std::fs::remove_file(path).map_err(|e| io_error(e, "remove_file"))?;
         Ok(())
     }
 
-    fn generate_random_number(&self) -> i64 {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
-        i64::from_ne_bytes(buf)
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn step(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Clock for GenericIO {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
     }
 
-    fn get_current_time(&self) -> String {
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 
 pub struct GenericFile {
-    file: RefCell<std::fs::File>,
+    file: RwLock<std::fs::File>,
 }
 
 impl File for GenericFile {
-    // Since we let the OS handle the locking, file locking is not supported on the generic IO implementation
-    // No-op implementation allows compilation but provides no actual file locking.
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         Ok(())
     }
 
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn unlock_file(&self) -> Result<()> {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Rc<Completion>) -> Result<()> {
-        let mut file = self.file.borrow_mut();
-        file.seek(std::io::SeekFrom::Start(pos as u64))?;
-        {
-            let r = match c.as_ref() {
-                Completion::Read(r) => r,
-                _ => unreachable!(),
-            };
-            let mut buf = r.buf_mut();
+    #[instrument(skip(self, c), level = Level::TRACE)]
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+        let mut file = self.file.write();
+        file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| io_error(e, "pread"))?;
+        let nr = {
+            let r = c.as_read();
+            let buf = r.buf();
             let buf = buf.as_mut_slice();
-            file.read_exact(buf)?;
-        }
-        c.complete(0);
-        Ok(())
+            file.read(buf).map_err(|e| io_error(e, "pread"))? as i32
+        };
+        c.complete(nr);
+        Ok(c)
     }
 
-    fn pwrite(
-        &self,
-        pos: usize,
-        buffer: Rc<RefCell<crate::Buffer>>,
-        c: Rc<Completion>,
-    ) -> Result<()> {
-        let mut file = self.file.borrow_mut();
-        file.seek(std::io::SeekFrom::Start(pos as u64))?;
-        let buf = buffer.borrow();
-        let buf = buf.as_slice();
-        file.write_all(buf)?;
-        c.complete(buf.len() as i32);
-        Ok(())
+    #[instrument(skip(self, c, buffer), level = Level::TRACE)]
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
+        let mut file = self.file.write();
+        file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| io_error(e, "pwrite"))?;
+        let buf = buffer.as_slice();
+        file.write_all(buf).map_err(|e| io_error(e, "pwrite"))?;
+        c.complete(buffer.len() as i32);
+        Ok(c)
     }
 
-    fn sync(&self, c: Rc<Completion>) -> Result<()> {
-        let mut file = self.file.borrow_mut();
-        file.sync_all().map_err(|err| LimboError::IOError(err))?;
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
+        let file = self.file.write();
+        file.sync_all().map_err(|e| io_error(e, "sync"))?;
         c.complete(0);
-        Ok(())
+        Ok(c)
+    }
+
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        let file = self.file.write();
+        file.set_len(len).map_err(|e| io_error(e, "truncate"))?;
+        c.complete(0);
+        Ok(c)
     }
 
     fn size(&self) -> Result<u64> {
-        let file = self.file.borrow();
-        Ok(file.metadata().unwrap().len())
-    }
-}
-
-impl Drop for GenericFile {
-    fn drop(&mut self) {
-        self.unlock_file().expect("Failed to unlock file");
+        let file = self.file.read();
+        Ok(file.metadata().map_err(|e| io_error(e, "metadata"))?.len())
     }
 }

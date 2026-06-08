@@ -9,7 +9,7 @@
 //! The instruction set of the VDBE is similar to SQLite's instruction set,
 //! but with the exception that bytecodes that perform I/O operations are
 //! return execution back to the caller instead of blocking. This is because
-//! Limbo is designed for applications that need high concurrency such as
+//! Turso is designed for applications that need high concurrency such as
 //! serverless runtimes. In addition, asynchronous I/O makes storage
 //! disaggregation easier.
 //!
@@ -17,46 +17,97 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+use crate::translate::plan::BitSet;
+use crate::types::{Extendable, Text};
+use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
+pub mod affinity;
+pub mod array;
+pub mod bloom_filter;
 pub mod builder;
-mod datetime;
+pub mod execute;
 pub mod explain;
+#[allow(dead_code)]
+pub mod hash_table;
 pub mod insn;
-pub mod likeop;
+pub mod metrics;
+pub mod rowset;
 pub mod sorter;
-
-use crate::error::{LimboError, SQLITE_CONSTRAINT_PRIMARYKEY};
-#[cfg(feature = "uuid")]
-use crate::ext::{exec_ts_from_uuid7, exec_uuid, exec_uuidblob, exec_uuidstr, ExtFunc, UuidFunc};
-use crate::function::{AggFunc, FuncCtx, MathFunc, MathFuncArity, ScalarFunc};
-use crate::pseudo::PseudoCursor;
-use crate::result::LimboResult;
-use crate::schema::Table;
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
-use crate::storage::{btree::BTreeCursor, pager::Pager};
-use crate::types::{
-    AggContext, Cursor, CursorResult, OwnedRecord, OwnedValue, Record, SeekKey, SeekOp,
-};
-use crate::util::parse_schema_rows;
-use crate::vdbe::insn::Insn;
-#[cfg(feature = "json")]
+pub mod vacuum;
+pub mod value;
+// for benchmarks
+pub use crate::translate::collate::CollationSeq;
 use crate::{
-    function::JsonFunc, json::get_json, json::json_array, json::json_array_length,
-    json::json_arrow_extract, json::json_arrow_shift_extract, json::json_extract, json::json_type,
+    error::LimboError,
+    function::FuncCtx,
+    mvcc::{database::CommitStateMachine, MvccClock},
+    numeric::Numeric,
+    return_if_io,
+    schema::Trigger,
+    state_machine::StateMachine,
+    translate::plan::TableReferences,
+    types::{IOCompletions, IOResult},
+    vdbe::{
+        execute::{
+            OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
+            OpIdxInsertState, OpInitCdcVersionState, OpInsertState, OpInsertSubState,
+            OpJournalModeState, OpNewRowidState, OpNoConflictState, OpParseSchemaState,
+            OpProgramState, OpRowIdState, OpSeekState, OpTransactionState, VacuumIntoOpContext,
+        },
+        hash_table::HashTable,
+        metrics::StatementMetrics,
+        vacuum::VacuumInPlaceOpContext,
+    },
+    ValueRef, WalAutoActions,
 };
-use crate::{Connection, Result, Rows, TransactionState, DATABASE_VERSION};
-use datetime::{exec_date, exec_datetime_full, exec_julianday, exec_time, exec_unixepoch};
-use insn::{
-    exec_add, exec_bit_and, exec_bit_not, exec_bit_or, exec_divide, exec_multiply, exec_remainder,
-    exec_subtract,
+use smallvec::SmallVec;
+
+#[cfg(feature = "json")]
+use crate::json::JsonCacheCell;
+use crate::sync::RwLock;
+use crate::{
+    storage::pager::Pager,
+    translate::plan::ResultSetColumn,
+    types::{AggContext, Cursor, ImmutableRecord, Value},
+    vdbe::{builder::CursorType, insn::Insn},
 };
-use likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape};
-use rand::distributions::{Distribution, Uniform};
-use rand::{thread_rng, Rng};
-use regex::{Regex, RegexBuilder};
-use std::borrow::{Borrow, BorrowMut};
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
-use std::rc::{Rc, Weak};
+use crate::{
+    AtomicBool, CaptureDataChangesInfo, Connection, MvStore, Result, Statement, SyncMode,
+    TransactionState,
+};
+use branches::{mark_unlikely, unlikely};
+use builder::{CursorKey, QueryMode};
+use execute::{
+    InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
+    OpOpenEphemeralState,
+};
+use turso_parser::ast::ResolveType;
+
+use crate::io::TempFile;
+use crate::vdbe::bloom_filter::BloomFilter;
+use crate::vdbe::rowset::RowSet;
+use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
+use std::{
+    collections::HashMap,
+    num::NonZero,
+    ops::Deref,
+    sync::{
+        atomic::{AtomicI64, AtomicIsize, Ordering},
+        Arc,
+    },
+    task::Waker,
+};
+use tracing::{instrument, Level};
+
+/// State machine for committing view deltas with I/O handling
+#[derive(Debug, Clone)]
+pub enum ViewDeltaCommitState {
+    NotStarted,
+    Processing {
+        views: Vec<String>, // view names (all materialized views have storage)
+        current_index: usize,
+    },
+    Done,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Represents a target for a jump instruction.
@@ -64,8 +115,9 @@ use std::rc::{Rc, Weak};
 pub enum BranchOffset {
     /// A label is a named location in the program.
     /// If there are references to it, it must always be resolved to an Offset
-    /// via program.resolve_label().
-    Label(i32),
+    /// via `ProgramBuilder::preassign_label_to_next_insn` or
+    /// `ProgramBuilder::link_label_to_other_label`.
+    Label(u32),
     /// An offset is a direct index into the instruction list.
     Offset(InsnReference),
     /// A placeholder is a temporary value to satisfy the compiler.
@@ -74,18 +126,13 @@ pub enum BranchOffset {
 }
 
 impl BranchOffset {
-    /// Returns true if the branch offset is a label.
-    pub fn is_label(&self) -> bool {
-        matches!(self, BranchOffset::Label(_))
-    }
-
     /// Returns true if the branch offset is an offset.
     pub fn is_offset(&self) -> bool {
         matches!(self, BranchOffset::Offset(_))
     }
 
     /// Returns the offset value. Panics if the branch offset is a label or placeholder.
-    pub fn to_offset_int(&self) -> InsnReference {
+    pub fn as_offset_int(&self) -> InsnReference {
         match self {
             BranchOffset::Label(v) => unreachable!("Unresolved label: {}", v),
             BranchOffset::Offset(v) => *v,
@@ -93,101 +140,703 @@ impl BranchOffset {
         }
     }
 
-    /// Returns the label value. Panics if the branch offset is an offset or placeholder.
-    pub fn to_label_value(&self) -> i32 {
-        match self {
-            BranchOffset::Label(v) => *v,
-            BranchOffset::Offset(_) => unreachable!("Offset cannot be converted to label value"),
-            BranchOffset::Placeholder => unreachable!("Unresolved placeholder"),
-        }
-    }
-
     /// Returns the branch offset as a signed integer.
     /// Used in explain output, where we don't want to panic in case we have an unresolved
     /// label or placeholder.
-    pub fn to_debug_int(&self) -> i32 {
+    pub fn as_debug_int(&self) -> i32 {
         match self {
-            BranchOffset::Label(v) => *v,
+            BranchOffset::Label(v) => *v as i32,
             BranchOffset::Offset(v) => *v as i32,
             BranchOffset::Placeholder => i32::MAX,
         }
-    }
-
-    /// Adds an integer value to the branch offset.
-    /// Returns a new branch offset.
-    /// Panics if the branch offset is a label or placeholder.
-    pub fn add<N: Into<u32>>(self, n: N) -> BranchOffset {
-        BranchOffset::Offset(self.to_offset_int() + n.into())
     }
 }
 
 pub type CursorID = usize;
 
-pub type PageIdx = usize;
+pub type PageIdx = i64;
 
 // Index of insn in list of insns
 type InsnReference = u32;
 
-pub enum StepResult<'a> {
+#[derive(Debug)]
+pub enum StepResult {
     Done,
     IO,
-    Row(Record<'a>),
+    Row,
     Interrupt,
     Busy,
 }
 
-/// If there is I/O, the instruction is restarted.
-/// Evaluate a Result<CursorResult<T>>, if IO return Ok(StepResult::IO).
-macro_rules! return_if_io {
-    ($expr:expr) => {
-        match $expr? {
-            CursorResult::Ok(v) => v,
-            CursorResult::IO => return Ok(StepResult::IO),
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+/// The commit state of the program.
+/// There are two states:
+/// - Ready: The program is ready to run the next instruction, or has shut down after
+///   the last instruction.
+/// - Committing: The program is committing a write transaction. It is waiting for the pager to finish flushing the cache to disk,
+///   primarily to the WAL, but also possibly checkpointing the WAL to the database file.
+enum CommitState {
+    Ready,
+    Committing,
+    /// Committing attached database pagers after main pager commit is done.
+    CommittingAttached,
+    CommittingMvcc {
+        state_machine: StateMachine<Box<CommitStateMachine<MvccClock>>>,
+    },
+    /// Committing MVCC transactions on attached databases after main MVCC commit is done.
+    CommittingAttachedMvcc {
+        state_machine: StateMachine<Box<CommitStateMachine<MvccClock>>>,
+        db_id: usize,
+        mv_store: Arc<MvStore>,
+    },
+}
+
+impl CommitState {
+    fn cleanup_mvcc_checkpoint_state(&mut self) {
+        match self {
+            CommitState::CommittingMvcc { state_machine } => {
+                state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
+            }
+            CommitState::CommittingAttachedMvcc { state_machine, .. } => {
+                state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
+            }
+            CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
         }
-    };
+    }
+
+    fn cleanup_abandoned_mvcc_commit(&mut self, connection: &Connection) {
+        match self {
+            CommitState::CommittingAttachedMvcc {
+                state_machine,
+                db_id: attached_db_id,
+                ..
+            } if !state_machine.is_finalized() => {
+                if connection
+                    .database_schemas()
+                    .write()
+                    .remove(attached_db_id)
+                    .is_some()
+                {
+                    connection.bump_prepare_context_generation();
+                }
+            }
+            CommitState::CommittingMvcc { state_machine } if !state_machine.is_finalized() => {}
+            _ => return, // no-op for already-finalized state machines and non-MVCC commit states
+        };
+
+        // Replace the live CommitState with Ready so the abandoned state machine
+        // drops here. CommitStateMachine::Drop -> cleanup_unfinished_commit ->
+        // cleanup_dropped_commit ultimately calls rollback_tx_inner on a tx left
+        // in Active/Preparing. Without this, the orphan tx stays Preparing
+        // forever — any other transaction that took a commit dependency on it
+        // (Hekaton §2.7 speculative read) deadlocks in WaitForDependencies.
+        // The locks/exclusive slot the SM acquired are released by the same
+        // cleanup path on drop.
+        *self = CommitState::Ready;
+
+        connection.rollback_attached_mvcc_txs(true);
+        connection.rollback_attached_wal_txns();
+        connection.rollback_temp_schema();
+    }
 }
 
-struct RegexCache {
-    like: HashMap<String, Regex>,
-    glob: HashMap<String, Regex>,
+#[derive(Debug, Clone, PartialEq)]
+pub enum Register {
+    Value(Value),
+    Aggregate(AggContext),
+    Record(ImmutableRecord),
 }
 
-impl RegexCache {
-    fn new() -> Self {
-        Self {
-            like: HashMap::new(),
-            glob: HashMap::new(),
+impl Register {
+    #[inline]
+    pub const fn is_null(&self) -> bool {
+        matches!(self, Register::Value(Value::Null))
+    }
+
+    #[inline(always)]
+    /// Sets the value of the register to an integer,
+    /// reusing the existing Register::Value(Value::Numeric(Numeric::Integer(_))) if possible,
+    /// which is faster than always creating a new one.
+    pub fn set_int(&mut self, val: i64) {
+        match self {
+            Register::Value(Value::Numeric(Numeric::Integer(existing))) => {
+                *existing = val;
+            }
+            Register::Value(Value::Numeric(float)) => {
+                *float = Numeric::Integer(val);
+            }
+            Register::Value(other_value_kind) => {
+                *other_value_kind = Value::from_i64(val);
+            }
+            _ => {
+                *self = Register::Value(Value::from_i64(val));
+            }
+        }
+    }
+    /// Set the value of the register to a floating point,
+    /// reusing Register::Value(Value::Numeric(Numeric::Float(_))) if possible.
+    #[inline(always)]
+    pub fn set_float(&mut self, val: NonNan) {
+        match self {
+            Register::Value(Value::Numeric(Numeric::Float(existing))) => {
+                *existing = val;
+            }
+            Register::Value(Value::Numeric(integer)) => {
+                *integer = Numeric::Float(val);
+            }
+            Register::Value(other_value_kind) => {
+                *other_value_kind = Value::Numeric(Numeric::Float(val));
+            }
+            _ => {
+                *self = Register::Value(Value::Numeric(Numeric::Float(val)));
+            }
+        }
+    }
+
+    /// Set the value of the register to a Text,
+    /// reusing Register::Value(Value::Text(_)) buffer if possible.
+    #[inline]
+    pub fn set_text(&mut self, val: Text) -> Result<()> {
+        match self {
+            Register::Value(Value::Text(existing)) => {
+                existing.do_extend(&val)?;
+            }
+            Register::Value(other_value_kind) => {
+                *other_value_kind = Value::Text(val);
+            }
+            _ => {
+                *self = Register::Value(Value::Text(val));
+            }
+        }
+        Ok(())
+    }
+
+    /// Set the value of the register to a blob,
+    /// reusing Register::Value(Value::Blob(_)) buffer if possible.
+    #[inline]
+    pub fn set_blob(&mut self, val: Vec<u8>) -> Result<()> {
+        match self {
+            Register::Value(Value::Blob(existing)) => {
+                existing.do_extend(&val)?;
+            }
+            Register::Value(other_value_kind) => {
+                *other_value_kind = Value::Blob(val);
+            }
+            _ => {
+                *self = Register::Value(Value::Blob(val));
+            }
+        }
+        Ok(())
+    }
+
+    // Set the value of the register to NULL,
+    // reusing the existing Register::Value(Value::Null) if possible.
+    pub fn set_null(&mut self) {
+        match self {
+            Register::Value(Value::Null) => {}
+            Register::Value(other_value_kind) => {
+                *other_value_kind = Value::Null;
+            }
+            _ => {
+                *self = Register::Value(Value::Null);
+            }
+        }
+    }
+
+    /// Set the register to a generic Value, attempting to reuse backing allocation if compatible.
+    pub fn set_value(&mut self, val: Value) {
+        match self {
+            Register::Value(v) => {
+                *v = val;
+            }
+            _ => {
+                *self = Register::Value(val);
+            }
         }
     }
 }
 
-/// The program state describes the environment in which the program executes.
-pub struct ProgramState {
-    pub pc: InsnReference,
-    cursors: RefCell<BTreeMap<CursorID, Box<dyn Cursor>>>,
-    registers: Vec<OwnedValue>,
-    last_compare: Option<std::cmp::Ordering>,
-    deferred_seek: Option<(CursorID, CursorID)>,
-    ended_coroutine: HashMap<usize, bool>, // flag to indicate that a coroutine has ended (key is the yield register)
-    regex_cache: RegexCache,
-    interrupted: bool,
+/// A row is a the list of registers that hold the values for a filtered row. This row is a pointer, therefore
+/// after stepping again, row will be invalidated to be sure it doesn't point to somewhere unexpected.
+#[derive(Debug)]
+pub struct Row {
+    values: *const Register,
+    count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TxnCleanup {
+    None,
+    RollbackTxn,
+    /// begin_statement was called and statement is participating in an interactive transaction.
+    /// If statement is abandoned and/or dropped without an apparent error, we should rollback statement
+    /// to previous savepoint.
+    RollbackSavepoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProgramExecutionState {
+    /// No steps of the program was executed
+    Init,
+    /// Program started execution but didn't reach any terminal state
+    Running,
+    /// Interrupt requested for the program
+    Interrupting,
+    /// Terminal state: program interrupted
+    Interrupted,
+    /// Terminal state: program finished successfully
+    Done,
+    /// Terminal state: program failed with error
+    Failed,
+}
+
+impl ProgramExecutionState {
+    pub const fn is_running(&self) -> bool {
+        matches!(
+            self,
+            ProgramExecutionState::Interrupting | ProgramExecutionState::Running
+        )
+    }
+    pub const fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ProgramExecutionState::Interrupted
+                | ProgramExecutionState::Failed
+                | ProgramExecutionState::Done
+        )
+    }
+}
+
+/// Re-entrant state for [Insn::HashBuild].
+/// Allows HashBuild to resume cleanly after async I/O without re-reading the row.
+#[derive(Debug, Default)]
+pub struct OpHashBuildState {
+    pub key_values: Vec<Value>,
+    pub key_idx: usize,
+    pub payload_values: Vec<Value>,
+    pub payload_idx: usize,
+    pub rowid: Option<i64>,
+    pub cursor_id: CursorID,
+    pub hash_table_id: usize,
+    pub key_start_reg: usize,
+    pub num_keys: usize,
+}
+
+/// Re-entrant state for [Insn::HashProbe].
+/// Allows HashProbe to resume cleanly after async probe-row buffering I/O.
+#[derive(Debug, Default)]
+pub struct OpHashProbeState {
+    /// Cached probe key values to avoid re-reading from registers
+    pub probe_keys: Vec<Value>,
+    /// Hash table register being probed
+    pub hash_table_id: usize,
+    /// Partition index being loaded (if any)
+    pub partition_idx: usize,
+    /// Whether the probe row was already buffered for grace processing.
+    pub probe_buffered: bool,
+}
+
+enum ActiveOpState {
+    None,
+    ClearBtree(OpClearBtreeState),
+    Delete(OpDeleteState),
+    Destroy(OpDestroyState),
+    IdxDelete(OpIdxDeleteState),
+    IntegrityCheck(OpIntegrityCheckState),
+    OpenEphemeral(OpOpenEphemeralState),
+    Program(OpProgramState),
+    NewRowid(OpNewRowidState),
+    IdxInsert(OpIdxInsertState),
+    Insert(OpInsertState),
+    NoConflict(OpNoConflictState),
+    Column(OpColumnState),
+    RowId(OpRowIdState),
+    Transaction(OpTransactionState),
+    JournalMode(OpJournalModeState),
+    ParseSchema(OpParseSchemaState),
+    HashBuild(Option<OpHashBuildState>),
+    HashProbe(Option<OpHashProbeState>),
+    InitCdcVersion(OpInitCdcVersionState),
+}
+
+impl std::fmt::Debug for ActiveOpState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            ActiveOpState::None => "None",
+            ActiveOpState::ClearBtree(_) => "ClearBtree",
+            ActiveOpState::Delete(_) => "Delete",
+            ActiveOpState::Destroy(_) => "Destroy",
+            ActiveOpState::IdxDelete(_) => "IdxDelete",
+            ActiveOpState::IntegrityCheck(_) => "IntegrityCheck",
+            ActiveOpState::OpenEphemeral(_) => "OpenEphemeral",
+            ActiveOpState::Program(_) => "Program",
+            ActiveOpState::NewRowid(_) => "NewRowid",
+            ActiveOpState::IdxInsert(_) => "IdxInsert",
+            ActiveOpState::Insert(_) => "Insert",
+            ActiveOpState::NoConflict(_) => "NoConflict",
+            ActiveOpState::Column(_) => "Column",
+            ActiveOpState::RowId(_) => "RowId",
+            ActiveOpState::Transaction(_) => "Transaction",
+            ActiveOpState::JournalMode(_) => "JournalMode",
+            ActiveOpState::ParseSchema(_) => "ParseSchema",
+            ActiveOpState::HashBuild(_) => "HashBuild",
+            ActiveOpState::HashProbe(_) => "HashProbe",
+            ActiveOpState::InitCdcVersion(_) => "InitCdcVersion",
+        };
+        f.write_str(name)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ActiveOpStateSlot {
+    state: ActiveOpState,
+}
+
+macro_rules! active_state_accessor {
+    ($name:ident, $variant:ident, $ty:ty, $init:expr) => {
+        fn $name(&mut self) -> &mut $ty {
+            if matches!(self.state, ActiveOpState::None) {
+                self.state = ActiveOpState::$variant($init);
+            }
+            match &mut self.state {
+                ActiveOpState::$variant(state) => state,
+                state => unreachable!(
+                    "active opcode state mismatch: expected {}, got {:?}",
+                    stringify!($variant),
+                    state
+                ),
+            }
+        }
+    };
+}
+
+impl Default for ActiveOpState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl ActiveOpStateSlot {
+    fn clear(&mut self) {
+        self.state = ActiveOpState::None;
+    }
+
+    active_state_accessor!(
+        delete,
+        Delete,
+        OpDeleteState,
+        OpDeleteState {
+            sub_state: OpDeleteSubState::MaybeCaptureRecord,
+            deleted_record: None,
+        }
+    );
+    active_state_accessor!(
+        clear_btree,
+        ClearBtree,
+        OpClearBtreeState,
+        OpClearBtreeState::CreateCursor
+    );
+    active_state_accessor!(
+        destroy,
+        Destroy,
+        OpDestroyState,
+        OpDestroyState::CreateCursor
+    );
+    active_state_accessor!(
+        idx_delete,
+        IdxDelete,
+        OpIdxDeleteState,
+        OpIdxDeleteState::Seeking
+    );
+    active_state_accessor!(
+        integrity_check,
+        IntegrityCheck,
+        OpIntegrityCheckState,
+        OpIntegrityCheckState::Start
+    );
+    active_state_accessor!(
+        open_ephemeral,
+        OpenEphemeral,
+        OpOpenEphemeralState,
+        OpOpenEphemeralState::Start
+    );
+    active_state_accessor!(program, Program, OpProgramState, OpProgramState::Start);
+    active_state_accessor!(new_rowid, NewRowid, OpNewRowidState, OpNewRowidState::Start);
+    active_state_accessor!(
+        idx_insert,
+        IdxInsert,
+        OpIdxInsertState,
+        OpIdxInsertState::MaybeSeek
+    );
+    active_state_accessor!(
+        insert,
+        Insert,
+        OpInsertState,
+        OpInsertState {
+            sub_state: OpInsertSubState::MaybeCaptureRecord,
+            old_record: None,
+            is_noop_update: false,
+        }
+    );
+    active_state_accessor!(
+        no_conflict,
+        NoConflict,
+        OpNoConflictState,
+        OpNoConflictState::Start
+    );
+    active_state_accessor!(column, Column, OpColumnState, OpColumnState::Start);
+    active_state_accessor!(row_id, RowId, OpRowIdState, OpRowIdState::Start);
+    active_state_accessor!(
+        transaction,
+        Transaction,
+        OpTransactionState,
+        OpTransactionState::Start
+    );
+    active_state_accessor!(
+        journal_mode,
+        JournalMode,
+        OpJournalModeState,
+        OpJournalModeState::default()
+    );
+    active_state_accessor!(parse_schema, ParseSchema, OpParseSchemaState, None);
+    active_state_accessor!(hash_build, HashBuild, Option<OpHashBuildState>, None);
+    active_state_accessor!(hash_probe, HashProbe, Option<OpHashProbeState>, None);
+    active_state_accessor!(
+        init_cdc_version,
+        InitCdcVersion,
+        OpInitCdcVersionState,
+        None
+    );
+
+    fn program_ref(&self) -> Option<&OpProgramState> {
+        match &self.state {
+            ActiveOpState::Program(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    fn program_mut(&mut self) -> Option<&mut OpProgramState> {
+        match &mut self.state {
+            ActiveOpState::Program(state) => Some(state),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredSeekState {
+    pub index_cursor_id: CursorID,
+    pub table_cursor_id: CursorID,
+}
+
+pub(crate) enum VacuumOpState {
+    None,
+    IntoFile(Box<VacuumIntoOpContext>),
+    InPlace(Box<VacuumInPlaceOpContext>),
+}
+
+impl Default for VacuumOpState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// The program state describes the environment in which the program executes.
+/// Bookkeeping for an in-flight sequence inner-tx wrap. The
+/// `SequenceBeginInnerTx` opcode populates this on the Wrapped path
+/// so a subsequent reset / unwind can roll back the inner tx and
+/// restore `conn.mv_tx_for_db(db)` even when the statement aborts
+/// before reaching `SequenceCommitInnerTx`.
+#[derive(Clone)]
+pub struct SequenceInnerTxState {
+    pub db: usize,
+    pub inner_tx_id: crate::mvcc::database::TxID,
+    pub saved_outer: Option<(
+        crate::mvcc::database::TxID,
+        crate::translate::emitter::TransactionMode,
+    )>,
+}
+
+pub struct ProgramState {
+    pub io_completions: Option<IOCompletions>,
+    pub pc: InsnReference,
+    pub(crate) cursors: Vec<Option<Cursor>>,
+    cursor_seqs: Vec<i64>,
+    registers: Box<[Register]>,
+    /// Trace state: register snapshot for diffing.
+    pre_op_registers: Option<Box<[Register]>>,
+    pub(crate) result_row: Option<Row>,
+    last_compare: Option<std::cmp::Ordering>,
+    deferred_seeks: Vec<Option<DeferredSeekState>>,
+    /// Indicate whether a coroutine has ended for a given yield register.
+    /// If an element is present, it means the coroutine with the given register number has ended.
+    ended_coroutine: Vec<u32>,
+    /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
+    once: SmallVec<[u32; 4]>,
+    pub execution_state: ProgramExecutionState,
+    /// Per-execution statement deadline derived from the connection query timeout.
+    /// `None` means no timeout.
+    pub query_deadline: Option<crate::MonotonicInstant>,
+    pub parameters: Vec<Value>,
+    commit_state: CommitState,
+    /// In-flight commit-state-machine for an autonomous sequence
+    /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
+    /// entry and drives it one step per opcode call, yielding
+    /// `InsnFunctionStepResult::IO` between steps. Cleared on terminal
+    /// outcome (Done / Conflict / Err) and on statement reset.
+    pub sequence_inner_commit: Option<StateMachine<Box<CommitStateMachine<MvccClock>>>>,
+    /// State for a pending sequence inner-tx wrap, set by
+    /// `Insn::SequenceBeginInnerTx` (Wrapped path only) and cleared
+    /// by `Insn::SequenceCommitInnerTx` on any terminal outcome.
+    /// Tracked here (rather than in registers) so that statement
+    /// reset can roll back an orphaned inner tx and restore the
+    /// connection's mv_tx — registers are wiped on reset, but the
+    /// orphaned inner would otherwise linger in `mv_store.txs` and
+    /// pollute the connection's mv_tx slot, breaking subsequent
+    /// commits with phantom dependencies.
+    pub sequence_inner_tx_pending: Option<SequenceInnerTxState>,
+    /// Consecutive conflict-retry count for the in-progress sequence
+    /// inner-tx wrap. Incremented on each `WriteWriteConflict` /
+    /// `BusySnapshot` from `SequenceCommitInnerTx`; reset on the next
+    /// successful commit. When it exceeds
+    /// `SEQUENCE_INNER_TX_RETRY_BUDGET` the opcode returns
+    /// `LimboError::Busy` directly instead of routing a phony
+    /// `SQLITE_BUSY` halt through `op_halt`, which would mis-wrap it as
+    /// a constraint error.
+    pub sequence_inner_retry_count: u32,
+    #[cfg(feature = "json")]
+    json_cache: JsonCacheCell,
+    active_op_state: ActiveOpStateSlot,
+    seek_state: OpSeekState,
+    /// Metrics collected for the lifetime of this prepared statement.
+    pub metrics: StatementMetrics,
+    /// Current collation sequence set by OP_CollSeq instruction
+    current_collation: Option<CollationSeq>,
+    op_vacuum_state: VacuumOpState,
+    /// State machine for committing view deltas with I/O handling
+    view_delta_state: ViewDeltaCommitState,
+    /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
+    /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
+    pub(crate) auto_txn_cleanup: TxnCleanup,
+    pub explain_state: RwLock<ExplainState>,
+    /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
+    distinct_key_values: Vec<Value>,
+    hash_tables: HashMap<usize, HashTable>,
+    /// TempFile handles for ephemeral cursors, keyed by cursor_id.
+    /// Dropping removes the temp file from disk.
+    ephemeral_temp_files: HashMap<usize, TempFile>,
+    /// Attached pagers that have open savepoints for statement rollback.
+    attached_savepoint_pagers: Vec<Arc<Pager>>,
+    /// Pending error to return after FAIL mode commit completes.
+    /// When a constraint error occurs with FAIL resolve type in autocommit mode,
+    /// we need to commit partial changes before returning the error.
+    pub(crate) pending_fail_error: Option<LimboError>,
+    /// Pending CDC info to apply after the program completes successfully.
+    /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
+    /// transaction rolls back, the connection's CDC state remains unchanged.
+    ///
+    /// capture_data_changes has type Option<CaptureDataChangesInfo> (off mode is None)
+    /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
+    pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
+    /// Cached subprogram Statements keyed by the PC of the Program instruction.
+    /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
+    pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
+    /// RowSet objects stored by register index
+    rowsets: HashMap<usize, RowSet>,
+    /// Bloom filters stored by cursor ID for probabilistic set membership testing
+    /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
+    pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
+    /// Number of deferred foreign key violations when the statement started.
+    /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
+    /// is reset to this value.
+    fk_deferred_violations_when_stmt_started: AtomicIsize,
+    /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
+    /// the statement subtransactionwill roll back.
+    fk_immediate_violations_during_stmt: AtomicIsize,
+    uses_subjournal: bool,
+    /// Whether this statement is an active write inside an explicit transaction.
+    pub(crate) is_active_write: bool,
+    /// Whether begin_statement was called (savepoint + FK bookkeeping active).
+    has_stmt_transaction: bool,
+    pub n_change: AtomicI64,
+    pub n_total_change: AtomicI64,
+}
+
+impl std::fmt::Debug for Program {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Program").finish()
+    }
+}
+
+// See: https://github.com/tursodatabase/turso/issues/1552
+// SAFETY: Rust cannot derive Send + Sync automatically mainly because of `Row` struct
+// as it contains a `*const Register`.
+// Program + Program State upholds Rust aliasing rules with `Row` by only giving out immutable references to
+// the internal `result_row` and by invalidating the result row whenever the program is stepped.
+unsafe impl Send for ProgramState {}
+unsafe impl Sync for ProgramState {}
+crate::assert::assert_send_sync!(ProgramState);
+
 impl ProgramState {
-    pub fn new(max_registers: usize) -> Self {
-        let cursors = RefCell::new(BTreeMap::new());
-        let mut registers = Vec::with_capacity(max_registers);
-        registers.resize(max_registers, OwnedValue::Null);
+    pub fn new(max_registers: usize, max_cursors: usize) -> Self {
+        let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
+        let cursor_seqs = vec![0i64; max_cursors];
+        let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
         Self {
+            io_completions: None,
             pc: 0,
             cursors,
+            cursor_seqs,
             registers,
+            pre_op_registers: None,
+            result_row: None,
             last_compare: None,
-            deferred_seek: None,
-            ended_coroutine: HashMap::new(),
-            regex_cache: RegexCache::new(),
-            interrupted: false,
+            deferred_seeks: vec![None; max_cursors],
+            ended_coroutine: vec![],
+            once: SmallVec::<[u32; 4]>::new(),
+            execution_state: ProgramExecutionState::Init,
+            query_deadline: None,
+            parameters: Vec::new(),
+            commit_state: CommitState::Ready,
+            sequence_inner_commit: None,
+            sequence_inner_tx_pending: None,
+            sequence_inner_retry_count: 0,
+            #[cfg(feature = "json")]
+            json_cache: JsonCacheCell::new(),
+            active_op_state: ActiveOpStateSlot::default(),
+            seek_state: OpSeekState::Start,
+            metrics: StatementMetrics::new(),
+            distinct_key_values: Vec::new(),
+            current_collation: None,
+            op_vacuum_state: VacuumOpState::None,
+            view_delta_state: ViewDeltaCommitState::NotStarted,
+            auto_txn_cleanup: TxnCleanup::None,
+            fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
+            fk_immediate_violations_during_stmt: AtomicIsize::new(0),
+            rowsets: HashMap::default(),
+            bloom_filters: HashMap::default(),
+            hash_tables: HashMap::default(),
+            ephemeral_temp_files: HashMap::default(),
+            uses_subjournal: false,
+            is_active_write: false,
+            has_stmt_transaction: false,
+            attached_savepoint_pagers: Vec::new(),
+            n_change: AtomicI64::new(0),
+            n_total_change: AtomicI64::new(0),
+            explain_state: RwLock::new(ExplainState::default()),
+            pending_fail_error: None,
+            pending_cdc_info: None,
+            subprogram_stmt_cache: HashMap::default(),
         }
+    }
+
+    pub fn set_register(&mut self, idx: usize, value: Register) {
+        self.registers[idx] = value;
+    }
+
+    pub fn get_register(&self, idx: usize) -> &Register {
+        &self.registers[idx]
     }
 
     pub fn column_count(&self) -> usize {
@@ -199,3930 +848,2675 @@ impl ProgramState {
     }
 
     pub fn interrupt(&mut self) {
-        self.interrupted = true;
+        self.execution_state = ProgramExecutionState::Interrupting;
     }
 
     pub fn is_interrupted(&self) -> bool {
-        self.interrupted
+        matches!(self.execution_state, ProgramExecutionState::Interrupting)
+    }
+
+    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
+        let i = index.get() - 1;
+        if i >= self.parameters.len() {
+            self.parameters.resize(i + 1, Value::Null);
+        }
+        let slot = &mut self.parameters[i];
+        match (slot, value) {
+            (Value::Null, Value::Null) => {}
+            (Value::Numeric(Numeric::Integer(existing)), Value::Numeric(Numeric::Integer(new))) => {
+                *existing = new
+            }
+            (Value::Numeric(Numeric::Float(existing)), Value::Numeric(Numeric::Float(new))) => {
+                *existing = new
+            }
+            (Value::Text(existing), Value::Text(new)) => existing.do_extend(&new)?,
+            (Value::Blob(existing), Value::Blob(new)) => existing.do_extend(&new)?,
+            (slot, value) => *slot = value,
+        }
+        Ok(())
+    }
+
+    pub fn clear_bindings(&mut self) {
+        self.parameters.clear();
+    }
+
+    pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
+        let i = index.get() - 1;
+        self.parameters.get(i).cloned().unwrap_or(Value::Null)
+    }
+
+    pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        self.io_completions = None;
+        self.pc = 0;
+
+        if let Some(max_cursors) = max_cursors {
+            self.cursors.resize_with(max_cursors, || None);
+            self.cursor_seqs.resize(max_cursors, 0);
+            self.deferred_seeks.resize(max_cursors, None);
+        }
+        self.result_row = None;
+        if let Some(max_registers) = max_registers {
+            // into_vec and into_boxed_slice do not allocate
+            let mut registers = std::mem::take(&mut self.registers).into_vec();
+            // As we are dropping whatever is in the result row, we can be sure that no one is referencing values from `*const Register` inside `Row`.
+            registers.resize_with(max_registers, || Register::Value(Value::Null));
+            self.registers = registers.into_boxed_slice();
+        }
+        // reset cursors as they can have cached information which will be no longer relevant on next program execution
+        self.cursors.iter_mut().for_each(|c| {
+            let _ = c.take();
+        });
+        for r in self.registers.iter_mut() {
+            match r {
+                Register::Value(v) => *v = Value::Null,
+                _ => r.set_null(),
+            }
+        }
+        self.last_compare = None;
+        self.deferred_seeks.iter_mut().for_each(|s| *s = None);
+        self.ended_coroutine.clear();
+        self.once.clear();
+        self.execution_state = ProgramExecutionState::Init;
+        self.query_deadline = None;
+        self.current_collation = None;
+        #[cfg(feature = "json")]
+        self.json_cache.clear();
+
+        // A caller can reset or drop a statement after an MVCC auto-checkpoint
+        // has yielded I/O. Waiting for that I/O does not step the nested
+        // CheckpointStateMachine again, so release its checkpoint lock before
+        // replacing commit_state with Ready.
+        self.commit_state.cleanup_mvcc_checkpoint_state();
+        self.active_op_state.clear();
+        self.seek_state = OpSeekState::Start;
+        self.current_collation = None;
+        self.commit_state = CommitState::Ready;
+        // Drop any in-flight sequence inner-tx commit-state-machine. If
+        // it was mid-step the inner mv_tx has already been swapped back
+        // (we handle that on every code path inside
+        // `op_sequence_commit_inner_tx`) so dropping the state machine
+        // here only releases its references.
+        self.sequence_inner_commit = None;
+        self.op_vacuum_state = VacuumOpState::None;
+        self.view_delta_state = ViewDeltaCommitState::NotStarted;
+        self.auto_txn_cleanup = TxnCleanup::None;
+        self.fk_immediate_violations_during_stmt
+            .store(0, Ordering::SeqCst);
+        self.fk_deferred_violations_when_stmt_started
+            .store(0, Ordering::SeqCst);
+        self.rowsets.clear();
+        self.bloom_filters.clear();
+        self.hash_tables.clear();
+        self.ephemeral_temp_files.clear();
+        self.uses_subjournal = false;
+        self.is_active_write = false;
+        self.has_stmt_transaction = false;
+        self.distinct_key_values.clear();
+        self.attached_savepoint_pagers.clear();
+        self.n_change.store(0, Ordering::SeqCst);
+        self.n_total_change.store(0, Ordering::SeqCst);
+        *self.explain_state.write() = ExplainState::default();
+        self.pending_fail_error = None;
+        self.pending_cdc_info = None;
+        self.subprogram_stmt_cache.clear();
+    }
+
+    pub(crate) fn record_statement_change(&self) {
+        self.n_change.fetch_add(1, Ordering::SeqCst);
+        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn record_total_change(&self) {
+        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Whether this statement owns the implicit autocommit transaction it is
+    /// about to finish, including re-entry while its commit is in progress.
+    #[inline]
+    pub(crate) fn owns_auto_txn(&self) -> bool {
+        self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+            || !matches!(self.commit_state, CommitState::Ready)
+    }
+
+    #[inline]
+    pub fn record_rows_read(&mut self, count: u64) {
+        self.metrics.rows_read = self.metrics.rows_read.saturating_add(count);
+    }
+
+    #[inline]
+    pub fn record_rows_written(&mut self, count: u64) {
+        self.metrics.rows_written = self.metrics.rows_written.saturating_add(count);
+    }
+
+    pub(crate) fn metrics(&self) -> StatementMetrics {
+        let mut metrics = self.metrics.clone();
+        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
+            metrics.merge(&statement.metrics());
+        }
+        for statement in self.subprogram_stmt_cache.values() {
+            metrics.merge(&statement.metrics());
+        }
+        metrics
+    }
+
+    pub(crate) fn reset_metrics(&mut self) {
+        self.metrics.reset();
+        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
+            statement.reset_metrics();
+        }
+        for statement in self.subprogram_stmt_cache.values_mut() {
+            statement.reset_metrics();
+        }
+    }
+
+    pub(crate) fn reset_stmt_status(&mut self, counter: crate::statement::StatementStatusCounter) {
+        match counter {
+            crate::statement::StatementStatusCounter::FullscanStep => {
+                self.metrics.fullscan_steps = 0
+            }
+            crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
+            crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
+            crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
+            crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
+            crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
+        }
+        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
+            statement.reset_stmt_status(counter);
+        }
+        for statement in self.subprogram_stmt_cache.values_mut() {
+            statement.reset_stmt_status(counter);
+        }
+    }
+
+    pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
+        self.cursors
+            .get_mut(cursor_id)
+            .unwrap_or_else(|| panic!("cursor id {cursor_id} out of bounds"))
+            .as_mut()
+            .unwrap_or_else(|| panic!("cursor id {cursor_id} is None"))
+    }
+
+    /// Begin a statement subtransaction.
+    ///
+    /// Creates a savepoint on the main DB's MvStore (or pager for WAL mode),
+    /// and snapshots FK violation counters for potential statement rollback.
+    /// Attached DB savepoints are opened per-DB in `op_transaction_inner`
+    /// when each DB's Transaction opcode is executed.
+    ///
+    /// Pager/MVCC savepoints are only opened for write statements inside an
+    /// explicit transaction. In autocommit mode, a statement abort is a
+    /// transaction abort, so savepoints are unnecessary.
+    pub fn begin_statement(
+        &mut self,
+        connection: &Connection,
+        pager: &Arc<Pager>,
+        write: bool,
+    ) -> Result<IOResult<()>> {
+        let in_explicit_txn = !connection.auto_commit.load(Ordering::SeqCst);
+        if write && in_explicit_txn {
+            // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
+            if let Some(mv_store) = connection.mv_store().as_ref() {
+                if let Some(tx_id) = connection.get_mv_tx_id() {
+                    mv_store.begin_savepoint(tx_id);
+                }
+            } else {
+                // Non-MVCC mode: use pager savepoints
+                let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
+                pager.open_subjournal()?;
+                pager.try_use_subjournal()?;
+                let result = pager.open_savepoint(db_size);
+                if result.is_err() {
+                    pager.stop_use_subjournal();
+                }
+                result?;
+                self.uses_subjournal = true;
+            }
+        }
+
+        self.has_stmt_transaction = true;
+
+        // Store the deferred foreign key violations counter at the start of the statement.
+        // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
+        // the deferred FK violations are not lost.
+        self.fk_deferred_violations_when_stmt_started.store(
+            connection.fk_deferred_violations.load(Ordering::Acquire),
+            Ordering::SeqCst,
+        );
+        // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
+        self.fk_immediate_violations_during_stmt
+            .store(0, Ordering::Release);
+        Ok(IOResult::Done(()))
+    }
+
+    /// End a statement subtransaction.
+    ///
+    /// Mirrors SQLite's vdbeCloseStatement (vdbeaux.c:3203-3248). Pager/MVCC
+    /// savepoint management and FK violation counter restoration are independent
+    /// concerns: pager savepoints may be skipped (e.g. autocommit optimization)
+    /// while FK bookkeeping still needs cleanup.
+    pub fn end_statement(
+        &mut self,
+        connection: &Connection,
+        pager: &Arc<Pager>,
+        end_statement: EndStatement,
+    ) -> Result<()> {
+        if self.is_active_write {
+            connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+            self.is_active_write = false;
+        }
+        // If begin_statement was never called, no savepoint/FK cleanup needed.
+        if !self.has_stmt_transaction {
+            return Ok(());
+        }
+        self.has_stmt_transaction = false;
+
+        // Drain attached pagers upfront so we can clean them up regardless of path.
+        let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
+        let result = match end_statement {
+            EndStatement::ReleaseSavepoint => {
+                if let Some(mv_store) = connection.mv_store().as_ref() {
+                    if let Some(tx_id) = connection.get_mv_tx_id() {
+                        mv_store.release_savepoint(tx_id);
+                    }
+                    connection.for_each_attached_mv_tx(|db_id, tx_id| {
+                        if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
+                            attached_mv.release_savepoint(tx_id);
+                        }
+                    });
+                    Ok(())
+                } else if self.uses_subjournal || !attached_pagers.is_empty() {
+                    if self.uses_subjournal {
+                        pager.release_savepoint()?;
+                    }
+                    for p in &attached_pagers {
+                        p.release_savepoint()?;
+                    }
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+            EndStatement::RollbackSavepoint => {
+                // Rollback pager/MVCC savepoint if one was opened.
+                let pager_err = if let Some(mv_store) = connection.mv_store().as_ref() {
+                    let mut err = None;
+                    if let Some(tx_id) = connection.get_mv_tx_id() {
+                        if let Err(e) = mv_store.rollback_first_savepoint(tx_id) {
+                            err = Some(e);
+                        }
+                    }
+                    connection.for_each_attached_mv_tx(|db_id, tx_id| {
+                        if let Some(attached_mv) = connection.mv_store_for_db(db_id) {
+                            if let Err(e) = attached_mv.rollback_first_savepoint(tx_id) {
+                                if err.is_none() {
+                                    err = Some(e);
+                                }
+                            }
+                        }
+                    });
+                    err
+                } else if self.uses_subjournal {
+                    match pager.rollback_to_newest_savepoint() {
+                        Ok(_) => {
+                            let mut err = None;
+                            for p in &attached_pagers {
+                                if let Err(e) = p.rollback_to_newest_savepoint() {
+                                    err = Some(e);
+                                    break;
+                                }
+                            }
+                            err
+                        }
+                        Err(e) => Some(e),
+                    }
+                } else if !attached_pagers.is_empty() {
+                    let mut err = None;
+                    for p in &attached_pagers {
+                        if let Err(e) = p.rollback_to_newest_savepoint() {
+                            err = Some(e);
+                        }
+                    }
+                    err
+                } else {
+                    None
+                };
+
+                // Always restore FK violation counters on statement rollback,
+                // regardless of whether a pager savepoint was opened.
+                // Mirrors SQLite's vdbeCloseStatement (vdbeaux.c:3243-3246).
+                connection.fk_deferred_violations.store(
+                    self.fk_deferred_violations_when_stmt_started
+                        .load(Ordering::Acquire),
+                    Ordering::SeqCst,
+                );
+
+                match pager_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
+            }
+        };
+        if self.uses_subjournal {
+            pager.stop_use_subjournal();
+            self.uses_subjournal = false;
+        }
+        for p in &attached_pagers {
+            p.stop_use_subjournal();
+        }
+        result
+    }
+
+    /// Gets or creates a bloom filter for the given cursor ID.
+    pub fn get_or_create_bloom_filter(&mut self, cursor_id: usize) -> &mut BloomFilter {
+        self.bloom_filters.entry(cursor_id).or_default()
+    }
+
+    /// Gets or creates a bloom filter with a specific capacity for the given cursor ID.
+    pub fn get_or_create_bloom_filter_with_capacity(
+        &mut self,
+        cursor_id: usize,
+        expected_items: u32,
+        false_positive_rate: f32,
+    ) -> &mut BloomFilter {
+        self.bloom_filters
+            .entry(cursor_id)
+            .or_insert_with(|| BloomFilter::with_capacity(expected_items, false_positive_rate))
+    }
+
+    /// Gets an existing bloom filter for the given cursor ID.
+    pub fn get_bloom_filter(&self, cursor_id: usize) -> Option<&BloomFilter> {
+        self.bloom_filters.get(&cursor_id)
+    }
+
+    /// Gets a mutable reference to an existing bloom filter for the given cursor ID.
+    pub fn get_bloom_filter_mut(&mut self, cursor_id: usize) -> Option<&mut BloomFilter> {
+        self.bloom_filters.get_mut(&cursor_id)
+    }
+
+    /// Removes and drops the bloom filter for the given cursor ID.
+    pub fn remove_bloom_filter(&mut self, cursor_id: usize) {
+        self.bloom_filters.remove(&cursor_id);
+    }
+
+    /// Checks if a bloom filter exists for the given cursor ID.
+    pub fn has_bloom_filter(&self, cursor_id: usize) -> bool {
+        self.bloom_filters.contains_key(&cursor_id)
+    }
+
+    pub fn get_fk_immediate_violations_during_stmt(&self) -> isize {
+        self.fk_immediate_violations_during_stmt
+            .load(Ordering::Acquire)
+    }
+
+    pub fn increment_fk_immediate_violations_during_stmt(&self, v: isize) {
+        self.fk_immediate_violations_during_stmt
+            .fetch_add(v, Ordering::AcqRel);
     }
 }
 
-#[derive(Debug)]
-pub struct Program {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Action to take at the end of a statement subtransaction.
+pub enum EndStatement {
+    /// Release (commit) the savepoint -- effectively removing the savepoint as it is no longer needed for undo purposes.
+    ReleaseSavepoint,
+    /// Rollback (abort) to the newest savepoint: read pages from the subjournal and restore them to the page cache.
+    /// This is used to undo the changes made by the statement.
+    RollbackSavepoint,
+}
+
+impl Register {
+    pub fn get_value(&self) -> &Value {
+        match self {
+            Register::Value(v) => v,
+            Register::Record(r) => {
+                turso_assert!(!r.is_invalidated());
+                r.as_blob_value()
+            }
+            _ => panic!("register holds unexpected value: {self:?}"),
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! must_be_btree_cursor {
+    ($cursor_id:expr, $cursor_ref:expr, $state:expr, $insn_name:expr) => {{
+        let (_, cursor_type) = $cursor_ref.get($cursor_id).unwrap();
+        if matches!(
+            cursor_type,
+            CursorType::BTreeTable(_)
+                | CursorType::BTreeIndex(_)
+                | CursorType::MaterializedView(_, _)
+        ) {
+            $crate::get_cursor!($state, $cursor_id)
+        } else {
+            panic!("{} on unexpected cursor", $insn_name)
+        }
+    }};
+}
+
+/// Macro is necessary to help the borrow checker see we are only accessing state.cursor field
+/// and nothing else
+#[macro_export]
+macro_rules! get_cursor {
+    ($state:expr, $cursor_id:expr) => {
+        $state
+            .cursors
+            .get_mut($cursor_id)
+            .unwrap_or_else(|| panic!("cursor id {} out of bounds", $cursor_id))
+            .as_mut()
+            .unwrap_or_else(|| panic!("cursor id {} is None", $cursor_id))
+    };
+}
+
+/// Tracks the state of explain mode execution, including which subprograms need to be processed.
+#[derive(Default)]
+pub struct ExplainState {
+    /// Subprograms queued for explain output, processed after the parent program finishes.
+    pending: std::collections::VecDeque<Arc<PreparedProgram>>,
+    /// Prepared subprograms that have already been queued for explain output.
+    ///
+    /// Recursive foreign-key action programs can contain a `Program` instruction
+    /// that calls the same prepared program again. Without this set, EXPLAIN
+    /// keeps printing the same subprogram forever.
+    queued_subprograms: std::collections::HashSet<usize>,
+    /// The subprogram currently being explained, if any.
+    current: Option<Arc<PreparedProgram>>,
+}
+
+impl ExplainState {
+    /// Queue a subprogram for EXPLAIN output if this statement has not queued it before.
+    fn queue_subprogram_once(&mut self, subprogram: Arc<PreparedProgram>) {
+        let subprogram_id = Arc::as_ptr(&subprogram) as usize;
+        if self.queued_subprograms.insert(subprogram_id) {
+            self.pending.push_back(subprogram);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedProgram {
     pub max_registers: usize,
-    pub insns: Vec<Insn>,
-    pub cursor_ref: Vec<(Option<String>, Option<Table>)>,
-    pub database_header: Rc<RefCell<DatabaseHeader>>,
-    pub comments: HashMap<InsnReference, &'static str>,
-    pub connection: Weak<Connection>,
-    pub auto_commit: bool,
+    // we store original indices because we don't want to create new vec from
+    // ProgramBuilder
+    pub insns: Vec<(Insn, usize)>,
+    pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
+    pub comments: Vec<(InsnReference, &'static str)>,
+    pub parameters: crate::parameters::Parameters,
+    pub change_cnt_on: bool,
+    /// Flag that detect if the sqlite statement will directly manipulate the database file.\
+    /// mirrors: https://sqlite.org/c3ref/stmt_readonly.html.
+    pub readonly: bool,
+    pub result_columns: Vec<ResultSetColumn>,
+    pub table_references: TableReferences,
+    pub sql: String,
+    /// Whether the statement needs to be wrapped in a statement subtransaction
+    /// when run as part of an interactive (non-autocommit) transaction.
+    /// See [crate::vdbe::builder::ProgramBuilder::is_multi_write] and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
+    pub needs_stmt_subtransactions: Arc<AtomicBool>,
+    /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
+    pub trigger: Option<Arc<Trigger>>,
+    /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
+    pub is_subprogram: bool,
+    /// Whether the program contains any trigger subprograms.
+    pub contains_trigger_subprograms: bool,
+    pub resolve_type: ResolveType,
+    pub prepare_context: PrepareContext,
+    /// Set of attached database indices that need write transactions.
+    pub write_databases: BitSet,
+    /// Set of attached database indices that need read transactions.
+    pub read_databases: BitSet,
+}
+
+#[derive(Clone)]
+pub struct Program {
+    pub(crate) prepared: Arc<PreparedProgram>,
+    pub connection: Arc<Connection>,
+}
+
+/// Captures connection settings at statement preparation time for cache invalidation.
+///
+/// This struct is used to detect when a cached prepared statement needs to be recompiled
+/// because relevant connection settings have changed. When `matches_connection()` returns
+/// false, the statement will be automatically reprepared before execution.
+///
+/// # Adding New Fields
+///
+/// If you add a new setting to `Connection` that affects statement compilation or execution,
+/// When adding a new connection setting that affects query compilation, you MUST call
+/// `bump_prepare_context_generation()` in its setter so that prepared statements know
+/// they need to be reprepared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareContext {
+    /// Identity check: the prepared statement must belong to the same database.
+    database_ptr: usize,
+    /// Generation counter snapshot taken at prepare time. Compared against the
+    /// connection's current generation to detect setting changes (pragmas,
+    /// attach/detach, extension registration, etc.) without rebuilding the full
+    /// context on every step.
+    generation: u64,
+}
+
+impl PrepareContext {
+    pub fn from_connection(connection: &Connection) -> Self {
+        Self {
+            database_ptr: connection.database_ptr(),
+            generation: connection.prepare_context_generation(),
+        }
+    }
+
+    #[inline]
+    pub fn matches_connection(&self, connection: &Connection) -> bool {
+        self.database_ptr == connection.database_ptr()
+            && self.generation == connection.prepare_context_generation()
+    }
+}
+
+impl PreparedProgram {
+    pub fn bind(self: Arc<Self>, connection: Arc<Connection>) -> Program {
+        Program {
+            prepared: self,
+            connection,
+        }
+    }
+
+    pub fn is_compatible_with(&self, connection: &Connection) -> bool {
+        self.prepare_context.matches_connection(connection)
+    }
+
+    #[inline]
+    pub const fn is_readonly(&self) -> bool {
+        self.readonly
+    }
 }
 
 impl Program {
-    pub fn explain(&self) {
-        println!("addr  opcode             p1    p2    p3    p4             p5  comment");
-        println!("----  -----------------  ----  ----  ----  -------------  --  -------");
-        let mut indent_count: usize = 0;
-        let indent = "  ";
-        let mut prev_insn: Option<&Insn> = None;
-        for (addr, insn) in self.insns.iter().enumerate() {
-            indent_count = get_indent_count(indent_count, insn, prev_insn);
-            print_insn(
-                self,
-                addr as InsnReference,
-                insn,
-                indent.repeat(indent_count),
-            );
-            prev_insn = Some(insn);
+    #[inline]
+    pub fn prepared(&self) -> &Arc<PreparedProgram> {
+        &self.prepared
+    }
+
+    pub fn from_prepared(prepared: Arc<PreparedProgram>, connection: Arc<Connection>) -> Self {
+        Self {
+            prepared,
+            connection,
         }
     }
 
-    pub fn step<'a>(
+    #[inline]
+    pub fn is_readonly(&self) -> bool {
+        self.prepared().is_readonly()
+    }
+}
+
+impl Program {
+    fn get_pager_from_database_index(&self, idx: &usize) -> Result<Arc<Pager>> {
+        self.connection.get_pager_from_database_index(idx)
+    }
+
+    #[inline]
+    fn maybe_request_interrupt<I>(&self, state: &mut ProgramState, io: &I) -> bool
+    where
+        I: crate::IO + ?Sized,
+    {
+        let connection_interrupt = self.connection.is_interrupted();
+        let hit_query_deadline = state
+            .query_deadline
+            .is_some_and(|deadline| io.current_time_monotonic() >= deadline);
+        let progress_interrupt = self
+            .connection
+            .should_interrupt_for_progress(state.metrics.vm_steps);
+        if connection_interrupt || hit_query_deadline || progress_interrupt {
+            state.interrupt();
+        }
+        state.is_interrupted()
+    }
+
+    #[turso_macros::trace_stack]
+    pub fn step(
         &self,
-        state: &'a mut ProgramState,
-        pager: Rc<Pager>,
-    ) -> Result<StepResult<'a>> {
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        query_mode: QueryMode,
+        waker: Option<&Waker>,
+    ) -> Result<StepResult> {
+        state.execution_state = ProgramExecutionState::Running;
+        let result = match query_mode {
+            QueryMode::Normal => self.normal_step(state, pager, waker),
+            QueryMode::Explain => self.explain_step(state, pager),
+            QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, pager),
+        };
+        match &result {
+            Ok(StepResult::Done) => {
+                state.execution_state = ProgramExecutionState::Done;
+            }
+            Ok(StepResult::Interrupt) => {
+                state.execution_state = ProgramExecutionState::Interrupted;
+            }
+            Err(_) => {
+                state.execution_state = ProgramExecutionState::Failed;
+            }
+            _ => {}
+        }
+        result
+    }
+
+    fn explain_step(&self, state: &mut ProgramState, pager: &Arc<Pager>) -> Result<StepResult> {
+        turso_debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
+        if self.connection.is_closed() {
+            let tx_state = self.connection.get_tx_state();
+            if let TransactionState::Write { .. } = tx_state {
+                pager.rollback_tx(&self.connection);
+            }
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+
+        if self.maybe_request_interrupt(state, pager.io.as_ref()) {
+            return Ok(StepResult::Interrupt);
+        }
+
+        state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+
+        let mut explain_state = state.explain_state.write();
+
+        // Advance to the next subprogram if the current one is finished
         loop {
-            if state.is_interrupted() {
+            if let Some(ref current) = explain_state.current {
+                if (state.pc as usize) < current.insns.len() {
+                    break;
+                }
+            } else if (state.pc as usize) < self.insns.len() {
+                break;
+            }
+            // Current program is done, pop next subprogram from queue
+            if let Some(next) = explain_state.pending.pop_front() {
+                explain_state.current = Some(next);
+                state.pc = 0;
+            } else {
+                explain_state.current = None;
+                return Ok(StepResult::Done);
+            }
+        }
+
+        let pc = state.pc as usize;
+
+        // Explain the current instruction from the active program.
+        // We collect subprograms separately to avoid borrow conflicts with explain_state.
+        let (row, subprogram) = if let Some(ref current) = explain_state.current {
+            let (insn, _) = &current.insns[pc];
+            let sub = if let Insn::Program {
+                program: subprogram,
+                ..
+            } = insn
+            {
+                Some(subprogram.prepared_program()?)
+            } else {
+                None
+            };
+            let comment = current
+                .comments
+                .iter()
+                .find(|(offset, _)| *offset == state.pc)
+                .map(|(_, c)| *c);
+            (insn_to_row_with_comment(current, insn, comment), sub)
+        } else {
+            let (insn, _) = &self.insns[pc];
+            let sub = if let Insn::Program {
+                program: subprogram,
+                ..
+            } = insn
+            {
+                Some(subprogram.prepared_program()?)
+            } else {
+                None
+            };
+            let comment = self
+                .comments
+                .iter()
+                .find(|(offset, _)| *offset == state.pc)
+                .map(|(_, c)| *c);
+            (insn_to_row_with_comment(self, insn, comment), sub)
+        };
+        if let Some(sub) = subprogram {
+            explain_state.queue_subprogram_once(sub);
+        }
+        let (opcode, p1, p2, p3, p4, p5, comment) = row;
+
+        state.registers[0].set_int(state.pc as i64);
+        state.registers[1].set_value(Value::from_text(opcode));
+        state.registers[2].set_int(p1);
+        state.registers[3].set_int(p2);
+        state.registers[4].set_int(p3);
+        state.registers[5].set_value(p4);
+        state.registers[6].set_int(p5);
+        state.registers[7].set_value(Value::from_text(comment));
+        state.result_row = Some(Row {
+            values: &state.registers[0] as *const Register,
+            count: EXPLAIN_COLUMNS.len(),
+        });
+        state.pc += 1;
+        Ok(StepResult::Row)
+    }
+
+    fn explain_query_plan_step(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<StepResult> {
+        turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
+        loop {
+            if self.connection.is_closed() {
+                // Connection is closed for whatever reason, rollback the transaction.
+                let state = self.connection.get_tx_state();
+                if let TransactionState::Write { .. } = state {
+                    pager.rollback_tx(&self.connection);
+                }
+                return Err(LimboError::InternalError("Connection closed".to_string()));
+            }
+
+            if self.maybe_request_interrupt(state, pager.io.as_ref()) {
                 return Ok(StepResult::Interrupt);
             }
-            let insn = &self.insns[state.pc as usize];
-            trace_insn(self, state.pc as InsnReference, insn);
-            let mut cursors = state.cursors.borrow_mut();
-            match insn {
-                Insn::Init { target_pc } => {
-                    assert!(target_pc.is_offset());
-                    state.pc = target_pc.to_offset_int();
-                }
-                Insn::Add { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_add(&state.registers[*lhs], &state.registers[*rhs]);
-                    state.pc += 1;
-                }
-                Insn::Subtract { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_subtract(&state.registers[*lhs], &state.registers[*rhs]);
-                    state.pc += 1;
-                }
-                Insn::Multiply { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_multiply(&state.registers[*lhs], &state.registers[*rhs]);
-                    state.pc += 1;
-                }
-                Insn::Divide { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_divide(&state.registers[*lhs], &state.registers[*rhs]);
-                    state.pc += 1;
-                }
-                Insn::Remainder { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_remainder(&state.registers[*lhs], &state.registers[*rhs]);
-                    state.pc += 1;
-                }
-                Insn::BitAnd { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_bit_and(&state.registers[*lhs], &state.registers[*rhs]);
-                    state.pc += 1;
-                }
-                Insn::BitOr { lhs, rhs, dest } => {
-                    state.registers[*dest] =
-                        exec_bit_or(&state.registers[*lhs], &state.registers[*rhs]);
-                    state.pc += 1;
-                }
-                Insn::BitNot { reg, dest } => {
-                    state.registers[*dest] = exec_bit_not(&state.registers[*reg]);
-                    state.pc += 1;
-                }
-                Insn::Null { dest, dest_end } => {
-                    if let Some(dest_end) = dest_end {
-                        for i in *dest..=*dest_end {
-                            state.registers[i] = OwnedValue::Null;
-                        }
-                    } else {
-                        state.registers[*dest] = OwnedValue::Null;
-                    }
-                    state.pc += 1;
-                }
-                Insn::NullRow { cursor_id } => {
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    cursor.set_null_flag(true);
-                    state.pc += 1;
-                }
-                Insn::Compare {
-                    start_reg_a,
-                    start_reg_b,
-                    count,
-                } => {
-                    let start_reg_a = *start_reg_a;
-                    let start_reg_b = *start_reg_b;
-                    let count = *count;
 
-                    if start_reg_a + count > start_reg_b {
-                        return Err(LimboError::InternalError(
-                            "Compare registers overlap".to_string(),
-                        ));
-                    }
+            // FIXME: do we need this?
+            state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
-                    let mut cmp = None;
-                    for i in 0..count {
-                        let a = &state.registers[start_reg_a + i];
-                        let b = &state.registers[start_reg_b + i];
-                        cmp = Some(a.cmp(b));
-                        if cmp != Some(std::cmp::Ordering::Equal) {
-                            break;
-                        }
-                    }
-                    state.last_compare = cmp;
-                    state.pc += 1;
-                }
-                Insn::Jump {
-                    target_pc_lt,
-                    target_pc_eq,
-                    target_pc_gt,
-                } => {
-                    assert!(target_pc_lt.is_offset());
-                    assert!(target_pc_eq.is_offset());
-                    assert!(target_pc_gt.is_offset());
-                    let cmp = state.last_compare.take();
-                    if cmp.is_none() {
-                        return Err(LimboError::InternalError(
-                            "Jump without compare".to_string(),
-                        ));
-                    }
-                    let target_pc = match cmp.unwrap() {
-                        std::cmp::Ordering::Less => *target_pc_lt,
-                        std::cmp::Ordering::Equal => *target_pc_eq,
-                        std::cmp::Ordering::Greater => *target_pc_gt,
-                    };
-                    state.pc = target_pc.to_offset_int();
-                }
-                Insn::Move {
-                    source_reg,
-                    dest_reg,
-                    count,
-                } => {
-                    let source_reg = *source_reg;
-                    let dest_reg = *dest_reg;
-                    let count = *count;
-                    for i in 0..count {
-                        state.registers[dest_reg + i] = std::mem::replace(
-                            &mut state.registers[source_reg + i],
-                            OwnedValue::Null,
-                        );
-                    }
-                    state.pc += 1;
-                }
-                Insn::IfPos {
-                    reg,
-                    target_pc,
-                    decrement_by,
-                } => {
-                    assert!(target_pc.is_offset());
-                    let reg = *reg;
-                    let target_pc = *target_pc;
-                    match &state.registers[reg] {
-                        OwnedValue::Integer(n) if *n > 0 => {
-                            state.pc = target_pc.to_offset_int();
-                            state.registers[reg] = OwnedValue::Integer(*n - *decrement_by as i64);
-                        }
-                        OwnedValue::Integer(_) => {
-                            state.pc += 1;
-                        }
-                        _ => {
-                            return Err(LimboError::InternalError(
-                                "IfPos: the value in the register is not an integer".into(),
-                            ));
-                        }
-                    }
-                }
-                Insn::NotNull { reg, target_pc } => {
-                    assert!(target_pc.is_offset());
-                    let reg = *reg;
-                    let target_pc = *target_pc;
-                    match &state.registers[reg] {
-                        OwnedValue::Null => {
-                            state.pc += 1;
-                        }
-                        _ => {
-                            state.pc = target_pc.to_offset_int();
-                        }
-                    }
-                }
+            if state.pc as usize >= self.insns.len() {
+                return Ok(StepResult::Done);
+            }
 
-                Insn::Eq {
-                    lhs,
-                    rhs,
-                    target_pc,
-                } => {
-                    assert!(target_pc.is_offset());
-                    let lhs = *lhs;
-                    let rhs = *rhs;
-                    let target_pc = *target_pc;
-                    match (&state.registers[lhs], &state.registers[rhs]) {
-                        (_, OwnedValue::Null) | (OwnedValue::Null, _) => {
-                            state.pc = target_pc.to_offset_int();
-                        }
-                        _ => {
-                            if state.registers[lhs] == state.registers[rhs] {
-                                state.pc = target_pc.to_offset_int();
-                            } else {
-                                state.pc += 1;
-                            }
-                        }
-                    }
-                }
-                Insn::Ne {
-                    lhs,
-                    rhs,
-                    target_pc,
-                } => {
-                    assert!(target_pc.is_offset());
-                    let lhs = *lhs;
-                    let rhs = *rhs;
-                    let target_pc = *target_pc;
-                    match (&state.registers[lhs], &state.registers[rhs]) {
-                        (_, OwnedValue::Null) | (OwnedValue::Null, _) => {
-                            state.pc = target_pc.to_offset_int();
-                        }
-                        _ => {
-                            if state.registers[lhs] != state.registers[rhs] {
-                                state.pc = target_pc.to_offset_int();
-                            } else {
-                                state.pc += 1;
-                            }
-                        }
-                    }
-                }
-                Insn::Lt {
-                    lhs,
-                    rhs,
-                    target_pc,
-                } => {
-                    assert!(target_pc.is_offset());
-                    let lhs = *lhs;
-                    let rhs = *rhs;
-                    let target_pc = *target_pc;
-                    match (&state.registers[lhs], &state.registers[rhs]) {
-                        (_, OwnedValue::Null) | (OwnedValue::Null, _) => {
-                            state.pc = target_pc.to_offset_int();
-                        }
-                        _ => {
-                            if state.registers[lhs] < state.registers[rhs] {
-                                state.pc = target_pc.to_offset_int();
-                            } else {
-                                state.pc += 1;
-                            }
-                        }
-                    }
-                }
-                Insn::Le {
-                    lhs,
-                    rhs,
-                    target_pc,
-                } => {
-                    assert!(target_pc.is_offset());
-                    let lhs = *lhs;
-                    let rhs = *rhs;
-                    let target_pc = *target_pc;
-                    match (&state.registers[lhs], &state.registers[rhs]) {
-                        (_, OwnedValue::Null) | (OwnedValue::Null, _) => {
-                            state.pc = target_pc.to_offset_int();
-                        }
-                        _ => {
-                            if state.registers[lhs] <= state.registers[rhs] {
-                                state.pc = target_pc.to_offset_int();
-                            } else {
-                                state.pc += 1;
-                            }
-                        }
-                    }
-                }
-                Insn::Gt {
-                    lhs,
-                    rhs,
-                    target_pc,
-                } => {
-                    assert!(target_pc.is_offset());
-                    let lhs = *lhs;
-                    let rhs = *rhs;
-                    let target_pc = *target_pc;
-                    match (&state.registers[lhs], &state.registers[rhs]) {
-                        (_, OwnedValue::Null) | (OwnedValue::Null, _) => {
-                            state.pc = target_pc.to_offset_int();
-                        }
-                        _ => {
-                            if state.registers[lhs] > state.registers[rhs] {
-                                state.pc = target_pc.to_offset_int();
-                            } else {
-                                state.pc += 1;
-                            }
-                        }
-                    }
-                }
-                Insn::Ge {
-                    lhs,
-                    rhs,
-                    target_pc,
-                } => {
-                    assert!(target_pc.is_offset());
-                    let lhs = *lhs;
-                    let rhs = *rhs;
-                    let target_pc = *target_pc;
-                    match (&state.registers[lhs], &state.registers[rhs]) {
-                        (_, OwnedValue::Null) | (OwnedValue::Null, _) => {
-                            state.pc = target_pc.to_offset_int();
-                        }
-                        _ => {
-                            if state.registers[lhs] >= state.registers[rhs] {
-                                state.pc = target_pc.to_offset_int();
-                            } else {
-                                state.pc += 1;
-                            }
-                        }
-                    }
-                }
-                Insn::If {
-                    reg,
-                    target_pc,
-                    null_reg,
-                } => {
-                    assert!(target_pc.is_offset());
-                    if exec_if(&state.registers[*reg], &state.registers[*null_reg], false) {
-                        state.pc = target_pc.to_offset_int();
-                    } else {
-                        state.pc += 1;
-                    }
-                }
-                Insn::IfNot {
-                    reg,
-                    target_pc,
-                    null_reg,
-                } => {
-                    assert!(target_pc.is_offset());
-                    if exec_if(&state.registers[*reg], &state.registers[*null_reg], true) {
-                        state.pc = target_pc.to_offset_int();
-                    } else {
-                        state.pc += 1;
-                    }
-                }
-                Insn::OpenReadAsync {
-                    cursor_id,
-                    root_page,
-                } => {
-                    let cursor = Box::new(BTreeCursor::new(
-                        pager.clone(),
-                        *root_page,
-                        self.database_header.clone(),
-                    ));
-                    cursors.insert(*cursor_id, cursor);
-                    state.pc += 1;
-                }
-                Insn::OpenReadAwait => {
-                    state.pc += 1;
-                }
-                Insn::OpenPseudo {
-                    cursor_id,
-                    content_reg: _,
-                    num_fields: _,
-                } => {
-                    let cursor = Box::new(PseudoCursor::new());
-                    cursors.insert(*cursor_id, cursor);
-                    state.pc += 1;
-                }
-                Insn::RewindAsync { cursor_id } => {
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    return_if_io!(cursor.rewind());
-                    state.pc += 1;
-                }
-                Insn::LastAsync { cursor_id } => {
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    return_if_io!(cursor.last());
-                    state.pc += 1;
-                }
-                Insn::LastAwait {
-                    cursor_id,
-                    pc_if_empty,
-                } => {
-                    assert!(pc_if_empty.is_offset());
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    cursor.wait_for_completion()?;
-                    if cursor.is_empty() {
-                        state.pc = pc_if_empty.to_offset_int();
-                    } else {
-                        state.pc += 1;
-                    }
-                }
-                Insn::RewindAwait {
-                    cursor_id,
-                    pc_if_empty,
-                } => {
-                    assert!(pc_if_empty.is_offset());
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    cursor.wait_for_completion()?;
-                    if cursor.is_empty() {
-                        state.pc = pc_if_empty.to_offset_int();
-                    } else {
-                        state.pc += 1;
-                    }
-                }
-                Insn::Column {
-                    cursor_id,
-                    column,
-                    dest,
-                } => {
-                    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seek.take() {
-                        let index_cursor = cursors.get_mut(&index_cursor_id).unwrap();
-                        let rowid = index_cursor.rowid()?;
-                        let table_cursor = cursors.get_mut(&table_cursor_id).unwrap();
-                        match table_cursor.seek(SeekKey::TableRowId(rowid.unwrap()), SeekOp::EQ)? {
-                            CursorResult::Ok(_) => {}
-                            CursorResult::IO => {
-                                state.deferred_seek = Some((index_cursor_id, table_cursor_id));
-                                return Ok(StepResult::IO);
-                            }
-                        }
-                    }
+            let Insn::Explain { p1, p2, detail } = &self.insns[state.pc as usize].0 else {
+                state.pc += 1;
+                continue;
+            };
 
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    if let Some(ref record) = *cursor.record()? {
-                        let null_flag = cursor.get_null_flag();
-                        state.registers[*dest] = if null_flag {
-                            OwnedValue::Null
-                        } else {
-                            record.values[*column].clone()
-                        };
-                    } else {
-                        state.registers[*dest] = OwnedValue::Null;
-                    }
-                    state.pc += 1;
-                }
-                Insn::MakeRecord {
-                    start_reg,
-                    count,
-                    dest_reg,
-                } => {
-                    let record = make_owned_record(&state.registers, start_reg, count);
-                    state.registers[*dest_reg] = OwnedValue::Record(record);
-                    state.pc += 1;
-                }
-                Insn::ResultRow { start_reg, count } => {
-                    let record = make_record(&state.registers, start_reg, count);
-                    state.pc += 1;
-                    return Ok(StepResult::Row(record));
-                }
-                Insn::NextAsync { cursor_id } => {
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    cursor.set_null_flag(false);
-                    return_if_io!(cursor.next());
-                    state.pc += 1;
-                }
-                Insn::PrevAsync { cursor_id } => {
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    cursor.set_null_flag(false);
-                    return_if_io!(cursor.prev());
-                    state.pc += 1;
-                }
-                Insn::PrevAwait {
-                    cursor_id,
-                    pc_if_next,
-                } => {
-                    assert!(pc_if_next.is_offset());
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    cursor.wait_for_completion()?;
-                    if !cursor.is_empty() {
-                        state.pc = pc_if_next.to_offset_int();
-                    } else {
-                        state.pc += 1;
-                    }
-                }
-                Insn::NextAwait {
-                    cursor_id,
-                    pc_if_next,
-                } => {
-                    assert!(pc_if_next.is_offset());
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    cursor.wait_for_completion()?;
-                    if !cursor.is_empty() {
-                        state.pc = pc_if_next.to_offset_int();
-                    } else {
-                        state.pc += 1;
-                    }
-                }
-                Insn::Halt {
-                    err_code,
-                    description,
-                } => {
-                    match *err_code {
-                        0 => {}
-                        SQLITE_CONSTRAINT_PRIMARYKEY => {
-                            return Err(LimboError::Constraint(format!(
-                                "UNIQUE constraint failed: {} (19)",
-                                description
-                            )));
-                        }
-                        _ => {
-                            return Err(LimboError::Constraint(format!(
-                                "undocumented halt error code {}",
-                                description
-                            )));
-                        }
-                    }
-                    log::trace!("Halt auto_commit {}", self.auto_commit);
-                    if self.auto_commit {
-                        return match pager.end_tx() {
-                            Ok(crate::storage::wal::CheckpointStatus::IO) => Ok(StepResult::IO),
-                            Ok(crate::storage::wal::CheckpointStatus::Done) => Ok(StepResult::Done),
-                            Err(e) => Err(e),
-                        };
-                    } else {
-                        return Ok(StepResult::Done);
-                    }
-                }
-                Insn::Transaction { write } => {
-                    let connection = self.connection.upgrade().unwrap();
-                    let current_state = connection.transaction_state.borrow().clone();
-                    let (new_transaction_state, updated) = match (&current_state, write) {
-                        (crate::TransactionState::Write, true) => (TransactionState::Write, false),
-                        (crate::TransactionState::Write, false) => (TransactionState::Write, false),
-                        (crate::TransactionState::Read, true) => (TransactionState::Write, true),
-                        (crate::TransactionState::Read, false) => (TransactionState::Read, false),
-                        (crate::TransactionState::None, true) => (TransactionState::Write, true),
-                        (crate::TransactionState::None, false) => (TransactionState::Read, true),
-                    };
+            state.registers[0].set_int(*p1 as i64);
+            state.registers[1] =
+                Register::Value(Value::from_i64(p2.as_ref().map(|p| *p).unwrap_or(0) as i64));
+            state.registers[2].set_int(0);
+            state.registers[3].set_value(Value::from_text(detail.clone()));
+            state.result_row = Some(Row {
+                values: &state.registers[0] as *const Register,
+                count: EXPLAIN_QUERY_PLAN_COLUMNS.len(),
+            });
+            state.pc += 1;
+            return Ok(StepResult::Row);
+        }
+    }
 
-                    if updated && matches!(current_state, TransactionState::None) {
-                        if let LimboResult::Busy = pager.begin_read_tx()? {
-                            log::trace!("begin_read_tx busy");
-                            return Ok(StepResult::Busy);
-                        }
-                    }
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn normal_step(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+    ) -> Result<StepResult> {
+        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
+        loop {
+            if self.connection.is_closed() {
+                // Connection is closed for whatever reason, rollback the transaction.
+                let state = self.connection.get_tx_state();
+                if let TransactionState::Write { .. } = state {
+                    pager.rollback_tx(&self.connection);
+                }
+                return Err(LimboError::InternalError("Connection closed".to_string()));
+            }
+            if self.maybe_request_interrupt(state, pager.io.as_ref()) {
+                self.abort(pager, None, state)?;
+                return Ok(StepResult::Interrupt);
+            }
 
-                    if updated && matches!(new_transaction_state, TransactionState::Write) {
-                        if let LimboResult::Busy = pager.begin_write_tx()? {
-                            log::trace!("begin_write_tx busy");
-                            return Ok(StepResult::Busy);
-                        }
-                    }
-                    if updated {
-                        connection
-                            .transaction_state
-                            .replace(new_transaction_state.clone());
-                    }
-                    state.pc += 1;
+            if let Some(io) = &state.io_completions {
+                if !io.finished() {
+                    io.set_waker(waker);
+                    return Ok(StepResult::IO);
                 }
-                Insn::Goto { target_pc } => {
-                    assert!(target_pc.is_offset());
-                    state.pc = target_pc.to_offset_int();
-                }
-                Insn::Gosub {
-                    target_pc,
-                    return_reg,
-                } => {
-                    assert!(target_pc.is_offset());
-                    state.registers[*return_reg] = OwnedValue::Integer((state.pc + 1) as i64);
-                    state.pc = target_pc.to_offset_int();
-                }
-                Insn::Return { return_reg } => {
-                    if let OwnedValue::Integer(pc) = state.registers[*return_reg] {
-                        let pc: u32 = pc
-                            .try_into()
-                            .unwrap_or_else(|_| panic!("Return register is negative: {}", pc));
-                        state.pc = pc;
-                    } else {
-                        return Err(LimboError::InternalError(
-                            "Return register is not an integer".to_string(),
-                        ));
-                    }
-                }
-                Insn::Integer { value, dest } => {
-                    state.registers[*dest] = OwnedValue::Integer(*value);
-                    state.pc += 1;
-                }
-                Insn::Real { value, dest } => {
-                    state.registers[*dest] = OwnedValue::Float(*value);
-                    state.pc += 1;
-                }
-                Insn::RealAffinity { register } => {
-                    if let OwnedValue::Integer(i) = &state.registers[*register] {
-                        state.registers[*register] = OwnedValue::Float(*i as f64);
-                    };
-                    state.pc += 1;
-                }
-                Insn::String8 { value, dest } => {
-                    state.registers[*dest] = OwnedValue::build_text(Rc::new(value.into()));
-                    state.pc += 1;
-                }
-                Insn::Blob { value, dest } => {
-                    state.registers[*dest] = OwnedValue::Blob(Rc::new(value.clone()));
-                    state.pc += 1;
-                }
-                Insn::RowId { cursor_id, dest } => {
-                    if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seek.take() {
-                        let index_cursor = cursors.get_mut(&index_cursor_id).unwrap();
-                        let rowid = index_cursor.rowid()?;
-                        let table_cursor = cursors.get_mut(&table_cursor_id).unwrap();
-                        match table_cursor.seek(SeekKey::TableRowId(rowid.unwrap()), SeekOp::EQ)? {
-                            CursorResult::Ok(_) => {}
-                            CursorResult::IO => {
-                                state.deferred_seek = Some((index_cursor_id, table_cursor_id));
-                                return Ok(StepResult::IO);
-                            }
-                        }
-                    }
-
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    if let Some(ref rowid) = cursor.rowid()? {
-                        state.registers[*dest] = OwnedValue::Integer(*rowid as i64);
-                    } else {
-                        state.registers[*dest] = OwnedValue::Null;
-                    }
-                    state.pc += 1;
-                }
-                Insn::SeekRowid {
-                    cursor_id,
-                    src_reg,
-                    target_pc,
-                } => {
-                    assert!(target_pc.is_offset());
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    let rowid = match &state.registers[*src_reg] {
-                        OwnedValue::Integer(rowid) => *rowid as u64,
-                        OwnedValue::Null => {
-                            state.pc = target_pc.to_offset_int();
-                            continue;
-                        }
-                        other => {
-                            return Err(LimboError::InternalError(
-                                format!("SeekRowid: the value in the register is not an integer or NULL: {}", other)
-                            ));
-                        }
-                    };
-                    let found = return_if_io!(cursor.seek(SeekKey::TableRowId(rowid), SeekOp::EQ));
-                    if !found {
-                        state.pc = target_pc.to_offset_int();
-                    } else {
-                        state.pc += 1;
-                    }
-                }
-                Insn::DeferredSeek {
-                    index_cursor_id,
-                    table_cursor_id,
-                } => {
-                    state.deferred_seek = Some((*index_cursor_id, *table_cursor_id));
-                    state.pc += 1;
-                }
-                Insn::SeekGE {
-                    cursor_id,
-                    start_reg,
-                    num_regs,
-                    target_pc,
-                    is_index,
-                } => {
-                    assert!(target_pc.is_offset());
-                    if *is_index {
-                        let cursor = cursors.get_mut(cursor_id).unwrap();
-                        let record_from_regs: OwnedRecord =
-                            make_owned_record(&state.registers, start_reg, num_regs);
-                        let found = return_if_io!(
-                            cursor.seek(SeekKey::IndexKey(&record_from_regs), SeekOp::GE)
-                        );
-                        if !found {
-                            state.pc = target_pc.to_offset_int();
-                        } else {
-                            state.pc += 1;
-                        }
-                    } else {
-                        let cursor = cursors.get_mut(cursor_id).unwrap();
-                        let rowid = match &state.registers[*start_reg] {
-                            OwnedValue::Null => {
-                                // All integer values are greater than null so we just rewind the cursor
-                                return_if_io!(cursor.rewind());
-                                state.pc += 1;
-                                continue;
-                            }
-                            OwnedValue::Integer(rowid) => *rowid as u64,
-                            _ => {
-                                return Err(LimboError::InternalError(
-                                    "SeekGE: the value in the register is not an integer".into(),
-                                ));
-                            }
-                        };
-                        let found =
-                            return_if_io!(cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE));
-                        if !found {
-                            state.pc = target_pc.to_offset_int();
-                        } else {
-                            state.pc += 1;
-                        }
-                    }
-                }
-                Insn::SeekGT {
-                    cursor_id,
-                    start_reg,
-                    num_regs,
-                    target_pc,
-                    is_index,
-                } => {
-                    assert!(target_pc.is_offset());
-                    if *is_index {
-                        let cursor = cursors.get_mut(cursor_id).unwrap();
-                        let record_from_regs: OwnedRecord =
-                            make_owned_record(&state.registers, start_reg, num_regs);
-                        let found = return_if_io!(
-                            cursor.seek(SeekKey::IndexKey(&record_from_regs), SeekOp::GT)
-                        );
-                        if !found {
-                            state.pc = target_pc.to_offset_int();
-                        } else {
-                            state.pc += 1;
-                        }
-                    } else {
-                        let cursor = cursors.get_mut(cursor_id).unwrap();
-                        let rowid = match &state.registers[*start_reg] {
-                            OwnedValue::Null => {
-                                // All integer values are greater than null so we just rewind the cursor
-                                return_if_io!(cursor.rewind());
-                                state.pc += 1;
-                                continue;
-                            }
-                            OwnedValue::Integer(rowid) => *rowid as u64,
-                            _ => {
-                                return Err(LimboError::InternalError(
-                                    "SeekGT: the value in the register is not an integer".into(),
-                                ));
-                            }
-                        };
-                        let found =
-                            return_if_io!(cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GT));
-                        if !found {
-                            state.pc = target_pc.to_offset_int();
-                        } else {
-                            state.pc += 1;
-                        }
-                    }
-                }
-                Insn::IdxGE {
-                    cursor_id,
-                    start_reg,
-                    num_regs,
-                    target_pc,
-                } => {
-                    assert!(target_pc.is_offset());
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    let record_from_regs: OwnedRecord =
-                        make_owned_record(&state.registers, start_reg, num_regs);
-                    if let Some(ref idx_record) = *cursor.record()? {
-                        // omit the rowid from the idx_record, which is the last value
-                        if idx_record.values[..idx_record.values.len() - 1]
-                            >= *record_from_regs.values
-                        {
-                            state.pc = target_pc.to_offset_int();
-                        } else {
-                            state.pc += 1;
-                        }
-                    } else {
-                        state.pc = target_pc.to_offset_int();
-                    }
-                }
-                Insn::IdxGT {
-                    cursor_id,
-                    start_reg,
-                    num_regs,
-                    target_pc,
-                } => {
-                    assert!(target_pc.is_offset());
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    let record_from_regs: OwnedRecord =
-                        make_owned_record(&state.registers, start_reg, num_regs);
-                    if let Some(ref idx_record) = *cursor.record()? {
-                        // omit the rowid from the idx_record, which is the last value
-                        if idx_record.values[..idx_record.values.len() - 1]
-                            > *record_from_regs.values
-                        {
-                            state.pc = target_pc.to_offset_int();
-                        } else {
-                            state.pc += 1;
-                        }
-                    } else {
-                        state.pc = target_pc.to_offset_int();
-                    }
-                }
-                Insn::DecrJumpZero { reg, target_pc } => {
-                    assert!(target_pc.is_offset());
-                    match state.registers[*reg] {
-                        OwnedValue::Integer(n) => {
-                            let n = n - 1;
-                            if n == 0 {
-                                state.pc = target_pc.to_offset_int();
-                            } else {
-                                state.registers[*reg] = OwnedValue::Integer(n);
-                                state.pc += 1;
-                            }
-                        }
-                        _ => unreachable!("DecrJumpZero on non-integer register"),
-                    }
-                }
-                Insn::AggStep {
-                    acc_reg,
-                    col,
-                    delimiter,
-                    func,
-                } => {
-                    if let OwnedValue::Null = &state.registers[*acc_reg] {
-                        state.registers[*acc_reg] = match func {
-                            AggFunc::Avg => OwnedValue::Agg(Box::new(AggContext::Avg(
-                                OwnedValue::Float(0.0),
-                                OwnedValue::Integer(0),
-                            ))),
-                            AggFunc::Sum => {
-                                OwnedValue::Agg(Box::new(AggContext::Sum(OwnedValue::Null)))
-                            }
-                            AggFunc::Total => {
-                                // The result of total() is always a floating point value.
-                                // No overflow error is ever raised if any prior input was a floating point value.
-                                // Total() never throws an integer overflow.
-                                OwnedValue::Agg(Box::new(AggContext::Sum(OwnedValue::Float(0.0))))
-                            }
-                            AggFunc::Count => {
-                                OwnedValue::Agg(Box::new(AggContext::Count(OwnedValue::Integer(0))))
-                            }
-                            AggFunc::Max => {
-                                let col = state.registers[*col].clone();
-                                match col {
-                                    OwnedValue::Integer(_) => {
-                                        OwnedValue::Agg(Box::new(AggContext::Max(None)))
-                                    }
-                                    OwnedValue::Float(_) => {
-                                        OwnedValue::Agg(Box::new(AggContext::Max(None)))
-                                    }
-                                    OwnedValue::Text(_) => {
-                                        OwnedValue::Agg(Box::new(AggContext::Max(None)))
-                                    }
-                                    _ => {
-                                        unreachable!();
-                                    }
-                                }
-                            }
-                            AggFunc::Min => {
-                                let col = state.registers[*col].clone();
-                                match col {
-                                    OwnedValue::Integer(_) => {
-                                        OwnedValue::Agg(Box::new(AggContext::Min(None)))
-                                    }
-                                    OwnedValue::Float(_) => {
-                                        OwnedValue::Agg(Box::new(AggContext::Min(None)))
-                                    }
-                                    OwnedValue::Text(_) => {
-                                        OwnedValue::Agg(Box::new(AggContext::Min(None)))
-                                    }
-                                    _ => {
-                                        unreachable!();
-                                    }
-                                }
-                            }
-                            AggFunc::GroupConcat | AggFunc::StringAgg => {
-                                OwnedValue::Agg(Box::new(AggContext::GroupConcat(
-                                    OwnedValue::build_text(Rc::new("".to_string())),
-                                )))
-                            }
-                        };
-                    }
-                    match func {
-                        AggFunc::Avg => {
-                            let col = state.registers[*col].clone();
-                            let OwnedValue::Agg(agg) = state.registers[*acc_reg].borrow_mut()
-                            else {
-                                unreachable!();
-                            };
-                            let AggContext::Avg(acc, count) = agg.borrow_mut() else {
-                                unreachable!();
-                            };
-                            *acc += col;
-                            *count += 1;
-                        }
-                        AggFunc::Sum | AggFunc::Total => {
-                            let col = state.registers[*col].clone();
-                            let OwnedValue::Agg(agg) = state.registers[*acc_reg].borrow_mut()
-                            else {
-                                unreachable!();
-                            };
-                            let AggContext::Sum(acc) = agg.borrow_mut() else {
-                                unreachable!();
-                            };
-                            *acc += col;
-                        }
-                        AggFunc::Count => {
-                            let OwnedValue::Agg(agg) = state.registers[*acc_reg].borrow_mut()
-                            else {
-                                unreachable!();
-                            };
-                            let AggContext::Count(count) = agg.borrow_mut() else {
-                                unreachable!();
-                            };
-                            *count += 1;
-                        }
-                        AggFunc::Max => {
-                            let col = state.registers[*col].clone();
-                            let OwnedValue::Agg(agg) = state.registers[*acc_reg].borrow_mut()
-                            else {
-                                unreachable!();
-                            };
-                            let AggContext::Max(acc) = agg.borrow_mut() else {
-                                unreachable!();
-                            };
-
-                            match (acc.as_mut(), col) {
-                                (None, value) => {
-                                    *acc = Some(value);
-                                }
-                                (
-                                    Some(OwnedValue::Integer(ref mut current_max)),
-                                    OwnedValue::Integer(value),
-                                ) => {
-                                    if value > *current_max {
-                                        *current_max = value;
-                                    }
-                                }
-                                (
-                                    Some(OwnedValue::Float(ref mut current_max)),
-                                    OwnedValue::Float(value),
-                                ) => {
-                                    if value > *current_max {
-                                        *current_max = value;
-                                    }
-                                }
-                                (
-                                    Some(OwnedValue::Text(ref mut current_max)),
-                                    OwnedValue::Text(value),
-                                ) => {
-                                    if value.value > current_max.value {
-                                        *current_max = value;
-                                    }
-                                }
-                                _ => {
-                                    eprintln!("Unexpected types in max aggregation");
-                                }
-                            }
-                        }
-                        AggFunc::Min => {
-                            let col = state.registers[*col].clone();
-                            let OwnedValue::Agg(agg) = state.registers[*acc_reg].borrow_mut()
-                            else {
-                                unreachable!();
-                            };
-                            let AggContext::Min(acc) = agg.borrow_mut() else {
-                                unreachable!();
-                            };
-
-                            match (acc.as_mut(), col) {
-                                (None, value) => {
-                                    *acc.borrow_mut() = Some(value);
-                                }
-                                (
-                                    Some(OwnedValue::Integer(ref mut current_min)),
-                                    OwnedValue::Integer(value),
-                                ) => {
-                                    if value < *current_min {
-                                        *current_min = value;
-                                    }
-                                }
-                                (
-                                    Some(OwnedValue::Float(ref mut current_min)),
-                                    OwnedValue::Float(value),
-                                ) => {
-                                    if value < *current_min {
-                                        *current_min = value;
-                                    }
-                                }
-                                (
-                                    Some(OwnedValue::Text(ref mut current_min)),
-                                    OwnedValue::Text(text),
-                                ) => {
-                                    if text.value < current_min.value {
-                                        *current_min = text;
-                                    }
-                                }
-                                _ => {
-                                    eprintln!("Unexpected types in min aggregation");
-                                }
-                            }
-                        }
-                        AggFunc::GroupConcat | AggFunc::StringAgg => {
-                            let col = state.registers[*col].clone();
-                            let delimiter = state.registers[*delimiter].clone();
-                            let OwnedValue::Agg(agg) = state.registers[*acc_reg].borrow_mut()
-                            else {
-                                unreachable!();
-                            };
-                            let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
-                                unreachable!();
-                            };
-                            if acc.to_string().is_empty() {
-                                *acc = col;
-                            } else {
-                                *acc += delimiter;
-                                *acc += col;
-                            }
-                        }
-                    };
-                    state.pc += 1;
-                }
-                Insn::AggFinal { register, func } => {
-                    match state.registers[*register].borrow_mut() {
-                        OwnedValue::Agg(agg) => {
-                            match func {
-                                AggFunc::Avg => {
-                                    let AggContext::Avg(acc, count) = agg.borrow_mut() else {
-                                        unreachable!();
-                                    };
-                                    *acc /= count.clone();
-                                }
-                                AggFunc::Sum | AggFunc::Total => {}
-                                AggFunc::Count => {}
-                                AggFunc::Max => {}
-                                AggFunc::Min => {}
-                                AggFunc::GroupConcat | AggFunc::StringAgg => {}
-                            };
-                        }
-                        OwnedValue::Null => {
-                            // when the set is empty
-                            match func {
-                                AggFunc::Total => {
-                                    state.registers[*register] = OwnedValue::Float(0.0);
-                                }
-                                AggFunc::Count => {
-                                    state.registers[*register] = OwnedValue::Integer(0);
-                                }
-                                _ => {}
-                            }
-                        }
-                        _ => {
-                            unreachable!();
-                        }
-                    };
-                    state.pc += 1;
-                }
-                Insn::SorterOpen {
-                    cursor_id,
-                    columns: _,
-                    order,
-                } => {
-                    let order = order
-                        .values
-                        .iter()
-                        .map(|v| match v {
-                            OwnedValue::Integer(i) => *i == 0,
-                            _ => unreachable!(),
-                        })
-                        .collect();
-                    let cursor = Box::new(sorter::Sorter::new(order));
-                    cursors.insert(*cursor_id, cursor);
-                    state.pc += 1;
-                }
-                Insn::SorterData {
-                    cursor_id,
-                    dest_reg,
-                    pseudo_cursor: sorter_cursor,
-                } => {
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    let record = match *cursor.record()? {
-                        Some(ref record) => record.clone(),
-                        None => {
-                            state.pc += 1;
-                            continue;
-                        }
-                    };
-                    state.registers[*dest_reg] = OwnedValue::Record(record.clone());
-                    let sorter_cursor = cursors.get_mut(sorter_cursor).unwrap();
-                    sorter_cursor.insert(&OwnedValue::Integer(0), &record, false)?; // fix key later
-                    state.pc += 1;
-                }
-                Insn::SorterInsert {
-                    cursor_id,
-                    record_reg,
-                } => {
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    let record = match &state.registers[*record_reg] {
-                        OwnedValue::Record(record) => record,
-                        _ => unreachable!("SorterInsert on non-record register"),
-                    };
-                    // TODO: set correct key
-                    cursor.insert(&OwnedValue::Integer(0), record, false)?;
-                    state.pc += 1;
-                }
-                Insn::SorterSort {
-                    cursor_id,
-                    pc_if_empty,
-                } => {
-                    if let Some(cursor) = cursors.get_mut(cursor_id) {
-                        cursor.rewind()?;
-                        state.pc += 1;
-                    } else {
-                        state.pc = pc_if_empty.to_offset_int();
-                    }
-                }
-                Insn::SorterNext {
-                    cursor_id,
-                    pc_if_next,
-                } => {
-                    assert!(pc_if_next.is_offset());
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    return_if_io!(cursor.next());
-                    if !cursor.is_empty() {
-                        state.pc = pc_if_next.to_offset_int();
-                    } else {
-                        state.pc += 1;
-                    }
-                }
-                Insn::Function {
-                    constant_mask,
-                    func,
-                    start_reg,
-                    dest,
-                } => {
-                    let arg_count = func.arg_count;
-                    match &func.func {
-                        #[cfg(feature = "json")]
-                        crate::function::Func::Json(JsonFunc::Json) => {
-                            let json_value = &state.registers[*start_reg];
-                            let json_str = get_json(json_value);
-                            match json_str {
-                                Ok(json) => state.registers[*dest] = json,
-                                Err(e) => return Err(e),
-                            }
-                        }
-                        #[cfg(feature = "json")]
-                        crate::function::Func::Json(JsonFunc::JsonArray) => {
-                            let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-
-                            let json_array = json_array(reg_values);
-
-                            match json_array {
-                                Ok(json) => state.registers[*dest] = json,
-                                Err(e) => return Err(e),
-                            }
-                        }
-                        #[cfg(feature = "json")]
-                        crate::function::Func::Json(JsonFunc::JsonExtract) => {
-                            let result = match arg_count {
-                                0 => json_extract(&OwnedValue::Null, &[]),
-                                _ => {
-                                    let val = &state.registers[*start_reg];
-                                    let reg_values =
-                                        &state.registers[*start_reg + 1..*start_reg + arg_count];
-
-                                    json_extract(val, reg_values)
-                                }
-                            };
-
-                            match result {
-                                Ok(json) => state.registers[*dest] = json,
-                                Err(e) => return Err(e),
-                            }
-                        }
-                        #[cfg(feature = "json")]
-                        crate::function::Func::Json(
-                            func @ (JsonFunc::JsonArrowExtract | JsonFunc::JsonArrowShiftExtract),
-                        ) => {
-                            assert_eq!(arg_count, 2);
-                            let json = &state.registers[*start_reg];
-                            let path = &state.registers[*start_reg + 1];
-                            let func = match func {
-                                JsonFunc::JsonArrowExtract => json_arrow_extract,
-                                JsonFunc::JsonArrowShiftExtract => json_arrow_shift_extract,
-                                _ => unreachable!(),
-                            };
-                            let json_str = func(json, path);
-                            match json_str {
-                                Ok(json) => state.registers[*dest] = json,
-                                Err(e) => return Err(e),
-                            }
-                        }
-                        #[cfg(feature = "json")]
-                        crate::function::Func::Json(
-                            func @ (JsonFunc::JsonArrayLength | JsonFunc::JsonType),
-                        ) => {
-                            let json_value = &state.registers[*start_reg];
-                            let path_value = if arg_count > 1 {
-                                Some(&state.registers[*start_reg + 1])
-                            } else {
-                                None
-                            };
-                            let func_result = match func {
-                                JsonFunc::JsonArrayLength => {
-                                    json_array_length(json_value, path_value)
-                                }
-                                JsonFunc::JsonType => json_type(json_value, path_value),
-                                _ => unreachable!(),
-                            };
-
-                            match func_result {
-                                Ok(result) => state.registers[*dest] = result,
-                                Err(e) => return Err(e),
-                            }
-                        }
-                        crate::function::Func::Scalar(scalar_func) => match scalar_func {
-                            ScalarFunc::Cast => {
-                                assert!(arg_count == 2);
-                                assert!(*start_reg + 1 < state.registers.len());
-                                let reg_value_argument = state.registers[*start_reg].clone();
-                                let OwnedValue::Text(reg_value_type) =
-                                    state.registers[*start_reg + 1].clone()
-                                else {
-                                    unreachable!("Cast with non-text type");
-                                };
-                                let result = exec_cast(&reg_value_argument, &reg_value_type.value);
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::Changes => {
-                                let res = &self.connection.upgrade().unwrap().last_change;
-                                let changes = res.get();
-                                state.registers[*dest] = OwnedValue::Integer(changes);
-                            }
-                            ScalarFunc::Char => {
-                                let reg_values =
-                                    state.registers[*start_reg..*start_reg + arg_count].to_vec();
-                                state.registers[*dest] = exec_char(reg_values);
-                            }
-                            ScalarFunc::Coalesce => {}
-                            ScalarFunc::Concat => {
-                                let result = exec_concat(
-                                    &state.registers[*start_reg..*start_reg + arg_count],
-                                );
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::ConcatWs => {
-                                let result = exec_concat_ws(
-                                    &state.registers[*start_reg..*start_reg + arg_count],
-                                );
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::Glob => {
-                                let pattern = &state.registers[*start_reg];
-                                let text = &state.registers[*start_reg + 1];
-                                let result = match (pattern, text) {
-                                    (OwnedValue::Text(pattern), OwnedValue::Text(text)) => {
-                                        let cache = if *constant_mask > 0 {
-                                            Some(&mut state.regex_cache.glob)
-                                        } else {
-                                            None
-                                        };
-                                        OwnedValue::Integer(exec_glob(
-                                            cache,
-                                            &pattern.value,
-                                            &text.value,
-                                        )
-                                            as i64)
-                                    }
-                                    _ => {
-                                        unreachable!("Like on non-text registers");
-                                    }
-                                };
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::IfNull => {}
-                            ScalarFunc::Iif => {}
-                            ScalarFunc::Instr => {
-                                let reg_value = &state.registers[*start_reg];
-                                let pattern_value = &state.registers[*start_reg + 1];
-                                let result = exec_instr(reg_value, pattern_value);
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::LastInsertRowid => {
-                                if let Some(conn) = self.connection.upgrade() {
-                                    state.registers[*dest] =
-                                        OwnedValue::Integer(conn.last_insert_rowid() as i64);
-                                } else {
-                                    state.registers[*dest] = OwnedValue::Null;
-                                }
-                            }
-                            ScalarFunc::Like => {
-                                let pattern = &state.registers[*start_reg];
-                                let text = &state.registers[*start_reg + 1];
-
-                                let result = match (pattern, text) {
-                                    (OwnedValue::Text(pattern), OwnedValue::Text(text))
-                                        if arg_count == 3 =>
-                                    {
-                                        let escape = match construct_like_escape_arg(
-                                            &state.registers[*start_reg + 2],
-                                        ) {
-                                            Ok(x) => x,
-                                            Err(e) => return Result::Err(e),
-                                        };
-
-                                        OwnedValue::Integer(exec_like_with_escape(
-                                            &pattern.value,
-                                            &text.value,
-                                            escape,
-                                        )
-                                            as i64)
-                                    }
-                                    (OwnedValue::Text(pattern), OwnedValue::Text(text)) => {
-                                        let cache = if *constant_mask > 0 {
-                                            Some(&mut state.regex_cache.like)
-                                        } else {
-                                            None
-                                        };
-                                        OwnedValue::Integer(exec_like(
-                                            cache,
-                                            &pattern.value,
-                                            &text.value,
-                                        )
-                                            as i64)
-                                    }
-                                    _ => {
-                                        unreachable!("Like on non-text registers");
-                                    }
-                                };
-
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::Abs
-                            | ScalarFunc::Lower
-                            | ScalarFunc::Upper
-                            | ScalarFunc::Length
-                            | ScalarFunc::OctetLength
-                            | ScalarFunc::Typeof
-                            | ScalarFunc::Unicode
-                            | ScalarFunc::Quote
-                            | ScalarFunc::RandomBlob
-                            | ScalarFunc::Sign
-                            | ScalarFunc::Soundex
-                            | ScalarFunc::ZeroBlob => {
-                                let reg_value = state.registers[*start_reg].borrow_mut();
-                                let result = match scalar_func {
-                                    ScalarFunc::Sign => exec_sign(reg_value),
-                                    ScalarFunc::Abs => exec_abs(reg_value),
-                                    ScalarFunc::Lower => exec_lower(reg_value),
-                                    ScalarFunc::Upper => exec_upper(reg_value),
-                                    ScalarFunc::Length => Some(exec_length(reg_value)),
-                                    ScalarFunc::OctetLength => Some(exec_octet_length(reg_value)),
-                                    ScalarFunc::Typeof => Some(exec_typeof(reg_value)),
-                                    ScalarFunc::Unicode => Some(exec_unicode(reg_value)),
-                                    ScalarFunc::Quote => Some(exec_quote(reg_value)),
-                                    ScalarFunc::RandomBlob => Some(exec_randomblob(reg_value)),
-                                    ScalarFunc::ZeroBlob => Some(exec_zeroblob(reg_value)),
-                                    ScalarFunc::Soundex => Some(exec_soundex(reg_value)),
-                                    _ => unreachable!(),
-                                };
-                                state.registers[*dest] = result.unwrap_or(OwnedValue::Null);
-                            }
-                            ScalarFunc::Hex => {
-                                let reg_value = state.registers[*start_reg].borrow_mut();
-                                let result = exec_hex(reg_value);
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::Unhex => {
-                                let reg_value = state.registers[*start_reg].clone();
-                                let ignored_chars = state.registers.get(*start_reg + 1);
-                                let result = exec_unhex(&reg_value, ignored_chars);
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::Random => {
-                                state.registers[*dest] = exec_random();
-                            }
-                            ScalarFunc::Trim => {
-                                let reg_value = state.registers[*start_reg].clone();
-                                let pattern_value = state.registers.get(*start_reg + 1).cloned();
-                                let result = exec_trim(&reg_value, pattern_value);
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::LTrim => {
-                                let reg_value = state.registers[*start_reg].clone();
-                                let pattern_value = state.registers.get(*start_reg + 1).cloned();
-                                let result = exec_ltrim(&reg_value, pattern_value);
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::RTrim => {
-                                let reg_value = state.registers[*start_reg].clone();
-                                let pattern_value = state.registers.get(*start_reg + 1).cloned();
-                                let result = exec_rtrim(&reg_value, pattern_value);
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::Round => {
-                                let reg_value = state.registers[*start_reg].clone();
-                                assert!(arg_count == 1 || arg_count == 2);
-                                let precision_value = if arg_count > 1 {
-                                    Some(state.registers[*start_reg + 1].clone())
-                                } else {
-                                    None
-                                };
-                                let result = exec_round(&reg_value, precision_value);
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::Min => {
-                                let reg_values = state.registers
-                                    [*start_reg..*start_reg + arg_count]
-                                    .iter()
-                                    .collect();
-                                state.registers[*dest] = exec_min(reg_values);
-                            }
-                            ScalarFunc::Max => {
-                                let reg_values = state.registers
-                                    [*start_reg..*start_reg + arg_count]
-                                    .iter()
-                                    .collect();
-                                state.registers[*dest] = exec_max(reg_values);
-                            }
-                            ScalarFunc::Nullif => {
-                                let first_value = &state.registers[*start_reg];
-                                let second_value = &state.registers[*start_reg + 1];
-                                state.registers[*dest] = exec_nullif(first_value, second_value);
-                            }
-                            ScalarFunc::Substr | ScalarFunc::Substring => {
-                                let str_value = &state.registers[*start_reg];
-                                let start_value = &state.registers[*start_reg + 1];
-                                let length_value = &state.registers[*start_reg + 2];
-                                let result = exec_substring(str_value, start_value, length_value);
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::Date => {
-                                let result =
-                                    exec_date(&state.registers[*start_reg..*start_reg + arg_count]);
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::Time => {
-                                let result =
-                                    exec_time(&state.registers[*start_reg..*start_reg + arg_count]);
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::TotalChanges => {
-                                let res = &self.connection.upgrade().unwrap().total_changes;
-                                let total_changes = res.get();
-                                state.registers[*dest] = OwnedValue::Integer(total_changes);
-                            }
-                            ScalarFunc::DateTime => {
-                                let result = exec_datetime_full(
-                                    &state.registers[*start_reg..*start_reg + arg_count],
-                                );
-                                state.registers[*dest] = result;
-                            }
-                            ScalarFunc::JulianDay => {
-                                if *start_reg == 0 {
-                                    let julianday: String = exec_julianday(
-                                        &OwnedValue::build_text(Rc::new("now".to_string())),
-                                    )?;
-                                    state.registers[*dest] =
-                                        OwnedValue::build_text(Rc::new(julianday));
-                                } else {
-                                    let datetime_value = &state.registers[*start_reg];
-                                    let julianday = exec_julianday(datetime_value);
-                                    match julianday {
-                                        Ok(time) => {
-                                            state.registers[*dest] =
-                                                OwnedValue::build_text(Rc::new(time))
-                                        }
-                                        Err(e) => {
-                                            return Err(LimboError::ParseError(format!(
-                                                "Error encountered while parsing datetime value: {}",
-                                                e
-                                            )));
-                                        }
-                                    }
-                                }
-                            }
-                            ScalarFunc::UnixEpoch => {
-                                if *start_reg == 0 {
-                                    let unixepoch: String = exec_unixepoch(
-                                        &OwnedValue::build_text(Rc::new("now".to_string())),
-                                    )?;
-                                    state.registers[*dest] =
-                                        OwnedValue::build_text(Rc::new(unixepoch));
-                                } else {
-                                    let datetime_value = &state.registers[*start_reg];
-                                    let unixepoch = exec_unixepoch(datetime_value);
-                                    match unixepoch {
-                                        Ok(time) => {
-                                            state.registers[*dest] =
-                                                OwnedValue::build_text(Rc::new(time))
-                                        }
-                                        Err(e) => {
-                                            return Err(LimboError::ParseError(format!(
-                                                "Error encountered while parsing datetime value: {}",
-                                                e
-                                            )));
-                                        }
-                                    }
-                                }
-                            }
-                            ScalarFunc::SqliteVersion => {
-                                let version_integer: i64 =
-                                    DATABASE_VERSION.get().unwrap().parse()?;
-                                let version = execute_sqlite_version(version_integer);
-                                state.registers[*dest] = OwnedValue::build_text(Rc::new(version));
-                            }
-                            ScalarFunc::Replace => {
-                                assert!(arg_count == 3);
-                                let source = &state.registers[*start_reg];
-                                let pattern = &state.registers[*start_reg + 1];
-                                let replacement = &state.registers[*start_reg + 2];
-                                state.registers[*dest] = exec_replace(source, pattern, replacement);
-                            }
-                        },
-                        #[allow(unreachable_patterns)]
-                        crate::function::Func::Extension(extfn) => match extfn {
-                            #[cfg(feature = "uuid")]
-                            ExtFunc::Uuid(uuidfn) => match uuidfn {
-                                UuidFunc::Uuid4Str => {
-                                    state.registers[*dest] = exec_uuid(uuidfn, None)?
-                                }
-                                UuidFunc::Uuid7 => match arg_count {
-                                    0 => {
-                                        state.registers[*dest] =
-                                            exec_uuid(uuidfn, None).unwrap_or(OwnedValue::Null);
-                                    }
-                                    1 => {
-                                        let reg_value = state.registers[*start_reg].borrow();
-                                        state.registers[*dest] = exec_uuid(uuidfn, Some(reg_value))
-                                            .unwrap_or(OwnedValue::Null);
-                                    }
-                                    _ => unreachable!(),
-                                },
-                                _ => {
-                                    // remaining accept 1 arg
-                                    let reg_value = state.registers[*start_reg].borrow();
-                                    state.registers[*dest] = match uuidfn {
-                                        UuidFunc::Uuid7TS => Some(exec_ts_from_uuid7(reg_value)),
-                                        UuidFunc::UuidStr => exec_uuidstr(reg_value).ok(),
-                                        UuidFunc::UuidBlob => exec_uuidblob(reg_value).ok(),
-                                        _ => unreachable!(),
-                                    }
-                                    .unwrap_or(OwnedValue::Null);
-                                }
-                            },
-                            _ => unreachable!(), // when more extension types are added
-                        },
-                        crate::function::Func::External(f) => {
-                            let result = (f.func)(&[])?;
-                            state.registers[*dest] = result;
-                        }
-                        crate::function::Func::Math(math_func) => match math_func.arity() {
-                            MathFuncArity::Nullary => match math_func {
-                                MathFunc::Pi => {
-                                    state.registers[*dest] =
-                                        OwnedValue::Float(std::f64::consts::PI);
-                                }
-                                _ => {
-                                    unreachable!(
-                                        "Unexpected mathematical Nullary function {:?}",
-                                        math_func
-                                    );
-                                }
-                            },
-
-                            MathFuncArity::Unary => {
-                                let reg_value = &state.registers[*start_reg];
-                                let result = exec_math_unary(reg_value, math_func);
-                                state.registers[*dest] = result;
-                            }
-
-                            MathFuncArity::Binary => {
-                                let lhs = &state.registers[*start_reg];
-                                let rhs = &state.registers[*start_reg + 1];
-                                let result = exec_math_binary(lhs, rhs, math_func);
-                                state.registers[*dest] = result;
-                            }
-
-                            MathFuncArity::UnaryOrBinary => match math_func {
-                                MathFunc::Log => {
-                                    let result = match arg_count {
-                                        1 => {
-                                            let arg = &state.registers[*start_reg];
-                                            exec_math_log(arg, None)
-                                        }
-                                        2 => {
-                                            let base = &state.registers[*start_reg];
-                                            let arg = &state.registers[*start_reg + 1];
-                                            exec_math_log(arg, Some(base))
-                                        }
-                                        _ => unreachable!(
-                                            "{:?} function with unexpected number of arguments",
-                                            math_func
-                                        ),
-                                    };
-                                    state.registers[*dest] = result;
-                                }
-                                _ => unreachable!(
-                                    "Unexpected mathematical UnaryOrBinary function {:?}",
-                                    math_func
-                                ),
-                            },
-                        },
-                        crate::function::Func::Agg(_) => {
-                            unreachable!("Aggregate functions should not be handled here")
-                        }
-                    }
-                    state.pc += 1;
-                }
-                Insn::InitCoroutine {
-                    yield_reg,
-                    jump_on_definition,
-                    start_offset,
-                } => {
-                    assert!(jump_on_definition.is_offset());
-                    let start_offset = start_offset.to_offset_int();
-                    state.registers[*yield_reg] = OwnedValue::Integer(start_offset as i64);
-                    state.ended_coroutine.insert(*yield_reg, false);
-                    let jump_on_definition = jump_on_definition.to_offset_int();
-                    state.pc = if jump_on_definition == 0 {
-                        state.pc + 1
-                    } else {
-                        jump_on_definition
-                    };
-                }
-                Insn::EndCoroutine { yield_reg } => {
-                    if let OwnedValue::Integer(pc) = state.registers[*yield_reg] {
-                        state.ended_coroutine.insert(*yield_reg, true);
-                        let pc: u32 = pc
-                            .try_into()
-                            .unwrap_or_else(|_| panic!("EndCoroutine: pc overflow: {}", pc));
-                        state.pc = pc - 1; // yield jump is always next to yield. Here we substract 1 to go back to yield instruction
-                    } else {
-                        unreachable!();
-                    }
-                }
-                Insn::Yield {
-                    yield_reg,
-                    end_offset,
-                } => {
-                    if let OwnedValue::Integer(pc) = state.registers[*yield_reg] {
-                        if *state
-                            .ended_coroutine
-                            .get(yield_reg)
-                            .expect("coroutine not initialized")
-                        {
-                            state.pc = end_offset.to_offset_int();
-                        } else {
-                            let pc: u32 = pc
-                                .try_into()
-                                .unwrap_or_else(|_| panic!("Yield: pc overflow: {}", pc));
-                            // swap the program counter with the value in the yield register
-                            // this is the mechanism that allows jumping back and forth between the coroutine and the caller
-                            (state.pc, state.registers[*yield_reg]) =
-                                (pc, OwnedValue::Integer((state.pc + 1) as i64));
-                        }
-                    } else {
-                        unreachable!(
-                            "yield_reg {} contains non-integer value: {:?}",
-                            *yield_reg, state.registers[*yield_reg]
-                        );
-                    }
-                }
-                Insn::InsertAsync {
-                    cursor,
-                    key_reg,
-                    record_reg,
-                    flag: _,
-                } => {
-                    let cursor = cursors.get_mut(cursor).unwrap();
-                    let record = match &state.registers[*record_reg] {
-                        OwnedValue::Record(r) => r,
-                        _ => unreachable!("Not a record! Cannot insert a non record value."),
-                    };
-                    let key = &state.registers[*key_reg];
-                    return_if_io!(cursor.insert(key, record, true));
-                    state.pc += 1;
-                }
-                Insn::InsertAwait { cursor_id } => {
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    cursor.wait_for_completion()?;
-                    // Only update last_insert_rowid for regular table inserts, not schema modifications
-                    if cursor.root_page() != 1 {
-                        if let Some(rowid) = cursor.rowid()? {
-                            if let Some(conn) = self.connection.upgrade() {
-                                conn.update_last_rowid(rowid);
-                                let prev_total_changes = conn.total_changes.get();
-                                conn.last_change.set(1);
-                                conn.total_changes.set(prev_total_changes + 1);
-                            }
-                        }
-                    }
-                    state.pc += 1;
-                }
-                Insn::DeleteAsync { cursor_id } => {
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    return_if_io!(cursor.delete());
-                    state.pc += 1;
-                }
-                Insn::DeleteAwait { cursor_id } => {
-                    let cursor = cursors.get_mut(cursor_id).unwrap();
-                    cursor.wait_for_completion()?;
-                    state.pc += 1;
-                }
-                Insn::NewRowid {
-                    cursor, rowid_reg, ..
-                } => {
-                    let cursor = cursors.get_mut(cursor).unwrap();
-                    // TODO: make io handle rng
-                    let rowid = return_if_io!(get_new_rowid(cursor, thread_rng()));
-                    state.registers[*rowid_reg] = OwnedValue::Integer(rowid);
-                    state.pc += 1;
-                }
-                Insn::MustBeInt { reg } => {
-                    match state.registers[*reg] {
-                        OwnedValue::Integer(_) => {}
-                        _ => {
-                            crate::bail_parse_error!(
-                                "MustBeInt: the value in the register is not an integer"
+                if let Some(err) = io.get_error() {
+                    if pager.is_checkpointing() {
+                        // Wrap IO errors that occurred during checkpointing in CheckpointFailed error,
+                        // so that abort() knows not to try to rollback the transaction, because the transaction
+                        // is already durable in the WAL and hence committed.
+                        // This also lets the simulator know that it should shadow the results of the query because
+                        // the write itself succeeded.
+                        let checkpoint_err = LimboError::CheckpointFailed(err.to_string());
+                        tracing::error!("Checkpoint failed: {checkpoint_err}");
+                        if let Err(abort_err) = self.abort(pager, Some(&checkpoint_err), state) {
+                            tracing::error!(
+                                "Abort also failed during checkpoint error handling: {abort_err}"
                             );
                         }
+                        return Err(checkpoint_err);
+                    }
+                    let err = err.into();
+                    if let Err(abort_err) = self.abort(pager, Some(&err), state) {
+                        tracing::error!("Abort failed during error handling: {abort_err}");
+                    }
+                    return Err(err);
+                }
+                state.io_completions = None;
+            }
+            // invalidate row
+            let _ = state.result_row.take();
+            let (insn, _) = &self.insns[state.pc as usize];
+            let insn_function = insn.to_function();
+            if enable_tracing {
+                trace_insn(self, state.pc as InsnReference, insn);
+                crate::stack::trace_remaining("program_step:opcode");
+            }
+            if self.connection.get_vdbe_trace() {
+                // Diff registers from PREVIOUS opcode
+                // The last opcode (Halt) won't have its diff printed, but Halt
+                // doesn't write to any registers
+                if let Some(ref old) = state.pre_op_registers {
+                    for (i, (old_reg, new_reg)) in
+                        old.iter().zip(state.registers.iter()).enumerate()
+                    {
+                        if old_reg != new_reg {
+                            match new_reg {
+                                Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                                Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
+                                Register::Record(_) => eprintln!("R[{i}] = <record>"),
+                            }
+                        }
+                    }
+                    state.pre_op_registers = None;
+                }
+
+                // Print CURRENT opcode
+                if matches!(insn, Insn::Init { .. }) {
+                    eprintln!("VDBE Trace:");
+                }
+                eprintln!(
+                    "{}",
+                    explain::insn_to_str(
+                        self,
+                        state.pc as InsnReference,
+                        insn,
+                        String::new(),
+                        self.comments
+                            .iter()
+                            .find(|(offset, _)| *offset == state.pc as InsnReference)
+                            .map(|(_, comment)| comment)
+                            .copied()
+                    )
+                );
+                // Snapshot for next iteration
+                state.pre_op_registers = Some(state.registers.clone());
+            }
+            // Always increment VM steps for every loop iteration
+            state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+
+            match insn_function(self, state, insn, pager) {
+                Ok(InsnFunctionStepResult::Step) => {
+                    // Instruction completed, moving to next
+                    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
+                }
+                Ok(InsnFunctionStepResult::Done) => {
+                    // Instruction completed execution
+                    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
+                    state.auto_txn_cleanup = TxnCleanup::None;
+                    return Ok(StepResult::Done);
+                }
+                Ok(InsnFunctionStepResult::IO(io)) => {
+                    // Instruction not complete - waiting for I/O, will resume at same PC
+                    io.set_waker(waker);
+                    let is_yield = io.is_explicit_yield();
+                    if is_yield {
+                        // Yield: return control to the cooperative scheduler so
+                        // other connections can make progress (e.g. release a
+                        // contended lock). Don't store in io_completions —
+                        // yields aren't pending I/O, so the instruction will
+                        // simply re-execute on the next step.
+                        return Ok(StepResult::IO);
+                    }
+                    let finished = io.finished();
+                    state.io_completions = Some(io);
+                    if !finished {
+                        return Ok(StepResult::IO);
+                    }
+                    // just continue the outer loop if IO is finished so db will continue execution immediately
+                }
+                Ok(InsnFunctionStepResult::Row) => {
+                    // Instruction completed (ResultRow already incremented PC)
+                    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
+                    return Ok(StepResult::Row);
+                }
+                Err(LimboError::Busy) => {
+                    // Instruction blocked - will retry at same PC
+                    return Ok(StepResult::Busy);
+                }
+                Err(LimboError::BusySnapshot)
+                    if self.connection.transaction_state.get() == TransactionState::None =>
+                {
+                    // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
+                    // because the snapshot will continue to be stale no matter how many times we retry.
+                    // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
+                    // back, so auto-retrying can be useful.
+                    return Ok(StepResult::Busy);
+                }
+                Err(err) => {
+                    if let Err(abort_err) = self.abort(pager, Some(&err), state) {
+                        tracing::error!("Abort failed during error handling: {abort_err}");
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn apply_view_deltas(
+        &self,
+        state: &mut ProgramState,
+        rollback: bool,
+        pager: &Arc<Pager>,
+    ) -> Result<IOResult<()>> {
+        use crate::types::IOResult;
+
+        loop {
+            match &state.view_delta_state {
+                ViewDeltaCommitState::NotStarted => {
+                    if self.connection.view_transaction_states.is_empty() {
+                        return Ok(IOResult::Done(()));
+                    }
+
+                    if rollback {
+                        // On rollback, just clear and done
+                        self.connection.view_transaction_states.clear();
+                        return Ok(IOResult::Done(()));
+                    }
+
+                    // Not a rollback - proceed with processing
+                    let schema = self.connection.schema.read();
+
+                    // Collect materialized views - they should all have storage
+                    let mut views = Vec::new();
+                    for view_name in self.connection.view_transaction_states.get_view_names() {
+                        if let Some(view_mutex) = schema.get_materialized_view(&view_name) {
+                            let view = view_mutex.lock();
+                            let root_page = view.get_root_page();
+
+                            // Materialized views should always have storage (root_page != 0)
+                            turso_assert_ne!(
+                                root_page, 0,
+                                "Materialized view should have a root page",
+                                { "view_name": view_name }
+                            );
+
+                            views.push(view_name);
+                        }
+                    }
+
+                    state.view_delta_state = ViewDeltaCommitState::Processing {
+                        views,
+                        current_index: 0,
                     };
-                    state.pc += 1;
                 }
-                Insn::SoftNull { reg } => {
-                    state.registers[*reg] = OwnedValue::Null;
-                    state.pc += 1;
-                }
-                Insn::NotExists {
-                    cursor,
-                    rowid_reg,
-                    target_pc,
-                } => {
-                    let cursor = cursors.get_mut(cursor).unwrap();
-                    let exists = return_if_io!(cursor.exists(&state.registers[*rowid_reg]));
-                    if exists {
-                        state.pc += 1;
-                    } else {
-                        state.pc = target_pc.to_offset_int();
-                    }
-                }
-                // this cursor may be reused for next insert
-                // Update: tablemoveto is used to travers on not exists, on insert depending on flags if nonseek it traverses again.
-                // If not there might be some optimizations obviously.
-                Insn::OpenWriteAsync {
-                    cursor_id,
-                    root_page,
-                } => {
-                    let cursor = Box::new(BTreeCursor::new(
-                        pager.clone(),
-                        *root_page,
-                        self.database_header.clone(),
-                    ));
-                    cursors.insert(*cursor_id, cursor);
-                    state.pc += 1;
-                }
-                Insn::OpenWriteAwait {} => {
-                    state.pc += 1;
-                }
-                Insn::Copy {
-                    src_reg,
-                    dst_reg,
-                    amount,
-                } => {
-                    for i in 0..=*amount {
-                        state.registers[*dst_reg + i] = state.registers[*src_reg + i].clone();
-                    }
-                    state.pc += 1;
-                }
-                Insn::CreateBtree { db, root, flags } => {
-                    if *db > 0 {
-                        // TODO: implement temp datbases
-                        todo!("temp databases not implemented yet");
-                    }
-                    let mut cursor = Box::new(BTreeCursor::new(
-                        pager.clone(),
-                        0,
-                        self.database_header.clone(),
-                    ));
 
-                    let root_page = cursor.btree_create(*flags);
-                    state.registers[*root] = OwnedValue::Integer(root_page as i64);
-                    state.pc += 1;
-                }
-                Insn::Close { cursor_id } => {
-                    cursors.remove(cursor_id);
-                    state.pc += 1;
-                }
-                Insn::IsNull { src, target_pc } => {
-                    if matches!(state.registers[*src], OwnedValue::Null) {
-                        state.pc = target_pc.to_offset_int();
-                    } else {
-                        state.pc += 1;
+                ViewDeltaCommitState::Processing {
+                    views,
+                    current_index,
+                } => {
+                    // At this point we know it's not a rollback
+                    if *current_index >= views.len() {
+                        // All done, clear the transaction states
+                        self.connection.view_transaction_states.clear();
+                        state.view_delta_state = ViewDeltaCommitState::Done;
+                        return Ok(IOResult::Done(()));
+                    }
+
+                    let view_name = &views[*current_index];
+
+                    let table_deltas = self
+                        .connection
+                        .view_transaction_states
+                        .get(view_name)
+                        .expect("view should have transaction state")
+                        .get_table_deltas();
+
+                    let schema = self.connection.schema.read();
+                    if let Some(view_mutex) = schema.get_materialized_view(view_name) {
+                        let mut view = view_mutex.lock();
+
+                        // Create a DeltaSet from the per-table deltas
+                        let mut delta_set = crate::incremental::compiler::DeltaSet::new();
+                        for (table_name, delta) in table_deltas {
+                            delta_set.insert(table_name, delta);
+                        }
+
+                        // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
+                        match view.merge_delta(delta_set, pager.clone())? {
+                            IOResult::Done(_) => {
+                                // Move to next view
+                                state.view_delta_state = ViewDeltaCommitState::Processing {
+                                    views: views.clone(),
+                                    current_index: current_index + 1,
+                                };
+                            }
+                            IOResult::IO(io) => {
+                                // Return I/O, will resume at same index
+                                return Ok(IOResult::IO(io));
+                            }
+                        }
                     }
                 }
-                Insn::ParseSchema {
-                    db: _,
-                    where_clause,
-                } => {
-                    let conn = self.connection.upgrade();
-                    let conn = conn.as_ref().unwrap();
-                    let stmt = conn.prepare(format!(
-                        "SELECT * FROM  sqlite_schema WHERE {}",
-                        where_clause
-                    ))?;
-                    let rows = Rows { stmt };
-                    let mut schema = RefCell::borrow_mut(&conn.schema);
-                    // TODO: This function below is synchronous, make it not async
-                    parse_schema_rows(Some(rows), &mut schema, conn.pager.io.clone())?;
-                    state.pc += 1;
+
+                ViewDeltaCommitState::Done => {
+                    return Ok(IOResult::Done(()));
                 }
             }
         }
     }
-}
 
-fn get_new_rowid<R: Rng>(cursor: &mut Box<dyn Cursor>, mut rng: R) -> Result<CursorResult<i64>> {
-    match cursor.seek_to_last()? {
-        CursorResult::Ok(()) => {}
-        CursorResult::IO => return Ok(CursorResult::IO),
-    }
-    let mut rowid = cursor.rowid()?.unwrap_or(0) + 1;
-    if rowid > i64::MAX.try_into().unwrap() {
-        let distribution = Uniform::from(1..=i64::MAX);
-        let max_attempts = 100;
-        for count in 0..max_attempts {
-            rowid = distribution.sample(&mut rng).try_into().unwrap();
-            match cursor.seek(SeekKey::TableRowId(rowid), SeekOp::EQ)? {
-                CursorResult::Ok(false) => break, // Found a non-existing rowid
-                CursorResult::Ok(true) => {
-                    if count == max_attempts - 1 {
-                        return Err(LimboError::InternalError(
-                            "Failed to generate a new rowid".to_string(),
-                        ));
-                    } else {
-                        continue; // Try next random rowid
-                    }
-                }
-                CursorResult::IO => return Ok(CursorResult::IO),
+    pub fn commit_txn(
+        &self,
+        pager: Arc<Pager>,
+        program_state: &mut ProgramState,
+        mv_store: Option<&Arc<MvStore>>,
+        rollback: bool,
+    ) -> Result<IOResult<()>> {
+        // Apply view deltas with I/O handling
+        match self.apply_view_deltas(program_state, rollback, &pager)? {
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            IOResult::Done(_) => {}
+        }
+
+        // Reset state for next use
+        program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
+        let tx_state = self.connection.get_tx_state();
+        if tx_state == TransactionState::None
+            && matches!(program_state.commit_state, CommitState::Ready)
+        {
+            // No main transaction and no in-progress commit — check whether
+            // any attached/temp database still has an active transaction before
+            // bailing out. Defer these checks to here so the common case
+            // (active main transaction) doesn't pay for the lock reads.
+            let has_attached_mv_tx = self.connection.next_attached_mv_tx().is_some();
+            let has_attached_wal_tx =
+                self.connection
+                    .with_all_attached_pagers_with_index(|pagers| {
+                        pagers.iter().any(|(_, pager)| pager.holds_read_lock())
+                    });
+            if !has_attached_mv_tx && !has_attached_wal_tx {
+                return Ok(IOResult::Done(()));
             }
         }
+        if self.connection.is_nested_stmt() {
+            // We don't want to commit on nested statements. Let parent handle it.
+            return Ok(IOResult::Done(()));
+        }
+        let res = if let Some(mv_store) = mv_store {
+            self.commit_txn_mvcc(pager, program_state, mv_store, rollback)
+        } else {
+            self.commit_txn_wal(pager, program_state, rollback)
+        }?;
+        if !res.is_io() {
+            if self.change_cnt_on {
+                self.connection
+                    .set_changes(program_state.n_change.load(Ordering::SeqCst));
+                self.connection
+                    .add_total_changes(program_state.n_total_change.load(Ordering::SeqCst));
+            }
+            let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
+                && self.connection.get_tx_state() == TransactionState::None;
+            if transaction_finished {
+                // Finalize the in-memory TEMP schema only when the outer
+                // transaction actually finishes. Updating the committed temp
+                // snapshot after every statement inside an explicit
+                // transaction would make a later full ROLLBACK restore
+                // uncommitted temp DDL.
+                if rollback {
+                    self.connection.rollback_temp_schema();
+                } else {
+                    self.connection.commit_temp_schema();
+                }
+            }
+        }
+        Ok(res)
     }
-    Ok(CursorResult::Ok(rowid.try_into().unwrap()))
+
+    fn commit_txn_wal(
+        &self,
+        pager: Arc<Pager>,
+        program_state: &mut ProgramState,
+        rollback: bool,
+    ) -> Result<IOResult<()>> {
+        let connection = self.connection.clone();
+        let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
+        let tx_state = connection.get_tx_state();
+        tracing::debug!(
+            "Halt auto_commit {}, commit_state={:?}, tx_state={:?}",
+            auto_commit,
+            program_state.commit_state,
+            tx_state,
+        );
+        if matches!(program_state.commit_state, CommitState::Committing) {
+            let TransactionState::Write { .. } = tx_state else {
+                unreachable!("invalid state for write commit step")
+            };
+            self.step_end_write_txn(&pager, &connection, program_state, rollback)
+        } else if matches!(program_state.commit_state, CommitState::CommittingAttached) {
+            // Re-entry after IO yield from attached pager commit.
+            match self.end_attached_write_txns(&connection, rollback)? {
+                IOResult::Done(_) => {
+                    program_state.commit_state = CommitState::Ready;
+                    if pager.holds_read_lock() {
+                        pager.end_read_tx();
+                    }
+                    self.end_attached_read_txns(&connection);
+                    Ok(IOResult::Done(()))
+                }
+                IOResult::IO(io) => Ok(IOResult::IO(io)),
+            }
+        } else if auto_commit {
+            match tx_state {
+                TransactionState::Write { .. } => {
+                    self.step_end_write_txn(&pager, &connection, program_state, rollback)
+                }
+                TransactionState::Read => {
+                    connection.set_tx_state(TransactionState::None);
+                    // Commit any attached write transactions that were opened
+                    // independently of the main connection's transaction state.
+                    // (e.g., UPDATE aux0.t SET ... only needs Read on main DB
+                    // but holds a write lock on the attached pager.)
+                    match self.end_attached_write_txns(&connection, rollback)? {
+                        IOResult::Done(_) => {}
+                        IOResult::IO(io) => {
+                            program_state.commit_state = CommitState::CommittingAttached;
+                            return Ok(IOResult::IO(io));
+                        }
+                    }
+                    pager.end_read_tx();
+                    self.end_attached_read_txns(&connection);
+                    Ok(IOResult::Done(()))
+                }
+                TransactionState::None => {
+                    match self.end_attached_write_txns(&connection, rollback)? {
+                        IOResult::Done(_) => {}
+                        IOResult::IO(io) => {
+                            program_state.commit_state = CommitState::CommittingAttached;
+                            return Ok(IOResult::IO(io));
+                        }
+                    }
+                    self.end_attached_read_txns(&connection);
+                    Ok(IOResult::Done(()))
+                }
+                TransactionState::PendingUpgrade { .. } => {
+                    panic!("Unexpected transaction state: {tx_state:?} during auto-commit",)
+                }
+            }
+        } else {
+            Ok(IOResult::Done(()))
+        }
+    }
+
+    /// Commit MVCC transactions across all databases in a multi-phase protocol:
+    ///
+    /// 1. **Main DB MVCC** — commit the main database's MvStore transaction.
+    /// 2. **Attached MVCC** — commit each attached database's MvStore transaction.
+    /// 3. **Attached WAL** — flush dirty pages on attached databases that use WAL
+    ///    (e.g. :memory: attached while main is MVCC).
+    ///
+    /// **IMPORTANT**: This multi-phase commit is NOT atomic across databases.
+    /// A crash between phases can leave the main and attached databases in
+    /// inconsistent states (main committed, some attached DBs not committed).
+    /// This matches SQLite's WAL mode behavior — cross-file atomicity only
+    /// exists in legacy rollback journal mode, which we do not support.
+    fn commit_txn_mvcc(
+        &self,
+        pager: Arc<Pager>,
+        program_state: &mut ProgramState,
+        mv_store: &Arc<MvStore>,
+        rollback: bool,
+    ) -> Result<IOResult<()>> {
+        let conn = self.connection.clone();
+        let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
+        if !auto_commit {
+            return Ok(IOResult::Done(()));
+        }
+
+        // Phase 1: Commit main DB MVCC transaction
+        if matches!(program_state.commit_state, CommitState::Ready) {
+            if let Some(tx_id) = conn.get_mv_tx_id() {
+                let state_machine = mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?;
+                program_state.commit_state = CommitState::CommittingMvcc { state_machine };
+            }
+            // If no main MVCC tx, commit_state stays Ready and we fall
+            // through directly to phase 2 (the CommittingMvcc and
+            // CommittingAttachedMvcc checks will both miss).
+        }
+
+        if matches!(
+            program_state.commit_state,
+            CommitState::CommittingMvcc { .. }
+        ) {
+            let CommitState::CommittingMvcc { state_machine } = &mut program_state.commit_state
+            else {
+                unreachable!()
+            };
+            match self.step_end_mvcc_txn(state_machine, mv_store)? {
+                IOResult::Done(_) => {
+                    assert!(state_machine.is_finalized());
+                    conn.set_mv_tx(None);
+                    conn.set_tx_state(TransactionState::None);
+                    pager.end_read_tx();
+                    program_state.commit_state = CommitState::Ready;
+                    // Fall through to attached phase
+                }
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            }
+        }
+
+        // Phase 2: Commit MVCC transactions on attached databases
+        // Resume an in-progress attached MVCC commit
+        if matches!(
+            program_state.commit_state,
+            CommitState::CommittingAttachedMvcc { .. }
+        ) {
+            let (step_result, db_id) = {
+                let CommitState::CommittingAttachedMvcc {
+                    state_machine,
+                    db_id,
+                    mv_store: ref attached_mv,
+                } = &mut program_state.commit_state
+                else {
+                    unreachable!()
+                };
+                (state_machine.step(attached_mv)?, *db_id)
+            };
+            match step_result {
+                IOResult::Done(_) => {
+                    let attached_pager = conn
+                        .get_pager_from_database_index(&db_id)
+                        .expect("attached MVCC transaction should always have a pager");
+                    conn.publish_database_schema(db_id);
+                    conn.set_mv_tx_for_db(db_id, None);
+                    attached_pager.end_read_tx();
+                    // Fall through to look for more
+                }
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            }
+        }
+
+        // Start/continue committing remaining attached MVCC transactions
+        loop {
+            let Some((db_id, tx_id, _mode)) = conn.next_attached_mv_tx() else {
+                break;
+            };
+            let Some(attached_mv_store) = conn.mv_store_for_db(db_id) else {
+                conn.set_mv_tx_for_db(db_id, None);
+                continue;
+            };
+            let mut state_machine = match attached_mv_store.commit_tx(tx_id, &conn, db_id) {
+                Ok(sm) => sm,
+                Err(e) => {
+                    tracing::error!(
+                        db_id,
+                        "attached DB commit failed after main DB already committed; \
+                         cross-database state is inconsistent: {e}"
+                    );
+                    // Rollback remaining uncommitted attached MVCC transactions
+                    // so they don't block checkpointing until connection close.
+                    conn.rollback_attached_mvcc_txs(true);
+                    return Err(e);
+                }
+            };
+            match state_machine.step(&attached_mv_store)? {
+                IOResult::Done(_) => {
+                    let attached_pager = conn
+                        .get_pager_from_database_index(&db_id)
+                        .expect("attached MVCC transaction should always have a pager");
+                    conn.publish_database_schema(db_id);
+                    conn.set_mv_tx_for_db(db_id, None);
+                    attached_pager.end_read_tx();
+                    continue;
+                }
+                IOResult::IO(io) => {
+                    program_state.commit_state = CommitState::CommittingAttachedMvcc {
+                        state_machine,
+                        db_id,
+                        mv_store: attached_mv_store,
+                    };
+                    return Ok(IOResult::IO(io));
+                }
+            }
+        }
+
+        // Phase 3: Commit WAL transactions on attached databases that don't use MVCC.
+        // When the main DB uses MVCC, we route through commit_txn_mvcc, but attached
+        // DBs may use WAL mode and need their dirty pages committed via the WAL path.
+        if matches!(program_state.commit_state, CommitState::CommittingAttached) {
+            // Re-entry after IO yield from attached WAL pager commit.
+            match self.end_attached_write_txns(&conn, rollback)? {
+                IOResult::Done(_) => {
+                    program_state.commit_state = CommitState::Ready;
+                    self.end_attached_read_txns(&conn);
+                    return Ok(IOResult::Done(()));
+                }
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            }
+        }
+
+        match self.end_attached_write_txns(&conn, rollback)? {
+            IOResult::Done(_) => {}
+            IOResult::IO(io) => {
+                program_state.commit_state = CommitState::CommittingAttached;
+                return Ok(IOResult::IO(io));
+            }
+        }
+        self.end_attached_read_txns(&conn);
+
+        program_state.commit_state = CommitState::Ready;
+        Ok(IOResult::Done(()))
+    }
+
+    #[instrument(skip(self, pager, connection, program_state), level = Level::DEBUG)]
+    fn step_end_write_txn(
+        &self,
+        pager: &Arc<Pager>,
+        connection: &Connection,
+        program_state: &mut ProgramState,
+        rollback: bool,
+    ) -> Result<IOResult<()>> {
+        let commit_state = &mut program_state.commit_state;
+        if matches!(commit_state, CommitState::CommittingAttached) {
+            // Resume committing attached pagers after IO yield.
+            match self.end_attached_write_txns(connection, rollback)? {
+                IOResult::Done(_) => {
+                    *commit_state = CommitState::Ready;
+                }
+                IOResult::IO(io) => {
+                    return Ok(IOResult::IO(io));
+                }
+            }
+            // Release read locks on attached pagers that only had read transactions
+            // (end_attached_write_txns only handles pagers with write locks).
+            self.end_attached_read_txns(connection);
+            return Ok(IOResult::Done(()));
+        }
+        let txn_finish_result = if !rollback {
+            pager.commit_tx(connection, true)
+        } else {
+            pager.rollback_tx(connection);
+            Ok(IOResult::Done(()))
+        };
+        tracing::debug!("txn_finish_result: {:?}", txn_finish_result);
+        match txn_finish_result? {
+            IOResult::Done(_) => {
+                // Main pager commit done, now commit attached database pagers
+                match self.end_attached_write_txns(connection, rollback)? {
+                    IOResult::Done(_) => {
+                        *commit_state = CommitState::Ready;
+                    }
+                    IOResult::IO(io) => {
+                        *commit_state = CommitState::CommittingAttached;
+                        return Ok(IOResult::IO(io));
+                    }
+                }
+            }
+            IOResult::IO(io) => {
+                tracing::trace!("Cacheflush IO");
+                *commit_state = CommitState::Committing;
+                return Ok(IOResult::IO(io));
+            }
+        }
+        // Release read locks on attached pagers that only had read transactions
+        // (end_attached_write_txns only handles pagers with write locks).
+        self.end_attached_read_txns(connection);
+        Ok(IOResult::Done(()))
+    }
+
+    /// End write transactions on all attached databases that hold write locks.
+    /// Iterates ALL attached pagers (not just the current program's write_databases)
+    /// because in explicit transactions, the COMMIT statement's program may differ
+    /// from the statement that acquired the attached write lock.
+    /// On IO yield, already-committed pagers are skipped on re-entry via holds_write_lock().
+    fn end_attached_write_txns(
+        &self,
+        connection: &Connection,
+        rollback: bool,
+    ) -> Result<IOResult<()>> {
+        connection.with_all_attached_pagers_with_index(|pagers| {
+            for (db_id, attached_pager) in pagers {
+                let db_id = *db_id;
+                // MVCC-enabled attached DBs are committed in commit_txn_mvcc phase 2
+                if connection.mv_store_for_db(db_id).is_some() {
+                    continue;
+                }
+                if !attached_pager.holds_write_lock() {
+                    continue;
+                }
+                if !rollback {
+                    // Commit dirty pages to WAL, then end write+read transactions.
+                    // We disable auto-checkpoint and avoid pager.commit_tx() since
+                    // the checkpoint logic can leave read locks held.
+                    match attached_pager.commit_dirty_pages(
+                        WalAutoActions::empty(),
+                        SyncMode::Normal,
+                        false,
+                    ) {
+                        Ok(IOResult::Done(_)) => {}
+                        Ok(IOResult::IO(io)) => {
+                            // IO pending — return so the caller can yield and re-enter.
+                            // commit_dirty_pages tracks its own internal state, so calling
+                            // it again on re-entry will resume correctly.
+                            return Ok(IOResult::IO(io));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    // WAL commit succeeded — publish the connection-local schema
+                    // changes to the shared Database so other connections can see them.
+                    connection.publish_database_schema(db_id);
+                    attached_pager.end_write_tx();
+                    attached_pager.end_read_tx();
+                    attached_pager.commit_dirty_pages_end();
+                } else {
+                    // Discard any local schema changes on rollback
+                    connection.database_schemas().write().remove(&db_id);
+                    attached_pager.rollback_attached();
+                }
+            }
+            Ok(IOResult::Done(()))
+        })
+    }
+
+    /// End read transactions on all attached databases that had transactions started.
+    fn end_attached_read_txns(&self, connection: &Connection) {
+        connection.with_all_attached_pagers_with_index(|pagers| {
+            pagers.iter().for_each(|(db_id, attached_pager)| {
+                if connection.mv_store_for_db(*db_id).is_some() {
+                    // MVCC-enabled attached DBs don't use WAL read transactions, so skip.
+                    return;
+                }
+                if attached_pager.holds_write_lock() {
+                    // Attached pager has a write lock, so its read transaction was ended by end_attached_write_txns: skip.
+                    return;
+                }
+                if attached_pager.holds_read_lock() {
+                    attached_pager.end_read_tx();
+                }
+            });
+        })
+    }
+
+    #[instrument(skip(self, commit_state, mv_store), level = Level::DEBUG)]
+    fn step_end_mvcc_txn(
+        &self,
+        commit_state: &mut StateMachine<Box<CommitStateMachine<MvccClock>>>,
+        mv_store: &Arc<MvStore>,
+    ) -> Result<IOResult<()>> {
+        commit_state.step(mv_store)
+    }
+
+    /// Aborts the program due to various conditions (explicit error, interrupt or reset of unfinished statement) by rolling back the transaction
+    /// This method is no-op if program was already finished (either aborted or executed to completion)
+    /// Returns an error if cleanup operations (savepoint rollback/release) fail.
+    pub fn abort(
+        &self,
+        pager: &Arc<Pager>,
+        err: Option<&LimboError>,
+        state: &mut ProgramState,
+    ) -> Result<()> {
+        fn capture_abort_error(
+            abort_error: &mut Option<LimboError>,
+            err: LimboError,
+            context: &str,
+        ) {
+            tracing::error!("{context}: {err}");
+            if abort_error.is_none() {
+                *abort_error = Some(err);
+            }
+        }
+
+        let mut abort_error: Option<LimboError> = None;
+        // MVCC auto-checkpoint is owned by commit_state, not by normal_step().
+        // If its yielded I/O fails, normal_step sees the error before
+        // CommitStateMachine::Checkpoint gets another step, so the checkpoint
+        // state machine cannot run its own error cleanup. abort() is the first
+        // statement cleanup path that still owns that commit_state.
+        state.commit_state.cleanup_mvcc_checkpoint_state();
+        // If a CommitStateMachine was non-terminal when the program was
+        // aborted — Statement dropped mid-IO yield, or `?` propagated a Busy
+        // out of BeginCommitLogicalLog / SyncLogicalLog — release the locks
+        // it acquired (`pager_commit_lock`, `exclusive_tx`) and roll back the
+        // orphan tx. Without this the tx stays in `Preparing`, the next op on
+        // this connection trips a `turso_assert_eq!(Active)`, and any other
+        // writer parks forever on the leaked `pager_commit_lock`. The
+        // following err-match's no-rollback arms (Busy / TxError / etc.)
+        // would otherwise skip this cleanup.
+        state
+            .commit_state
+            .cleanup_abandoned_mvcc_commit(&self.connection);
+
+        // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
+        // releases nested guards. Clean it before checking whether this program
+        // is itself nested; otherwise abort could skip top-level cleanup.
+        if let Err(err) = execute::cleanup_vacuum_state(&self.connection, state) {
+            capture_abort_error(
+                &mut abort_error,
+                err,
+                "Failed to clean up VACUUM state during abort",
+            );
+        }
+
+        // Only end trigger execution if the subprogram was actually running.
+        // Cached (pooled) statements may be dropped after their trigger execution
+        // was already ended by op_program; calling end again would pop the wrong
+        // entry from the executing_triggers stack.
+        if self.is_trigger_subprogram() && state.execution_state.is_running() {
+            self.connection.end_trigger_execution();
+        }
+        // Roll back any in-flight autonomous sequence inner-tx and restore
+        // the connection's `mv_tx` slot to the saved outer tx BEFORE the
+        // statement-savepoint rollback path runs below. Without this, the
+        // savepoint rollback below reads `connection.get_mv_tx_id()` and
+        // gets the now-dead inner tx id — there is no savepoint on the
+        // inner tx, so the outer tx's statement-level changes (rows
+        // inserted before the failing nextval) never get rolled back.
+        // Roll back the statement-level MVCC savepoint on the OUTER tx
+        // before any downstream cleanup re-targets `connection.mv_tx`.
+        // The savepoint was opened by `begin_statement` against the outer
+        // tx; if a `SequenceBeginInnerTx` swap happened mid-statement the
+        // connection's `mv_tx` slot now points at the (failed) inner tx,
+        // and `end_statement`'s `rollback_first_savepoint` would walk the
+        // wrong tx — leaving the outer tx's pre-error writes durable on
+        // commit. Use `saved_outer` from the pending inner-tx record to
+        // pick the right tx id, run the savepoint rollback explicitly,
+        // and let the existing `Statement::cleanup_orphaned_seq_inner_tx`
+        // (called from `Statement::step` after this abort returns)
+        // perform the inner-tx rollback + mv_tx restoration.
+        if err.is_some() && !pager.is_checkpointing() {
+            if let Some(pending) = state.sequence_inner_tx_pending.as_ref() {
+                if let Some((outer_tx_id, _)) = pending.saved_outer {
+                    if let Some(mv_store) = self.connection.mv_store_for_db(pending.db) {
+                        if let Err(e) = mv_store.rollback_first_savepoint(outer_tx_id) {
+                            tracing::error!(
+                                "Failed to rollback outer-tx savepoint after sequence \
+                                 inner-tx aborted: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Errors from nested statements are handled by the parent statement.
+        if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+            let owns_auto_txn = state.owns_auto_txn();
+            if err.is_some() && !pager.is_checkpointing() {
+                // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
+                // changes made before the error should persist.
+                // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
+                let is_fail_constraint = (matches!(err, Some(LimboError::Constraint(_)))
+                    && self.resolve_type == ResolveType::Fail)
+                    || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)));
+                if !is_fail_constraint {
+                    if let Err(end_stmt_err) = state.end_statement(
+                        &self.connection,
+                        pager,
+                        EndStatement::RollbackSavepoint,
+                    ) {
+                        capture_abort_error(
+                            &mut abort_error,
+                            end_stmt_err,
+                            "Failed to rollback statement savepoint during abort",
+                        );
+                    }
+                }
+            }
+            match err {
+                // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
+                Some(LimboError::TxError(_)) => {}
+                // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
+                Some(LimboError::TableLocked) => {}
+                // Busy errors do not cause a rollback.
+                Some(LimboError::Busy) => {}
+                // BusySnapshot errors do not cause a rollback either - user must rollback explicitly.
+                // BusySnapshot is distinct from Busy in that a busy_timeout or handler should not be
+                // used because it will not help - the snapshot is permanently stale and rollback is
+                // the only way out for this poor transaction.
+                Some(LimboError::BusySnapshot) => {}
+                // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
+                // and the caller is expected to handle transaction cleanup explicitly if needed.
+                Some(LimboError::SchemaUpdated) => {}
+                Some(LimboError::WriteWriteConflict | LimboError::SchemaConflict) => {
+                    // These MVCC errors mean the current transaction cannot
+                    // commit. Roll it back even if this statement opened a
+                    // statement savepoint, as DDL does.
+                    self.rollback_current_txn(pager);
+                    self.connection.set_changes(0);
+                }
+                // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
+                // FK errors always behave like ABORT: rollback statement,
+                // rollback transaction in autocommit mode.
+                Some(LimboError::ForeignKeyConstraint(_)) => {
+                    if owns_auto_txn {
+                        self.rollback_current_txn(pager);
+                    }
+                    self.connection.set_changes(0);
+                }
+                // Constraint and RAISE errors: behavior depends on the effective resolve type.
+                // For normal constraints, the resolve type comes from the statement (ON CONFLICT).
+                // For RAISE errors, the resolve type is embedded in the error variant itself.
+                // - ROLLBACK: rollback the entire transaction regardless of autocommit mode
+                // - FAIL: don't rollback anything - changes persist, transaction stays active
+                // - ABORT (default): rollback statement, rollback txn if autocommit
+                Some(LimboError::Constraint(_)) | Some(LimboError::Raise(_, _)) => {
+                    let effective_resolve = match err {
+                        Some(LimboError::Raise(rt, _)) => *rt,
+                        _ => self.resolve_type,
+                    };
+                    match effective_resolve {
+                        ResolveType::Rollback => {
+                            self.rollback_current_txn(pager);
+                            // All deferred FK violations are undone by the full rollback.
+                            self.connection.clear_deferred_foreign_key_violations();
+                        }
+                        ResolveType::Fail => {
+                            // FAIL: Don't rollback the transaction.
+                            // Changes made before the error persist.
+                            if let Err(end_stmt_err) = state.end_statement(
+                                &self.connection,
+                                pager,
+                                EndStatement::ReleaseSavepoint,
+                            ) {
+                                capture_abort_error(
+                                    &mut abort_error,
+                                    end_stmt_err,
+                                    "Failed to release statement savepoint during abort",
+                                );
+                            }
+                            if owns_auto_txn {
+                                // Autocommit FAIL: commit partial changes.
+                                // This matches halt()'s FAIL+autocommit path.
+                                let mv_store = self.connection.mv_store();
+                                if let Err(e) = execute::vtab_commit_all(&self.connection) {
+                                    capture_abort_error(
+                                        &mut abort_error,
+                                        e,
+                                        "vtab_commit_all failed during FAIL abort",
+                                    );
+                                }
+                                if let Err(e) = execute::index_method_pre_commit_all(state, pager) {
+                                    capture_abort_error(
+                                        &mut abort_error,
+                                        e,
+                                        "index_method_pre_commit_all failed during FAIL abort",
+                                    );
+                                }
+                                loop {
+                                    match self.commit_txn(
+                                        pager.clone(),
+                                        state,
+                                        mv_store.as_ref(),
+                                        false,
+                                    ) {
+                                        Ok(IOResult::Done(_)) => break,
+                                        Ok(IOResult::IO(io)) => {
+                                            if let Err(e) = io.wait(pager.io.as_ref()) {
+                                                capture_abort_error(
+                                                    &mut abort_error,
+                                                    e,
+                                                    "IO error during FAIL commit in abort",
+                                                );
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            capture_abort_error(
+                                                &mut abort_error,
+                                                e,
+                                                "commit_txn failed during FAIL abort",
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            if owns_auto_txn {
+                                self.rollback_current_txn(pager);
+                            }
+                        }
+                    }
+                    let last_change = match effective_resolve {
+                        ResolveType::Fail => state.n_change.load(Ordering::SeqCst),
+                        _ => 0,
+                    };
+                    self.connection.set_changes(last_change);
+                }
+                Some(LimboError::RaiseIgnore) => {
+                    tracing::error!(
+                        "BUG: RaiseIgnore reached abort() - should be caught by op_program"
+                    );
+                    debug_assert!(
+                        false,
+                        "RaiseIgnore should be caught by op_program, not reach abort"
+                    );
+                }
+                _ => match state.auto_txn_cleanup {
+                    TxnCleanup::RollbackTxn => {
+                        self.rollback_current_txn(pager);
+                    }
+                    TxnCleanup::RollbackSavepoint => {
+                        if owns_auto_txn {
+                            self.rollback_current_txn(pager);
+                        } else if err.is_none() && !pager.is_checkpointing() {
+                            if let Err(end_stmt_err) = state.end_statement(
+                                &self.connection,
+                                pager,
+                                EndStatement::RollbackSavepoint,
+                            ) {
+                                capture_abort_error(
+                                    &mut abort_error,
+                                    end_stmt_err,
+                                    "Failed to rollback statement savepoint during abort",
+                                );
+                            }
+                        }
+                    }
+                    TxnCleanup::None => {
+                        if owns_auto_txn || (!self.connection.get_auto_commit() && err.is_some()) {
+                            self.rollback_current_txn(pager);
+                        }
+                    }
+                },
+            }
+        }
+        if state.uses_subjournal {
+            pager.stop_use_subjournal();
+            state.uses_subjournal = false;
+        }
+        state.auto_txn_cleanup = TxnCleanup::None;
+        if let Some(err) = abort_error {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn rollback_current_txn(&self, pager: &Arc<Pager>) {
+        self.connection.rollback_current_txn_state(pager, true);
+    }
+
+    pub fn is_trigger_subprogram(&self) -> bool {
+        self.trigger.is_some() || self.is_subprogram
+    }
 }
 
-fn make_record<'a>(registers: &'a [OwnedValue], start_reg: &usize, count: &usize) -> Record<'a> {
-    let mut values = Vec::with_capacity(*count);
-    for r in registers.iter().skip(*start_reg).take(*count) {
-        values.push(crate::types::to_value(r))
+impl Deref for Program {
+    type Target = PreparedProgram;
+
+    fn deref(&self) -> &PreparedProgram {
+        &self.prepared
     }
-    Record::new(values)
 }
 
-fn make_owned_record(registers: &[OwnedValue], start_reg: &usize, count: &usize) -> OwnedRecord {
-    let mut values = Vec::with_capacity(*count);
-    for r in registers.iter().skip(*start_reg).take(*count) {
-        values.push(r.clone())
-    }
-    OwnedRecord::new(values)
+pub(crate) fn make_record(
+    registers: &[Register],
+    start_reg: &usize,
+    count: &usize,
+) -> Result<ImmutableRecord> {
+    let regs = &registers[*start_reg..*start_reg + *count];
+    ImmutableRecord::from_registers(regs, regs.len())
 }
 
+/// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
+pub(crate) fn split_registers(
+    registers: &mut [Register],
+    src: usize,
+    dst: usize,
+) -> (&Register, &mut Register) {
+    debug_assert_ne!(src, dst, "split_registers: src and dst must differ");
+    if src < dst {
+        let (left, right) = registers.split_at_mut(dst);
+        (&left[src], &mut right[0])
+    } else {
+        let (left, right) = registers.split_at_mut(src);
+        (&right[0], &mut left[dst])
+    }
+}
+
+pub fn registers_to_ref_values<'a>(
+    registers: &'a [Register],
+) -> impl ExactSizeIterator<Item = ValueRef<'a>> {
+    registers.iter().map(|reg| reg.get_value().as_ref())
+}
+
+#[instrument(skip(program), level = Level::DEBUG)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
-    if !log::log_enabled!(log::Level::Trace) {
-        return;
-    }
-    log::trace!(
-        "{}",
+    tracing::trace!(
+        "\n{}",
         explain::insn_to_str(
             program,
             addr,
             insn,
             String::new(),
-            program.comments.get(&(addr as u32)).copied()
+            program
+                .comments
+                .iter()
+                .find(|(offset, _)| *offset == addr)
+                .map(|(_, comment)| comment)
+                .copied()
         )
     );
 }
 
-fn print_insn(program: &Program, addr: InsnReference, insn: &Insn, indent: String) {
-    let s = explain::insn_to_str(
-        program,
-        addr,
-        insn,
-        indent,
-        program.comments.get(&(addr as u32)).copied(),
-    );
-    println!("{}", s);
+pub trait FromValueRow<'a> {
+    fn from_value(value: &'a Value) -> Result<Self>
+    where
+        Self: Sized + 'a;
 }
 
-fn get_indent_count(indent_count: usize, curr_insn: &Insn, prev_insn: Option<&Insn>) -> usize {
-    let indent_count = if let Some(insn) = prev_insn {
-        match insn {
-            Insn::RewindAwait { .. }
-            | Insn::LastAwait { .. }
-            | Insn::SorterSort { .. }
-            | Insn::SeekGE { .. }
-            | Insn::SeekGT { .. } => indent_count + 1,
-            _ => indent_count,
+impl<'a> FromValueRow<'a> for i64 {
+    fn from_value(value: &'a Value) -> Result<Self> {
+        match value {
+            Value::Numeric(Numeric::Integer(i)) => Ok(*i),
+            _ => Err(LimboError::ConversionError("Expected integer value".into())),
         }
-    } else {
-        indent_count
-    };
+    }
+}
 
-    match curr_insn {
-        Insn::NextAsync { .. } | Insn::SorterNext { .. } | Insn::PrevAsync { .. } => {
-            indent_count - 1
+impl<'a> FromValueRow<'a> for f64 {
+    fn from_value(value: &'a Value) -> Result<Self> {
+        match value {
+            Value::Numeric(Numeric::Float(f)) => Ok(f64::from(*f)),
+            _ => Err(LimboError::ConversionError("Expected integer value".into())),
         }
-        _ => indent_count,
+    }
+}
+
+impl<'a> FromValueRow<'a> for String {
+    fn from_value(value: &'a Value) -> Result<Self> {
+        match value {
+            Value::Text(s) => Ok(s.as_str().to_string()),
+            _ => Err(LimboError::ConversionError("Expected text value".into())),
+        }
+    }
+}
+
+impl<'a> FromValueRow<'a> for &'a str {
+    fn from_value(value: &'a Value) -> Result<Self> {
+        match value {
+            Value::Text(s) => Ok(s.as_str()),
+            _ => Err(LimboError::ConversionError("Expected text value".into())),
+        }
+    }
+}
+
+impl<'a> FromValueRow<'a> for &'a Value {
+    fn from_value(value: &'a Value) -> Result<Self> {
+        Ok(value)
     }
 }
 
-fn exec_lower(reg: &OwnedValue) -> Option<OwnedValue> {
-    match reg {
-        OwnedValue::Text(t) => Some(OwnedValue::build_text(Rc::new(t.value.to_lowercase()))),
-        t => Some(t.to_owned()),
-    }
-}
-
-fn exec_length(reg: &OwnedValue) -> OwnedValue {
-    match reg {
-        OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
-            OwnedValue::Integer(reg.to_string().chars().count() as i64)
-        }
-        OwnedValue::Blob(blob) => OwnedValue::Integer(blob.len() as i64),
-        OwnedValue::Agg(aggctx) => exec_length(aggctx.final_value()),
-        _ => reg.to_owned(),
-    }
-}
-
-fn exec_octet_length(reg: &OwnedValue) -> OwnedValue {
-    match reg {
-        OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
-            OwnedValue::Integer(reg.to_string().into_bytes().len() as i64)
-        }
-        OwnedValue::Blob(blob) => OwnedValue::Integer(blob.len() as i64),
-        OwnedValue::Agg(aggctx) => exec_octet_length(aggctx.final_value()),
-        _ => reg.to_owned(),
-    }
-}
-
-fn exec_upper(reg: &OwnedValue) -> Option<OwnedValue> {
-    match reg {
-        OwnedValue::Text(t) => Some(OwnedValue::build_text(Rc::new(t.value.to_uppercase()))),
-        t => Some(t.to_owned()),
-    }
-}
-
-fn exec_concat(registers: &[OwnedValue]) -> OwnedValue {
-    let mut result = String::new();
-    for reg in registers {
-        match reg {
-            OwnedValue::Text(text) => result.push_str(&text.value),
-            OwnedValue::Integer(i) => result.push_str(&i.to_string()),
-            OwnedValue::Float(f) => result.push_str(&f.to_string()),
-            OwnedValue::Agg(aggctx) => result.push_str(&aggctx.final_value().to_string()),
-            OwnedValue::Null => continue,
-            OwnedValue::Blob(_) => todo!("TODO concat blob"),
-            OwnedValue::Record(_) => unreachable!(),
-        }
-    }
-    OwnedValue::build_text(Rc::new(result))
-}
-
-fn exec_concat_ws(registers: &[OwnedValue]) -> OwnedValue {
-    if registers.is_empty() {
-        return OwnedValue::Null;
-    }
-
-    let separator = match &registers[0] {
-        OwnedValue::Text(text) => text.value.clone(),
-        OwnedValue::Integer(i) => Rc::new(i.to_string()),
-        OwnedValue::Float(f) => Rc::new(f.to_string()),
-        _ => return OwnedValue::Null,
-    };
-
-    let mut result = String::new();
-    for (i, reg) in registers.iter().enumerate().skip(1) {
-        if i > 1 {
-            result.push_str(&separator);
-        }
-        match reg {
-            OwnedValue::Text(text) => result.push_str(&text.value),
-            OwnedValue::Integer(i) => result.push_str(&i.to_string()),
-            OwnedValue::Float(f) => result.push_str(&f.to_string()),
-            _ => continue,
-        }
-    }
-
-    OwnedValue::build_text(Rc::new(result))
-}
-
-fn exec_sign(reg: &OwnedValue) -> Option<OwnedValue> {
-    let num = match reg {
-        OwnedValue::Integer(i) => *i as f64,
-        OwnedValue::Float(f) => *f,
-        OwnedValue::Text(s) => {
-            if let Ok(i) = s.value.parse::<i64>() {
-                i as f64
-            } else if let Ok(f) = s.value.parse::<f64>() {
-                f
-            } else {
-                return Some(OwnedValue::Null);
-            }
-        }
-        OwnedValue::Blob(b) => match std::str::from_utf8(b) {
-            Ok(s) => {
-                if let Ok(i) = s.parse::<i64>() {
-                    i as f64
-                } else if let Ok(f) = s.parse::<f64>() {
-                    f
-                } else {
-                    return Some(OwnedValue::Null);
-                }
-            }
-            Err(_) => return Some(OwnedValue::Null),
-        },
-        _ => return Some(OwnedValue::Null),
-    };
-
-    let sign = if num > 0.0 {
-        1
-    } else if num < 0.0 {
-        -1
-    } else {
-        0
-    };
-
-    Some(OwnedValue::Integer(sign))
-}
-
-/// Generates the Soundex code for a given word
-pub fn exec_soundex(reg: &OwnedValue) -> OwnedValue {
-    let s = match reg {
-        OwnedValue::Null => return OwnedValue::build_text(Rc::new("?000".to_string())),
-        OwnedValue::Text(s) => {
-            // return ?000 if non ASCII alphabet character is found
-            if !s.value.chars().all(|c| c.is_ascii_alphabetic()) {
-                return OwnedValue::build_text(Rc::new("?000".to_string()));
-            }
-            s.clone()
-        }
-        _ => return OwnedValue::build_text(Rc::new("?000".to_string())), // For unsupported types, return NULL
-    };
-
-    // Remove numbers and spaces
-    let word: String = s
-        .value
-        .chars()
-        .filter(|c| !c.is_ascii_digit())
-        .collect::<String>()
-        .replace(" ", "");
-    if word.is_empty() {
-        return OwnedValue::build_text(Rc::new("0000".to_string()));
-    }
-
-    let soundex_code = |c| match c {
-        'b' | 'f' | 'p' | 'v' => Some('1'),
-        'c' | 'g' | 'j' | 'k' | 'q' | 's' | 'x' | 'z' => Some('2'),
-        'd' | 't' => Some('3'),
-        'l' => Some('4'),
-        'm' | 'n' => Some('5'),
-        'r' => Some('6'),
-        _ => None,
-    };
-
-    // Convert the word to lowercase for consistent lookups
-    let word = word.to_lowercase();
-    let first_letter = word.chars().next().unwrap();
-
-    // Remove all occurrences of 'h' and 'w' except the first letter
-    let code: String = word
-        .chars()
-        .skip(1)
-        .filter(|&ch| ch != 'h' && ch != 'w')
-        .fold(first_letter.to_string(), |mut acc, ch| {
-            acc.push(ch);
-            acc
-        });
-
-    // Replace consonants with digits based on Soundex mapping
-    let tmp: String = code
-        .chars()
-        .map(|ch| match soundex_code(ch) {
-            Some(code) => code.to_string(),
-            None => ch.to_string(),
-        })
-        .collect();
-
-    // Remove adjacent same digits
-    let tmp = tmp.chars().fold(String::new(), |mut acc, ch| {
-        if !acc.ends_with(ch) {
-            acc.push(ch);
-        }
-        acc
-    });
-
-    // Remove all occurrences of a, e, i, o, u, y except the first letter
-    let mut result = tmp
-        .chars()
-        .enumerate()
-        .filter(|(i, ch)| *i == 0 || !matches!(ch, 'a' | 'e' | 'i' | 'o' | 'u' | 'y'))
-        .map(|(_, ch)| ch)
-        .collect::<String>();
-
-    // If the first symbol is a digit, replace it with the saved first letter
-    if let Some(first_digit) = result.chars().next() {
-        if first_digit.is_ascii_digit() {
-            result.replace_range(0..1, &first_letter.to_string());
-        }
-    }
-
-    // Append zeros if the result contains less than 4 characters
-    while result.len() < 4 {
-        result.push('0');
-    }
-
-    // Retain the first 4 characters and convert to uppercase
-    result.truncate(4);
-    OwnedValue::build_text(Rc::new(result.to_uppercase()))
-}
-
-fn exec_abs(reg: &OwnedValue) -> Option<OwnedValue> {
-    match reg {
-        OwnedValue::Integer(x) => {
-            if x < &0 {
-                Some(OwnedValue::Integer(-x))
-            } else {
-                Some(OwnedValue::Integer(*x))
-            }
-        }
-        OwnedValue::Float(x) => {
-            if x < &0.0 {
-                Some(OwnedValue::Float(-x))
-            } else {
-                Some(OwnedValue::Float(*x))
-            }
-        }
-        OwnedValue::Null => Some(OwnedValue::Null),
-        _ => Some(OwnedValue::Float(0.0)),
-    }
-}
-
-fn exec_random() -> OwnedValue {
-    let mut buf = [0u8; 8];
-    getrandom::getrandom(&mut buf).unwrap();
-    let random_number = i64::from_ne_bytes(buf);
-    OwnedValue::Integer(random_number)
-}
-
-fn exec_randomblob(reg: &OwnedValue) -> OwnedValue {
-    let length = match reg {
-        OwnedValue::Integer(i) => *i,
-        OwnedValue::Float(f) => *f as i64,
-        OwnedValue::Text(t) => t.value.parse().unwrap_or(1),
-        _ => 1,
-    }
-    .max(1) as usize;
-
-    let mut blob: Vec<u8> = vec![0; length];
-    getrandom::getrandom(&mut blob).expect("Failed to generate random blob");
-    OwnedValue::Blob(Rc::new(blob))
-}
-
-fn exec_quote(value: &OwnedValue) -> OwnedValue {
-    match value {
-        OwnedValue::Null => OwnedValue::build_text(OwnedValue::Null.to_string().into()),
-        OwnedValue::Integer(_) | OwnedValue::Float(_) => value.to_owned(),
-        OwnedValue::Blob(_) => todo!(),
-        OwnedValue::Text(s) => {
-            let mut quoted = String::with_capacity(s.value.len() + 2);
-            quoted.push('\'');
-            for c in s.value.chars() {
-                if c == '\0' {
-                    break;
-                } else {
-                    quoted.push(c);
-                }
-            }
-            quoted.push('\'');
-            OwnedValue::build_text(Rc::new(quoted))
-        }
-        _ => OwnedValue::Null, // For unsupported types, return NULL
-    }
-}
-
-fn exec_char(values: Vec<OwnedValue>) -> OwnedValue {
-    let result: String = values
-        .iter()
-        .filter_map(|x| {
-            if let OwnedValue::Integer(i) = x {
-                Some(*i as u8 as char)
-            } else {
-                None
-            }
-        })
-        .collect();
-    OwnedValue::build_text(Rc::new(result))
-}
-
-fn construct_like_regex(pattern: &str) -> Regex {
-    let mut regex_pattern = String::with_capacity(pattern.len() * 2);
-
-    regex_pattern.push('^');
-
-    for c in pattern.chars() {
-        match c {
-            '\\' => regex_pattern.push_str("\\\\"),
-            '%' => regex_pattern.push_str(".*"),
-            '_' => regex_pattern.push('.'),
-            ch => {
-                if regex_syntax::is_meta_character(c) {
-                    regex_pattern.push('\\');
-                }
-                regex_pattern.push(ch);
-            }
-        }
-    }
-
-    regex_pattern.push('$');
-
-    RegexBuilder::new(&regex_pattern)
-        .case_insensitive(true)
-        .dot_matches_new_line(true)
-        .build()
-        .unwrap()
-}
-
-// Implements LIKE pattern matching. Caches the constructed regex if a cache is provided
-fn exec_like(regex_cache: Option<&mut HashMap<String, Regex>>, pattern: &str, text: &str) -> bool {
-    if let Some(cache) = regex_cache {
-        match cache.get(pattern) {
-            Some(re) => re.is_match(text),
-            None => {
-                let re = construct_like_regex(pattern);
-                let res = re.is_match(text);
-                cache.insert(pattern.to_string(), re);
-                res
-            }
-        }
-    } else {
-        let re = construct_like_regex(pattern);
-        re.is_match(text)
-    }
-}
-
-fn exec_min(regs: Vec<&OwnedValue>) -> OwnedValue {
-    regs.iter()
-        .min()
-        .map(|&v| v.to_owned())
-        .unwrap_or(OwnedValue::Null)
-}
-
-fn exec_max(regs: Vec<&OwnedValue>) -> OwnedValue {
-    regs.iter()
-        .max()
-        .map(|&v| v.to_owned())
-        .unwrap_or(OwnedValue::Null)
-}
-
-fn exec_nullif(first_value: &OwnedValue, second_value: &OwnedValue) -> OwnedValue {
-    if first_value != second_value {
-        first_value.clone()
-    } else {
-        OwnedValue::Null
-    }
-}
-
-fn exec_substring(
-    str_value: &OwnedValue,
-    start_value: &OwnedValue,
-    length_value: &OwnedValue,
-) -> OwnedValue {
-    if let (OwnedValue::Text(str), OwnedValue::Integer(start), OwnedValue::Integer(length)) =
-        (str_value, start_value, length_value)
-    {
-        let start = *start as usize;
-        let str_len = str.value.len();
-
-        if start > str_len {
-            return OwnedValue::build_text(Rc::new("".to_string()));
-        }
-
-        let start_idx = start - 1;
-        let end = if *length != -1 {
-            start_idx + *length as usize
-        } else {
-            str_len
+impl Row {
+    pub fn get<'a, T: FromValueRow<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
+        let value = unsafe {
+            self.values
+                .add(idx)
+                .as_ref()
+                .expect("row value pointer should be valid")
         };
-        let substring = &str.value[start_idx..end.min(str_len)];
+        let value = match value {
+            Register::Value(value) => value,
+            _ => unreachable!("a row should be formed of values only"),
+        };
+        T::from_value(value)
+    }
 
-        OwnedValue::build_text(Rc::new(substring.to_string()))
-    } else if let (OwnedValue::Text(str), OwnedValue::Integer(start)) = (str_value, start_value) {
-        let start = *start as usize;
-        let str_len = str.value.len();
-
-        if start > str_len {
-            return OwnedValue::build_text(Rc::new("".to_string()));
+    pub fn get_value(&self, idx: usize) -> &Value {
+        let value = unsafe {
+            self.values
+                .add(idx)
+                .as_ref()
+                .expect("row value pointer should be valid")
+        };
+        match value {
+            Register::Value(value) => value,
+            _ => unreachable!("a row should be formed of values only"),
         }
+    }
 
-        let start_idx = start - 1;
-        let substring = &str.value[start_idx..str_len];
+    pub fn get_values(&self) -> impl Iterator<Item = &Value> {
+        let values = unsafe { std::slice::from_raw_parts(self.values, self.count) };
+        // This should be ownedvalues
+        // TODO: add check for this
+        values.iter().map(|v| v.get_value())
+    }
 
-        OwnedValue::build_text(Rc::new(substring.to_string()))
-    } else {
-        OwnedValue::Null
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
     }
 }
 
-fn exec_instr(reg: &OwnedValue, pattern: &OwnedValue) -> OwnedValue {
-    if reg == &OwnedValue::Null || pattern == &OwnedValue::Null {
-        return OwnedValue::Null;
-    }
-
-    if let (OwnedValue::Blob(reg), OwnedValue::Blob(pattern)) = (reg, pattern) {
-        let result = reg
-            .windows(pattern.len())
-            .position(|window| window == **pattern)
-            .map_or(0, |i| i + 1);
-        return OwnedValue::Integer(result as i64);
-    }
-
-    let reg_str;
-    let reg = match reg {
-        OwnedValue::Text(s) => s.value.as_str(),
-        _ => {
-            reg_str = reg.to_string();
-            reg_str.as_str()
-        }
-    };
-
-    let pattern_str;
-    let pattern = match pattern {
-        OwnedValue::Text(s) => s.value.as_str(),
-        _ => {
-            pattern_str = pattern.to_string();
-            pattern_str.as_str()
-        }
-    };
-
-    match reg.find(pattern) {
-        Some(position) => OwnedValue::Integer(position as i64 + 1),
-        None => OwnedValue::Integer(0),
-    }
+/// Extension trait for `ValueIterator` that allows writing directly to a `Register`
+/// without allocating intermediate `ValueRef` values.
+pub trait ValueIteratorExt {
+    /// Skips `n` elements and writes the value directly to the register.
+    /// Returns `Some(Ok(()))` on success, `Some(Err(...))` on parse error,
+    /// or `None` if there are fewer than `n+1` elements.
+    fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>>;
 }
 
-fn exec_typeof(reg: &OwnedValue) -> OwnedValue {
-    match reg {
-        OwnedValue::Null => OwnedValue::build_text(Rc::new("null".to_string())),
-        OwnedValue::Integer(_) => OwnedValue::build_text(Rc::new("integer".to_string())),
-        OwnedValue::Float(_) => OwnedValue::build_text(Rc::new("real".to_string())),
-        OwnedValue::Text(_) => OwnedValue::build_text(Rc::new("text".to_string())),
-        OwnedValue::Blob(_) => OwnedValue::build_text(Rc::new("blob".to_string())),
-        OwnedValue::Agg(ctx) => exec_typeof(ctx.final_value()),
-        OwnedValue::Record(_) => unimplemented!(),
-    }
-}
+impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
+    #[inline(always)]
+    fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>> {
+        use crate::storage::sqlite3_ondisk::read_varint;
+        use crate::types::{get_serial_type_size, Extendable, Text};
 
-fn exec_hex(reg: &OwnedValue) -> OwnedValue {
-    match reg {
-        OwnedValue::Text(_)
-        | OwnedValue::Integer(_)
-        | OwnedValue::Float(_)
-        | OwnedValue::Blob(_) => {
-            let text = reg.to_string();
-            OwnedValue::build_text(Rc::new(hex::encode_upper(text)))
+        let mut header = self.header_section_ref();
+        let mut data = self.data_section_ref();
+
+        // Skip n elements
+        let mut data_sum = 0;
+        for _ in 0..n {
+            if header.is_empty() {
+                return None;
+            }
+
+            let (serial_type, bytes_read) = match read_varint(header) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            header = &header[bytes_read..];
+
+            data_sum += match get_serial_type_size(serial_type) {
+                Ok(size) => size,
+                Err(e) => return Some(Err(e)),
+            };
         }
-        _ => OwnedValue::Null,
-    }
-}
 
-fn exec_unhex(reg: &OwnedValue, ignored_chars: Option<&OwnedValue>) -> OwnedValue {
-    match reg {
-        OwnedValue::Null => OwnedValue::Null,
-        _ => match ignored_chars {
-            None => match hex::decode(reg.to_string()) {
-                Ok(bytes) => OwnedValue::Blob(Rc::new(bytes)),
-                Err(_) => OwnedValue::Null,
-            },
-            Some(ignore) => match ignore {
-                OwnedValue::Text(_) => {
-                    let pat = ignore.to_string();
-                    let trimmed = reg
-                        .to_string()
-                        .trim_start_matches(|x| pat.contains(x))
-                        .trim_end_matches(|x| pat.contains(x))
-                        .to_string();
-                    match hex::decode(trimmed) {
-                        Ok(bytes) => OwnedValue::Blob(Rc::new(bytes)),
-                        Err(_) => OwnedValue::Null,
+        if data_sum > data.len() {
+            return Some(Err(LimboError::Corrupt(
+                "Data section too small for indicated serial type size".into(),
+            )));
+        }
+        data = &data[data_sum..];
+
+        // Read the serial type for the target element
+        if header.is_empty() {
+            return None;
+        }
+
+        let (serial_type, bytes_read) = match read_varint(header) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+
+        // Update iterator state
+        self.set_header_section(&header[bytes_read..]);
+
+        // Decode directly into register based on serial type
+        match serial_type {
+            // NULL
+            0 => {
+                self.set_data_section(data);
+                dest.set_null();
+            }
+            // I8
+            1 => {
+                if unlikely(data.is_empty()) {
+                    return Some(Err(LimboError::Corrupt("Invalid 1-byte int".into())));
+                }
+                self.set_data_section(&data[1..]);
+                dest.set_int(data[0] as i8 as i64);
+            }
+            // I16
+            2 => {
+                if unlikely(data.len() < 2) {
+                    return Some(Err(LimboError::Corrupt("Invalid 2-byte int".into())));
+                }
+                self.set_data_section(&data[2..]);
+                dest.set_int(i16::from_be_bytes([data[0], data[1]]) as i64);
+            }
+            // I24
+            3 => {
+                if unlikely(data.len() < 3) {
+                    return Some(Err(LimboError::Corrupt("Invalid 3-byte int".into())));
+                }
+                self.set_data_section(&data[3..]);
+                let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
+                dest.set_int(
+                    i32::from_be_bytes([sign_extension, data[0], data[1], data[2]]) as i64,
+                );
+            }
+            // I32
+            4 => {
+                if unlikely(data.len() < 4) {
+                    return Some(Err(LimboError::Corrupt("Invalid 4-byte int".into())));
+                }
+                self.set_data_section(&data[4..]);
+                dest.set_int(i32::from_be_bytes([data[0], data[1], data[2], data[3]]) as i64);
+            }
+            // I48
+            5 => {
+                if unlikely(data.len() < 6) {
+                    return Some(Err(LimboError::Corrupt("Invalid 6-byte int".into())));
+                }
+                self.set_data_section(&data[6..]);
+                let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
+                dest.set_int(i64::from_be_bytes([
+                    sign_extension,
+                    sign_extension,
+                    data[0],
+                    data[1],
+                    data[2],
+                    data[3],
+                    data[4],
+                    data[5],
+                ]));
+            }
+            // I64
+            6 => {
+                if unlikely(data.len() < 8) {
+                    return Some(Err(LimboError::Corrupt("Invalid 8-byte int".into())));
+                }
+                self.set_data_section(&data[8..]);
+                dest.set_int(i64::from_be_bytes([
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                ]));
+            }
+            // F64
+            7 => {
+                if unlikely(data.len() < 8) {
+                    return Some(Err(LimboError::Corrupt("Invalid 8-byte float".into())));
+                }
+                self.set_data_section(&data[8..]);
+                let val = f64::from_be_bytes([
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                ]);
+                if let Some(nn) = NonNan::new(val) {
+                    dest.set_float(nn);
+                } else {
+                    dest.set_null();
+                }
+            }
+            // CONST_INT0
+            8 => {
+                self.set_data_section(data);
+                dest.set_int(0);
+            }
+            // CONST_INT1
+            9 => {
+                self.set_data_section(data);
+                dest.set_int(1);
+            }
+            // Reserved
+            10 | 11 => {
+                mark_unlikely();
+                return Some(Err(LimboError::Corrupt(format!(
+                    "Reserved serial type: {serial_type}"
+                ))));
+            }
+            // BLOB (n >= 12 && n & 1 == 0)
+            n if n >= 12 && n & 1 == 0 => {
+                let content_size = ((n - 12) / 2) as usize;
+                if unlikely(data.len() < content_size) {
+                    return Some(Err(LimboError::Corrupt("Invalid Blob value".into())));
+                }
+                self.set_data_section(&data[content_size..]);
+                let blob_data = &data[..content_size];
+                match dest {
+                    Register::Value(Value::Blob(existing_blob)) => {
+                        if let Err(err) = existing_blob.do_extend(&blob_data) {
+                            return Some(Err(err));
+                        }
+                    }
+                    _ => {
+                        if let Err(err) = dest.set_blob(blob_data.to_vec()) {
+                            return Some(Err(err));
+                        }
                     }
                 }
-                _ => OwnedValue::Null,
-            },
-        },
-    }
-}
-
-fn exec_unicode(reg: &OwnedValue) -> OwnedValue {
-    match reg {
-        OwnedValue::Text(_)
-        | OwnedValue::Integer(_)
-        | OwnedValue::Float(_)
-        | OwnedValue::Blob(_) => {
-            let text = reg.to_string();
-            if let Some(first_char) = text.chars().next() {
-                OwnedValue::Integer(first_char as u32 as i64)
-            } else {
-                OwnedValue::Null
             }
-        }
-        _ => OwnedValue::Null,
-    }
-}
-
-fn _to_float(reg: &OwnedValue) -> f64 {
-    match reg {
-        OwnedValue::Text(x) => x.value.parse().unwrap_or(0.0),
-        OwnedValue::Integer(x) => *x as f64,
-        OwnedValue::Float(x) => *x,
-        _ => 0.0,
-    }
-}
-
-fn exec_round(reg: &OwnedValue, precision: Option<OwnedValue>) -> OwnedValue {
-    let precision = match precision {
-        Some(OwnedValue::Text(x)) => x.value.parse().unwrap_or(0.0),
-        Some(OwnedValue::Integer(x)) => x as f64,
-        Some(OwnedValue::Float(x)) => x,
-        Some(OwnedValue::Null) => return OwnedValue::Null,
-        _ => 0.0,
-    };
-
-    let reg = match reg {
-        OwnedValue::Agg(ctx) => _to_float(ctx.final_value()),
-        _ => _to_float(reg),
-    };
-
-    let precision = if precision < 1.0 { 0.0 } else { precision };
-    let multiplier = 10f64.powi(precision as i32);
-    OwnedValue::Float(((reg * multiplier).round()) / multiplier)
-}
-
-// Implements TRIM pattern matching.
-fn exec_trim(reg: &OwnedValue, pattern: Option<OwnedValue>) -> OwnedValue {
-    match (reg, pattern) {
-        (reg, Some(pattern)) => match reg {
-            OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
-                let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                OwnedValue::build_text(Rc::new(
-                    reg.to_string().trim_matches(&pattern_chars[..]).to_string(),
-                ))
-            }
-            _ => reg.to_owned(),
-        },
-        (OwnedValue::Text(t), None) => OwnedValue::build_text(Rc::new(t.value.trim().to_string())),
-        (reg, _) => reg.to_owned(),
-    }
-}
-
-// Implements LTRIM pattern matching.
-fn exec_ltrim(reg: &OwnedValue, pattern: Option<OwnedValue>) -> OwnedValue {
-    match (reg, pattern) {
-        (reg, Some(pattern)) => match reg {
-            OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
-                let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                OwnedValue::build_text(Rc::new(
-                    reg.to_string()
-                        .trim_start_matches(&pattern_chars[..])
-                        .to_string(),
-                ))
-            }
-            _ => reg.to_owned(),
-        },
-        (OwnedValue::Text(t), None) => {
-            OwnedValue::build_text(Rc::new(t.value.trim_start().to_string()))
-        }
-        (reg, _) => reg.to_owned(),
-    }
-}
-
-// Implements RTRIM pattern matching.
-fn exec_rtrim(reg: &OwnedValue, pattern: Option<OwnedValue>) -> OwnedValue {
-    match (reg, pattern) {
-        (reg, Some(pattern)) => match reg {
-            OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
-                let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                OwnedValue::build_text(Rc::new(
-                    reg.to_string()
-                        .trim_end_matches(&pattern_chars[..])
-                        .to_string(),
-                ))
-            }
-            _ => reg.to_owned(),
-        },
-        (OwnedValue::Text(t), None) => {
-            OwnedValue::build_text(Rc::new(t.value.trim_end().to_string()))
-        }
-        (reg, _) => reg.to_owned(),
-    }
-}
-
-fn exec_zeroblob(req: &OwnedValue) -> OwnedValue {
-    let length: i64 = match req {
-        OwnedValue::Integer(i) => *i,
-        OwnedValue::Float(f) => *f as i64,
-        OwnedValue::Text(s) => s.value.parse().unwrap_or(0),
-        _ => 0,
-    };
-    OwnedValue::Blob(Rc::new(vec![0; length.max(0) as usize]))
-}
-
-// exec_if returns whether you should jump
-fn exec_if(reg: &OwnedValue, null_reg: &OwnedValue, not: bool) -> bool {
-    match reg {
-        OwnedValue::Integer(0) | OwnedValue::Float(0.0) => not,
-        OwnedValue::Integer(_) | OwnedValue::Float(_) => !not,
-        OwnedValue::Null => match null_reg {
-            OwnedValue::Integer(0) | OwnedValue::Float(0.0) => false,
-            OwnedValue::Integer(_) | OwnedValue::Float(_) => true,
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
-    if matches!(value, OwnedValue::Null) {
-        return OwnedValue::Null;
-    }
-    match affinity(datatype) {
-        // NONE	Casting a value to a type-name with no affinity causes the value to be converted into a BLOB. Casting to a BLOB consists of first casting the value to TEXT in the encoding of the database connection, then interpreting the resulting byte sequence as a BLOB instead of as TEXT.
-        // Historically called NONE, but it's the same as BLOB
-        Affinity::Blob => {
-            // Convert to TEXT first, then interpret as BLOB
-            // TODO: handle encoding
-            let text = value.to_string();
-            OwnedValue::Blob(Rc::new(text.into_bytes()))
-        }
-        // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
-        // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
-        Affinity::Text => {
-            // Convert everything to text representation
-            // TODO: handle encoding and whatever sqlite3_snprintf does
-            OwnedValue::build_text(Rc::new(value.to_string()))
-        }
-        Affinity::Real => match value {
-            OwnedValue::Blob(b) => {
-                // Convert BLOB to TEXT first
-                let text = String::from_utf8_lossy(b);
-                cast_text_to_real(&text)
-            }
-            OwnedValue::Text(t) => cast_text_to_real(&t.value),
-            OwnedValue::Integer(i) => OwnedValue::Float(*i as f64),
-            OwnedValue::Float(f) => OwnedValue::Float(*f),
-            _ => OwnedValue::Float(0.0),
-        },
-        Affinity::Integer => match value {
-            OwnedValue::Blob(b) => {
-                // Convert BLOB to TEXT first
-                let text = String::from_utf8_lossy(b);
-                cast_text_to_integer(&text)
-            }
-            OwnedValue::Text(t) => cast_text_to_integer(&t.value),
-            OwnedValue::Integer(i) => OwnedValue::Integer(*i),
-            // A cast of a REAL value into an INTEGER results in the integer between the REAL value and zero
-            // that is closest to the REAL value. If a REAL is greater than the greatest possible signed integer (+9223372036854775807)
-            // then the result is the greatest possible signed integer and if the REAL is less than the least possible signed integer (-9223372036854775808)
-            // then the result is the least possible signed integer.
-            OwnedValue::Float(f) => {
-                let i = f.floor() as i128;
-                if i > i64::MAX as i128 {
-                    OwnedValue::Integer(i64::MAX)
-                } else if i < i64::MIN as i128 {
-                    OwnedValue::Integer(i64::MIN)
+            // TEXT (n >= 13 && n & 1 == 1)
+            n if n >= 13 && n & 1 == 1 => {
+                let content_size = ((n - 13) / 2) as usize;
+                if unlikely(data.len() < content_size) {
+                    return Some(Err(LimboError::Corrupt("Invalid Text value".into())));
+                }
+                self.set_data_section(&data[content_size..]);
+                let text_data = &data[..content_size];
+                // SAFETY: TEXT serial type contains valid UTF-8
+                let text_str = if cfg!(debug_assertions) {
+                    match std::str::from_utf8(text_data) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Some(Err(LimboError::InternalError(format!(
+                                "Invalid UTF-8 in TEXT serial type: {e}"
+                            ))));
+                        }
+                    }
                 } else {
-                    OwnedValue::Integer(i as i64)
+                    unsafe { std::str::from_utf8_unchecked(text_data) }
+                };
+                match dest {
+                    Register::Value(Value::Text(existing_text)) => {
+                        if let Err(err) = existing_text.do_extend(&text_str) {
+                            return Some(Err(err));
+                        }
+                    }
+                    _ => {
+                        if let Err(err) = dest.set_text(Text::new(text_str.to_string())) {
+                            return Some(Err(err));
+                        }
+                    }
                 }
             }
-            _ => OwnedValue::Integer(0),
-        },
-        Affinity::Numeric => match value {
-            OwnedValue::Blob(b) => {
-                let text = String::from_utf8_lossy(b);
-                cast_text_to_numeric(&text)
+            _ => {
+                mark_unlikely();
+                return Some(Err(LimboError::Corrupt(format!(
+                    "Invalid serial type: {serial_type}"
+                ))));
             }
-            OwnedValue::Text(t) => cast_text_to_numeric(&t.value),
-            OwnedValue::Integer(i) => OwnedValue::Integer(*i),
-            OwnedValue::Float(f) => OwnedValue::Float(*f),
-            _ => value.clone(), // TODO probably wrong
-        },
-    }
-}
-
-fn exec_replace(source: &OwnedValue, pattern: &OwnedValue, replacement: &OwnedValue) -> OwnedValue {
-    // The replace(X,Y,Z) function returns a string formed by substituting string Z for every occurrence of
-    // string Y in string X. The BINARY collating sequence is used for comparisons. If Y is an empty string
-    // then return X unchanged. If Z is not initially a string, it is cast to a UTF-8 string prior to processing.
-
-    // If any of the arguments is NULL, the result is NULL.
-    if matches!(source, OwnedValue::Null)
-        || matches!(pattern, OwnedValue::Null)
-        || matches!(replacement, OwnedValue::Null)
-    {
-        return OwnedValue::Null;
-    }
-
-    let source = exec_cast(source, "TEXT");
-    let pattern = exec_cast(pattern, "TEXT");
-    let replacement = exec_cast(replacement, "TEXT");
-
-    // If any of the casts failed, panic as text casting is not expected to fail.
-    match (&source, &pattern, &replacement) {
-        (OwnedValue::Text(source), OwnedValue::Text(pattern), OwnedValue::Text(replacement)) => {
-            if pattern.value.is_empty() {
-                return OwnedValue::build_text(source.value.clone());
-            }
-
-            let result = source
-                .value
-                .replace(pattern.value.as_str(), &replacement.value);
-            OwnedValue::build_text(Rc::new(result))
         }
-        _ => unreachable!("text cast should never fail"),
+
+        Some(Ok(()))
     }
-}
-
-enum Affinity {
-    Integer,
-    Text,
-    Blob,
-    Real,
-    Numeric,
-}
-
-/// For tables not declared as STRICT, the affinity of a column is determined by the declared type of the column, according to the following rules in the order shown:
-/// If the declared type contains the string "INT" then it is assigned INTEGER affinity.
-/// If the declared type of the column contains any of the strings "CHAR", "CLOB", or "TEXT" then that column has TEXT affinity. Notice that the type VARCHAR contains the string "CHAR" and is thus assigned TEXT affinity.
-/// If the declared type for a column contains the string "BLOB" or if no type is specified then the column has affinity BLOB.
-/// If the declared type for a column contains any of the strings "REAL", "FLOA", or "DOUB" then the column has REAL affinity.
-/// Otherwise, the affinity is NUMERIC.
-/// Note that the order of the rules for determining column affinity is important. A column whose declared type is "CHARINT" will match both rules 1 and 2 but the first rule takes precedence and so the column affinity will be INTEGER.
-fn affinity(datatype: &str) -> Affinity {
-    // Note: callers of this function must ensure that the datatype is uppercase.
-    // Rule 1: INT -> INTEGER affinity
-    if datatype.contains("INT") {
-        return Affinity::Integer;
-    }
-
-    // Rule 2: CHAR/CLOB/TEXT -> TEXT affinity
-    if datatype.contains("CHAR") || datatype.contains("CLOB") || datatype.contains("TEXT") {
-        return Affinity::Text;
-    }
-
-    // Rule 3: BLOB or empty -> BLOB affinity (historically called NONE)
-    if datatype.contains("BLOB") || datatype.is_empty() {
-        return Affinity::Blob;
-    }
-
-    // Rule 4: REAL/FLOA/DOUB -> REAL affinity
-    if datatype.contains("REAL") || datatype.contains("FLOA") || datatype.contains("DOUB") {
-        return Affinity::Real;
-    }
-
-    // Rule 5: Otherwise -> NUMERIC affinity
-    Affinity::Numeric
-}
-
-/// When casting a TEXT value to INTEGER, the longest possible prefix of the value that can be interpreted as an integer number
-/// is extracted from the TEXT value and the remainder ignored. Any leading spaces in the TEXT value when converting from TEXT to INTEGER are ignored.
-/// If there is no prefix that can be interpreted as an integer number, the result of the conversion is 0.
-/// If the prefix integer is greater than +9223372036854775807 then the result of the cast is exactly +9223372036854775807.
-/// Similarly, if the prefix integer is less than -9223372036854775808 then the result of the cast is exactly -9223372036854775808.
-/// When casting to INTEGER, if the text looks like a floating point value with an exponent, the exponent will be ignored
-/// because it is no part of the integer prefix. For example, "CAST('123e+5' AS INTEGER)" results in 123, not in 12300000.
-/// The CAST operator understands decimal integers only — conversion of hexadecimal integers stops at the "x" in the "0x" prefix of the hexadecimal integer string and thus result of the CAST is always zero.
-fn cast_text_to_integer(text: &str) -> OwnedValue {
-    let text = text.trim();
-    if let Ok(i) = text.parse::<i64>() {
-        return OwnedValue::Integer(i);
-    }
-    // Try to find longest valid prefix that parses as an integer
-    // TODO: inefficient
-    let mut end_index = text.len() - 1;
-    while end_index > 0 {
-        if let Ok(i) = text[..=end_index].parse::<i64>() {
-            return OwnedValue::Integer(i);
-        }
-        end_index -= 1;
-    }
-    OwnedValue::Integer(0)
-}
-
-/// When casting a TEXT value to REAL, the longest possible prefix of the value that can be interpreted
-/// as a real number is extracted from the TEXT value and the remainder ignored. Any leading spaces in
-/// the TEXT value are ignored when converging from TEXT to REAL.
-/// If there is no prefix that can be interpreted as a real number, the result of the conversion is 0.0.
-fn cast_text_to_real(text: &str) -> OwnedValue {
-    let trimmed = text.trim_start();
-    if let Ok(num) = trimmed.parse::<f64>() {
-        return OwnedValue::Float(num);
-    }
-    // Try to find longest valid prefix that parses as a float
-    // TODO: inefficient
-    let mut end_index = trimmed.len() - 1;
-    while end_index > 0 {
-        if let Ok(num) = trimmed[..=end_index].parse::<f64>() {
-            return OwnedValue::Float(num);
-        }
-        end_index -= 1;
-    }
-    OwnedValue::Float(0.0)
-}
-
-/// NUMERIC Casting a TEXT or BLOB value into NUMERIC yields either an INTEGER or a REAL result.
-/// If the input text looks like an integer (there is no decimal point nor exponent) and the value
-/// is small enough to fit in a 64-bit signed integer, then the result will be INTEGER.
-/// Input text that looks like floating point (there is a decimal point and/or an exponent)
-/// and the text describes a value that can be losslessly converted back and forth between IEEE 754
-/// 64-bit float and a 51-bit signed integer, then the result is INTEGER. (In the previous sentence,
-/// a 51-bit integer is specified since that is one bit less than the length of the mantissa of an
-/// IEEE 754 64-bit float and thus provides a 1-bit of margin for the text-to-float conversion operation.)
-/// Any text input that describes a value outside the range of a 64-bit signed integer yields a REAL result.
-/// Casting a REAL or INTEGER value to NUMERIC is a no-op, even if a real value could be losslessly converted to an integer.
-fn cast_text_to_numeric(text: &str) -> OwnedValue {
-    if !text.contains('.') && !text.contains('e') && !text.contains('E') {
-        // Looks like an integer
-        if let Ok(i) = text.parse::<i64>() {
-            return OwnedValue::Integer(i);
-        }
-    }
-    // Try as float
-    if let Ok(f) = text.parse::<f64>() {
-        // Check if can be losslessly converted to 51-bit integer
-        let i = f as i64;
-        if f == i as f64 && i.abs() < (1i64 << 51) {
-            return OwnedValue::Integer(i);
-        }
-        return OwnedValue::Float(f);
-    }
-    OwnedValue::Integer(0)
-}
-
-fn execute_sqlite_version(version_integer: i64) -> String {
-    let major = version_integer / 1_000_000;
-    let minor = (version_integer % 1_000_000) / 1_000;
-    let release = version_integer % 1_000;
-
-    format!("{}.{}.{}", major, minor, release)
-}
-
-fn to_f64(reg: &OwnedValue) -> Option<f64> {
-    match reg {
-        OwnedValue::Integer(i) => Some(*i as f64),
-        OwnedValue::Float(f) => Some(*f),
-        OwnedValue::Text(t) => t.value.parse::<f64>().ok(),
-        OwnedValue::Agg(ctx) => to_f64(ctx.final_value()),
-        _ => None,
-    }
-}
-
-fn exec_math_unary(reg: &OwnedValue, function: &MathFunc) -> OwnedValue {
-    // In case of some functions and integer input, return the input as is
-    if let OwnedValue::Integer(_) = reg {
-        if matches! { function, MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc }
-        {
-            return reg.clone();
-        }
-    }
-
-    let f = match to_f64(reg) {
-        Some(f) => f,
-        None => return OwnedValue::Null,
-    };
-
-    let result = match function {
-        MathFunc::Acos => f.acos(),
-        MathFunc::Acosh => f.acosh(),
-        MathFunc::Asin => f.asin(),
-        MathFunc::Asinh => f.asinh(),
-        MathFunc::Atan => f.atan(),
-        MathFunc::Atanh => f.atanh(),
-        MathFunc::Ceil | MathFunc::Ceiling => f.ceil(),
-        MathFunc::Cos => f.cos(),
-        MathFunc::Cosh => f.cosh(),
-        MathFunc::Degrees => f.to_degrees(),
-        MathFunc::Exp => f.exp(),
-        MathFunc::Floor => f.floor(),
-        MathFunc::Ln => f.ln(),
-        MathFunc::Log10 => f.log10(),
-        MathFunc::Log2 => f.log2(),
-        MathFunc::Radians => f.to_radians(),
-        MathFunc::Sin => f.sin(),
-        MathFunc::Sinh => f.sinh(),
-        MathFunc::Sqrt => f.sqrt(),
-        MathFunc::Tan => f.tan(),
-        MathFunc::Tanh => f.tanh(),
-        MathFunc::Trunc => f.trunc(),
-        _ => unreachable!("Unexpected mathematical unary function {:?}", function),
-    };
-
-    if result.is_nan() {
-        OwnedValue::Null
-    } else {
-        OwnedValue::Float(result)
-    }
-}
-
-fn exec_math_binary(lhs: &OwnedValue, rhs: &OwnedValue, function: &MathFunc) -> OwnedValue {
-    let lhs = match to_f64(lhs) {
-        Some(f) => f,
-        None => return OwnedValue::Null,
-    };
-
-    let rhs = match to_f64(rhs) {
-        Some(f) => f,
-        None => return OwnedValue::Null,
-    };
-
-    let result = match function {
-        MathFunc::Atan2 => lhs.atan2(rhs),
-        MathFunc::Mod => lhs % rhs,
-        MathFunc::Pow | MathFunc::Power => lhs.powf(rhs),
-        _ => unreachable!("Unexpected mathematical binary function {:?}", function),
-    };
-
-    if result.is_nan() {
-        OwnedValue::Null
-    } else {
-        OwnedValue::Float(result)
-    }
-}
-
-fn exec_math_log(arg: &OwnedValue, base: Option<&OwnedValue>) -> OwnedValue {
-    let f = match to_f64(arg) {
-        Some(f) => f,
-        None => return OwnedValue::Null,
-    };
-
-    let base = match base {
-        Some(base) => match to_f64(base) {
-            Some(f) => f,
-            None => return OwnedValue::Null,
-        },
-        None => 10.0,
-    };
-
-    if f <= 0.0 || base <= 0.0 || base == 1.0 {
-        return OwnedValue::Null;
-    }
-
-    OwnedValue::Float(f.log(base))
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        types::{SeekKey, SeekOp},
-        vdbe::exec_replace,
-    };
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    use super::{
-        exec_abs, exec_char, exec_hex, exec_if, exec_instr, exec_length, exec_like, exec_lower,
-        exec_ltrim, exec_max, exec_min, exec_nullif, exec_quote, exec_random, exec_randomblob,
-        exec_round, exec_rtrim, exec_sign, exec_soundex, exec_substring, exec_trim, exec_typeof,
-        exec_unhex, exec_unicode, exec_upper, exec_zeroblob, execute_sqlite_version, get_new_rowid,
-        AggContext, Cursor, CursorResult, LimboError, OwnedRecord, OwnedValue, Result,
-    };
-    use mockall::{mock, predicate};
-    use rand::{rngs::mock::StepRng, thread_rng};
-    use std::{cell::Ref, collections::HashMap, rc::Rc};
+    #[test]
+    fn active_opcode_helpers_initialize_defaults() {
+        let mut state = ProgramState::new(1, 0);
 
-    mock! {
-        Cursor {
-            fn seek_to_last(&mut self) -> Result<CursorResult<()>>;
-            fn seek<'a>(&mut self, key: SeekKey<'a>, op: SeekOp) -> Result<CursorResult<bool>>;
-            fn rowid(&self) -> Result<Option<u64>>;
-            fn seek_rowid(&mut self, rowid: u64) -> Result<CursorResult<bool>>;
-        }
-    }
-
-    impl Cursor for MockCursor {
-        fn root_page(&self) -> usize {
-            unreachable!()
-        }
-
-        fn seek_to_last(&mut self) -> Result<CursorResult<()>> {
-            self.seek_to_last()
-        }
-
-        fn rowid(&self) -> Result<Option<u64>> {
-            self.rowid()
-        }
-
-        fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<bool>> {
-            self.seek(key, op)
-        }
-
-        fn rewind(&mut self) -> Result<CursorResult<()>> {
-            unimplemented!()
-        }
-
-        fn next(&mut self) -> Result<CursorResult<()>> {
-            unimplemented!()
-        }
-
-        fn record(&self) -> Result<Ref<Option<OwnedRecord>>> {
-            unimplemented!()
-        }
-
-        fn is_empty(&self) -> bool {
-            unimplemented!()
-        }
-
-        fn set_null_flag(&mut self, _flag: bool) {
-            unimplemented!()
-        }
-
-        fn get_null_flag(&self) -> bool {
-            unimplemented!()
-        }
-
-        fn insert(
-            &mut self,
-            _key: &OwnedValue,
-            _record: &OwnedRecord,
-            _is_leaf: bool,
-        ) -> Result<CursorResult<()>> {
-            unimplemented!()
-        }
-
-        fn delete(&mut self) -> Result<CursorResult<()>> {
-            unimplemented!()
-        }
-
-        fn wait_for_completion(&mut self) -> Result<()> {
-            unimplemented!()
-        }
-
-        fn exists(&mut self, _key: &OwnedValue) -> Result<CursorResult<bool>> {
-            unimplemented!()
-        }
-
-        fn btree_create(&mut self, _flags: usize) -> u32 {
-            unimplemented!()
-        }
-
-        fn last(&mut self) -> Result<CursorResult<()>> {
-            todo!()
-        }
-
-        fn prev(&mut self) -> Result<CursorResult<()>> {
-            todo!()
-        }
+        assert!(matches!(state.active_op_state.state, ActiveOpState::None));
+        assert!(matches!(
+            state.active_op_state.column(),
+            OpColumnState::Start
+        ));
+        state.active_op_state.clear();
+        assert!(state.active_op_state.parse_schema().is_none());
     }
 
     #[test]
-    fn test_get_new_rowid() -> Result<()> {
-        // Test case 0: Empty table
-        let mut mock = MockCursor::new();
-        mock.expect_seek_to_last()
-            .return_once(|| Ok(CursorResult::Ok(())));
-        mock.expect_rowid().return_once(|| Ok(None));
+    fn active_opcode_helpers_reject_mismatched_resumes() {
+        let mut state = ProgramState::new(1, 0);
+        *state.active_op_state.column() = OpColumnState::GetColumn;
 
-        let result = get_new_rowid(&mut (Box::new(mock) as Box<dyn Cursor>), thread_rng())?;
-        assert_eq!(
-            result,
-            CursorResult::Ok(1),
-            "For an empty table, rowid should be 1"
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = state.active_op_state.parse_schema();
+        }));
+        assert!(panic.is_err(), "mismatched opcode resume should panic");
+    }
+
+    #[test]
+    fn seek_state_is_independent_from_active_opcode_slot() {
+        let mut state = ProgramState::new(1, 0);
+
+        *state.active_op_state.insert() = OpInsertState {
+            sub_state: OpInsertSubState::Seek,
+            old_record: None,
+            is_noop_update: false,
+        };
+        state.seek_state = OpSeekState::MoveLast;
+
+        assert!(matches!(
+            state.active_op_state.insert().sub_state,
+            OpInsertSubState::Seek
+        ));
+        assert!(matches!(state.seek_state, OpSeekState::MoveLast));
+    }
+}
+
+/// Shuttle tests for validating the `unsafe impl Send + Sync for ProgramState` safety claims.
+///
+/// The safety claims are:
+/// 1. `Row` contains a `*const Register` pointing into `ProgramState.registers`
+/// 2. Only immutable references (`&Row`) are given out via `result_row.as_ref()`
+/// 3. `result_row` is invalidated (via `.take()`) at the start of each step iteration
+///
+/// These tests verify that the implementation correctly upholds these invariants
+/// under concurrent access patterns.
+
+#[cfg(all(shuttle, test))]
+mod shuttle_tests {
+    use super::*;
+    use crate::sync::Arc;
+    use crate::thread;
+    use crate::types::Value;
+
+    /// Creates a minimal ProgramState for testing.
+    fn create_test_state(num_registers: usize, num_cursors: usize) -> ProgramState {
+        ProgramState::new(num_registers, num_cursors)
+    }
+
+    /// Test that ProgramState can be safely sent between threads.
+    /// This validates the `unsafe impl Send for ProgramState` claim.
+    #[test]
+    fn shuttle_program_state_send() {
+        shuttle::check_random(
+            || {
+                let mut state = create_test_state(10, 2);
+
+                // Write some data to registers
+                state.registers[0].set_int(42);
+                state.registers[1].set_text(Text::new("test".to_string()));
+
+                // Send state to another thread
+                let handle = thread::spawn(move || {
+                    // Verify data is intact after send
+                    assert!(matches!(
+                        &state.registers[0],
+                        Register::Value(Value::Numeric(Numeric::Integer(42)))
+                    ));
+                    if let Register::Value(Value::Text(t)) = &state.registers[1] {
+                        assert_eq!(t.as_str(), "test");
+                    } else {
+                        panic!("Expected text value");
+                    }
+
+                    // Modify in new thread
+                    state.registers[2].set_int(100);
+                    state
+                });
+
+                let state = handle.join().unwrap();
+                assert!(matches!(
+                    &state.registers[2],
+                    Register::Value(Value::Numeric(Numeric::Integer(100)))
+                ));
+            },
+            1000,
         );
+    }
 
-        // Test case 1: Normal case, rowid within i64::MAX
-        let mut mock = MockCursor::new();
-        mock.expect_seek_to_last()
-            .return_once(|| Ok(CursorResult::Ok(())));
-        mock.expect_rowid().return_once(|| Ok(Some(100)));
+    /// Test that ProgramState with a set result_row can be safely sent.
+    /// The Row contains a raw pointer that must remain valid after the send.
+    #[test]
+    fn shuttle_program_state_send_with_row() {
+        shuttle::check_random(
+            || {
+                let mut state = create_test_state(10, 2);
 
-        let result = get_new_rowid(&mut (Box::new(mock) as Box<dyn Cursor>), thread_rng())?;
-        assert_eq!(result, CursorResult::Ok(101));
+                // Set up registers with test data
+                state.registers[0].set_int(1);
+                state.registers[1].set_int(2);
+                state.registers[2].set_int(3);
 
-        // Test case 2: Rowid exceeds i64::MAX, need to generate random rowid
-        let mut mock = MockCursor::new();
-        mock.expect_seek_to_last()
-            .return_once(|| Ok(CursorResult::Ok(())));
-        mock.expect_rowid()
-            .return_once(|| Ok(Some(i64::MAX as u64)));
-        mock.expect_seek()
-            .with(predicate::always(), predicate::always())
-            .returning(|rowid, _| {
-                if rowid == SeekKey::TableRowId(50) {
-                    Ok(CursorResult::Ok(false))
-                } else {
-                    Ok(CursorResult::Ok(true))
+                // Create a result_row pointing to registers
+                state.result_row = Some(Row {
+                    values: &state.registers[0] as *const Register,
+                    count: 3,
+                });
+
+                // Send to another thread - the pointer must remain valid
+                // because it points to memory owned by state (the registers Vec)
+                let handle = thread::spawn(move || {
+                    // The row pointer should still be valid because registers moved with state
+                    if let Some(row) = &state.result_row {
+                        assert_eq!(row.len(), 3);
+                        // Read through the pointer - this validates the pointer is still valid
+                        let val = row.get::<i64>(0).unwrap();
+                        assert_eq!(val, 1);
+                        let val = row.get::<i64>(1).unwrap();
+                        assert_eq!(val, 2);
+                        let val = row.get::<i64>(2).unwrap();
+                        assert_eq!(val, 3);
+                    } else {
+                        panic!("Expected result_row to be set");
+                    }
+                    state
+                });
+
+                let _ = handle.join().unwrap();
+            },
+            1000,
+        );
+    }
+
+    /// Test concurrent reads of result_row through shared reference.
+    /// This validates the `unsafe impl Sync for ProgramState` claim for read access.
+    #[test]
+    fn shuttle_program_state_sync_concurrent_reads() {
+        shuttle::check_random(
+            || {
+                let mut state = create_test_state(10, 2);
+
+                // Set up registers
+                state.registers[0].set_int(42);
+                state.registers[1].set_int(43);
+
+                // Create result_row
+                state.result_row = Some(Row {
+                    values: &state.registers[0] as *const Register,
+                    count: 2,
+                });
+
+                let state = Arc::new(state);
+                let state2 = Arc::clone(&state);
+                let state3 = Arc::clone(&state);
+
+                // Multiple threads reading concurrently
+                let h1 = thread::spawn(move || {
+                    if let Some(row) = &state.result_row {
+                        let val = row.get::<i64>(0).unwrap();
+                        assert_eq!(val, 42);
+                    }
+                });
+
+                let h2 = thread::spawn(move || {
+                    if let Some(row) = &state2.result_row {
+                        let val = row.get::<i64>(1).unwrap();
+                        assert_eq!(val, 43);
+                    }
+                });
+
+                let h3 = thread::spawn(move || {
+                    if let Some(row) = &state3.result_row {
+                        assert_eq!(row.len(), 2);
+                    }
+                });
+
+                h1.join().unwrap();
+                h2.join().unwrap();
+                h3.join().unwrap();
+            },
+            1000,
+        );
+    }
+
+    /// Test that Row values read through the pointer are consistent.
+    /// Multiple threads reading the same row values should see the same data.
+    #[test]
+    fn shuttle_row_pointer_consistency() {
+        shuttle::check_random(
+            || {
+                let mut state = create_test_state(10, 2);
+
+                // Set up registers with distinct values
+                for i in 0..5 {
+                    state.registers[i].set_int(i as i64 * 10);
                 }
-            });
 
-        // Mock the random number generation
-        let new_rowid =
-            get_new_rowid(&mut (Box::new(mock) as Box<dyn Cursor>), StepRng::new(1, 1))?;
-        assert_eq!(new_rowid, CursorResult::Ok(50));
-
-        // Test case 3: IO error
-        let mut mock = MockCursor::new();
-        mock.expect_seek_to_last()
-            .return_once(|| Ok(CursorResult::Ok(())));
-        mock.expect_rowid()
-            .return_once(|| Ok(Some(i64::MAX as u64)));
-        mock.expect_seek()
-            .with(predicate::always(), predicate::always())
-            .return_once(|_, _| Ok(CursorResult::IO));
-
-        let result = get_new_rowid(&mut (Box::new(mock) as Box<dyn Cursor>), thread_rng());
-        assert!(matches!(result, Ok(CursorResult::IO)));
-
-        // Test case 4: Failure to generate new rowid
-        let mut mock = MockCursor::new();
-        mock.expect_seek_to_last()
-            .return_once(|| Ok(CursorResult::Ok(())));
-        mock.expect_rowid()
-            .return_once(|| Ok(Some(i64::MAX as u64)));
-        mock.expect_seek()
-            .with(predicate::always(), predicate::always())
-            .returning(|_, _| Ok(CursorResult::Ok(true)));
-
-        // Mock the random number generation
-        let result = get_new_rowid(&mut (Box::new(mock) as Box<dyn Cursor>), StepRng::new(1, 1));
-        assert!(matches!(result, Err(LimboError::InternalError(_))));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_length() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        let expected_len = OwnedValue::Integer(3);
-        assert_eq!(exec_length(&input_str), expected_len);
-
-        let input_integer = OwnedValue::Integer(123);
-        let expected_len = OwnedValue::Integer(3);
-        assert_eq!(exec_length(&input_integer), expected_len);
-
-        let input_float = OwnedValue::Float(123.456);
-        let expected_len = OwnedValue::Integer(7);
-        assert_eq!(exec_length(&input_float), expected_len);
-
-        let expected_blob = OwnedValue::Blob(Rc::new("example".as_bytes().to_vec()));
-        let expected_len = OwnedValue::Integer(7);
-        assert_eq!(exec_length(&expected_blob), expected_len);
-    }
-
-    #[test]
-    fn test_quote() {
-        let input = OwnedValue::build_text(Rc::new(String::from("abc\0edf")));
-        let expected = OwnedValue::build_text(Rc::new(String::from("'abc'")));
-        assert_eq!(exec_quote(&input), expected);
-
-        let input = OwnedValue::Integer(123);
-        let expected = OwnedValue::Integer(123);
-        assert_eq!(exec_quote(&input), expected);
-
-        let input = OwnedValue::build_text(Rc::new(String::from("hello''world")));
-        let expected = OwnedValue::build_text(Rc::new(String::from("'hello''world'")));
-        assert_eq!(exec_quote(&input), expected);
-    }
-
-    #[test]
-    fn test_typeof() {
-        let input = OwnedValue::Null;
-        let expected: OwnedValue = OwnedValue::build_text(Rc::new("null".to_string()));
-        assert_eq!(exec_typeof(&input), expected);
-
-        let input = OwnedValue::Integer(123);
-        let expected: OwnedValue = OwnedValue::build_text(Rc::new("integer".to_string()));
-        assert_eq!(exec_typeof(&input), expected);
-
-        let input = OwnedValue::Float(123.456);
-        let expected: OwnedValue = OwnedValue::build_text(Rc::new("real".to_string()));
-        assert_eq!(exec_typeof(&input), expected);
-
-        let input = OwnedValue::build_text(Rc::new("hello".to_string()));
-        let expected: OwnedValue = OwnedValue::build_text(Rc::new("text".to_string()));
-        assert_eq!(exec_typeof(&input), expected);
-
-        let input = OwnedValue::Blob(Rc::new("limbo".as_bytes().to_vec()));
-        let expected: OwnedValue = OwnedValue::build_text(Rc::new("blob".to_string()));
-        assert_eq!(exec_typeof(&input), expected);
-
-        let input = OwnedValue::Agg(Box::new(AggContext::Sum(OwnedValue::Integer(123))));
-        let expected = OwnedValue::build_text(Rc::new("integer".to_string()));
-        assert_eq!(exec_typeof(&input), expected);
-    }
-
-    #[test]
-    fn test_unicode() {
-        assert_eq!(
-            exec_unicode(&OwnedValue::build_text(Rc::new("a".to_string()))),
-            OwnedValue::Integer(97)
-        );
-        assert_eq!(
-            exec_unicode(&OwnedValue::build_text(Rc::new("😊".to_string()))),
-            OwnedValue::Integer(128522)
-        );
-        assert_eq!(
-            exec_unicode(&OwnedValue::build_text(Rc::new("".to_string()))),
-            OwnedValue::Null
-        );
-        assert_eq!(
-            exec_unicode(&OwnedValue::Integer(23)),
-            OwnedValue::Integer(50)
-        );
-        assert_eq!(
-            exec_unicode(&OwnedValue::Integer(0)),
-            OwnedValue::Integer(48)
-        );
-        assert_eq!(
-            exec_unicode(&OwnedValue::Float(0.0)),
-            OwnedValue::Integer(48)
-        );
-        assert_eq!(
-            exec_unicode(&OwnedValue::Float(23.45)),
-            OwnedValue::Integer(50)
-        );
-        assert_eq!(exec_unicode(&OwnedValue::Null), OwnedValue::Null);
-        assert_eq!(
-            exec_unicode(&OwnedValue::Blob(Rc::new("example".as_bytes().to_vec()))),
-            OwnedValue::Integer(101)
-        );
-    }
-
-    #[test]
-    fn test_min_max() {
-        let input_int_vec = vec![&OwnedValue::Integer(-1), &OwnedValue::Integer(10)];
-        assert_eq!(exec_min(input_int_vec.clone()), OwnedValue::Integer(-1));
-        assert_eq!(exec_max(input_int_vec.clone()), OwnedValue::Integer(10));
-
-        let str1 = OwnedValue::build_text(Rc::new(String::from("A")));
-        let str2 = OwnedValue::build_text(Rc::new(String::from("z")));
-        let input_str_vec = vec![&str2, &str1];
-        assert_eq!(
-            exec_min(input_str_vec.clone()),
-            OwnedValue::build_text(Rc::new(String::from("A")))
-        );
-        assert_eq!(
-            exec_max(input_str_vec.clone()),
-            OwnedValue::build_text(Rc::new(String::from("z")))
-        );
-
-        let input_null_vec = vec![&OwnedValue::Null, &OwnedValue::Null];
-        assert_eq!(exec_min(input_null_vec.clone()), OwnedValue::Null);
-        assert_eq!(exec_max(input_null_vec.clone()), OwnedValue::Null);
-
-        let input_mixed_vec = vec![&OwnedValue::Integer(10), &str1];
-        assert_eq!(exec_min(input_mixed_vec.clone()), OwnedValue::Integer(10));
-        assert_eq!(
-            exec_max(input_mixed_vec.clone()),
-            OwnedValue::build_text(Rc::new(String::from("A")))
-        );
-    }
-
-    #[test]
-    fn test_trim() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("Bob and Alice")));
-        assert_eq!(exec_trim(&input_str, None), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("Bob and")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("Alice")));
-        assert_eq!(exec_trim(&input_str, Some(pattern_str)), expected_str);
-    }
-
-    #[test]
-    fn test_ltrim() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("Bob and Alice     ")));
-        assert_eq!(exec_ltrim(&input_str, None), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("Bob and")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("Alice     ")));
-        assert_eq!(exec_ltrim(&input_str, Some(pattern_str)), expected_str);
-    }
-
-    #[test]
-    fn test_rtrim() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice")));
-        assert_eq!(exec_rtrim(&input_str, None), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("Bob and")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice")));
-        assert_eq!(exec_rtrim(&input_str, Some(pattern_str)), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("     Bob and Alice     ")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("and Alice")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("     Bob")));
-        assert_eq!(exec_rtrim(&input_str, Some(pattern_str)), expected_str);
-    }
-
-    #[test]
-    fn test_soundex() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Pfister")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("P236")));
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("husobee")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("H210")));
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Tymczak")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("T522")));
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Ashcraft")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("A261")));
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Robert")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("R163")));
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Rupert")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("R163")));
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Rubin")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("R150")));
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Kant")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("K530")));
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Knuth")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("K530")));
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("x")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("X000")));
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("闪电五连鞭")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("?000")));
-        assert_eq!(exec_soundex(&input_str), expected_str);
-    }
-
-    #[test]
-    fn test_upper_case() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Limbo")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("LIMBO")));
-        assert_eq!(exec_upper(&input_str).unwrap(), expected_str);
-
-        let input_int = OwnedValue::Integer(10);
-        assert_eq!(exec_upper(&input_int).unwrap(), input_int);
-        assert_eq!(exec_upper(&OwnedValue::Null).unwrap(), OwnedValue::Null)
-    }
-
-    #[test]
-    fn test_lower_case() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("Limbo")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        assert_eq!(exec_lower(&input_str).unwrap(), expected_str);
-
-        let input_int = OwnedValue::Integer(10);
-        assert_eq!(exec_lower(&input_int).unwrap(), input_int);
-        assert_eq!(exec_lower(&OwnedValue::Null).unwrap(), OwnedValue::Null)
-    }
-
-    #[test]
-    fn test_hex() {
-        let input_str = OwnedValue::build_text(Rc::new("limbo".to_string()));
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("6C696D626F")));
-        assert_eq!(exec_hex(&input_str), expected_val);
-
-        let input_int = OwnedValue::Integer(100);
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("313030")));
-        assert_eq!(exec_hex(&input_int), expected_val);
-
-        let input_float = OwnedValue::Float(12.34);
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("31322E3334")));
-        assert_eq!(exec_hex(&input_float), expected_val);
-    }
-
-    #[test]
-    fn test_unhex() {
-        let input = OwnedValue::build_text(Rc::new(String::from("6F")));
-        let expected = OwnedValue::Blob(Rc::new(vec![0x6f]));
-        assert_eq!(exec_unhex(&input, None), expected);
-
-        let input = OwnedValue::build_text(Rc::new(String::from("6f")));
-        let expected = OwnedValue::Blob(Rc::new(vec![0x6f]));
-        assert_eq!(exec_unhex(&input, None), expected);
-
-        let input = OwnedValue::build_text(Rc::new(String::from("611")));
-        let expected = OwnedValue::Null;
-        assert_eq!(exec_unhex(&input, None), expected);
-
-        let input = OwnedValue::build_text(Rc::new(String::from("")));
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
-        assert_eq!(exec_unhex(&input, None), expected);
-
-        let input = OwnedValue::build_text(Rc::new(String::from("61x")));
-        let expected = OwnedValue::Null;
-        assert_eq!(exec_unhex(&input, None), expected);
-
-        let input = OwnedValue::Null;
-        let expected = OwnedValue::Null;
-        assert_eq!(exec_unhex(&input, None), expected);
-    }
-
-    #[test]
-    fn test_abs() {
-        let int_positive_reg = OwnedValue::Integer(10);
-        let int_negative_reg = OwnedValue::Integer(-10);
-        assert_eq!(exec_abs(&int_positive_reg).unwrap(), int_positive_reg);
-        assert_eq!(exec_abs(&int_negative_reg).unwrap(), int_positive_reg);
-
-        let float_positive_reg = OwnedValue::Integer(10);
-        let float_negative_reg = OwnedValue::Integer(-10);
-        assert_eq!(exec_abs(&float_positive_reg).unwrap(), float_positive_reg);
-        assert_eq!(exec_abs(&float_negative_reg).unwrap(), float_positive_reg);
-
-        assert_eq!(
-            exec_abs(&OwnedValue::build_text(Rc::new(String::from("a")))).unwrap(),
-            OwnedValue::Float(0.0)
-        );
-        assert_eq!(exec_abs(&OwnedValue::Null).unwrap(), OwnedValue::Null);
-    }
-
-    #[test]
-    fn test_char() {
-        assert_eq!(
-            exec_char(vec![OwnedValue::Integer(108), OwnedValue::Integer(105)]),
-            OwnedValue::build_text(Rc::new("li".to_string()))
-        );
-        assert_eq!(
-            exec_char(vec![]),
-            OwnedValue::build_text(Rc::new("".to_string()))
-        );
-        assert_eq!(
-            exec_char(vec![OwnedValue::Null]),
-            OwnedValue::build_text(Rc::new("".to_string()))
-        );
-        assert_eq!(
-            exec_char(vec![OwnedValue::build_text(Rc::new("a".to_string()))]),
-            OwnedValue::build_text(Rc::new("".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_like_with_escape_or_regexmeta_chars() {
-        assert!(exec_like(None, r#"\%A"#, r#"\A"#));
-        assert!(exec_like(None, "%a%a", "aaaa"));
-    }
-
-    #[test]
-    fn test_like_no_cache() {
-        assert!(exec_like(None, "a%", "aaaa"));
-        assert!(exec_like(None, "%a%a", "aaaa"));
-        assert!(!exec_like(None, "%a.a", "aaaa"));
-        assert!(!exec_like(None, "a.a%", "aaaa"));
-        assert!(!exec_like(None, "%a.ab", "aaaa"));
-    }
-
-    #[test]
-    fn test_like_with_cache() {
-        let mut cache = HashMap::new();
-        assert!(exec_like(Some(&mut cache), "a%", "aaaa"));
-        assert!(exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "a.a%", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "%a.ab", "aaaa"));
-
-        // again after values have been cached
-        assert!(exec_like(Some(&mut cache), "a%", "aaaa"));
-        assert!(exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "a.a%", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "%a.ab", "aaaa"));
-    }
-
-    #[test]
-    fn test_random() {
-        match exec_random() {
-            OwnedValue::Integer(value) => {
-                // Check that the value is within the range of i64
-                assert!(
-                    (i64::MIN..=i64::MAX).contains(&value),
-                    "Random number out of range"
-                );
-            }
-            _ => panic!("exec_random did not return an Integer variant"),
-        }
-    }
-
-    #[test]
-    fn test_exec_randomblob() {
-        struct TestCase {
-            input: OwnedValue,
-            expected_len: usize,
-        }
-
-        let test_cases = vec![
-            TestCase {
-                input: OwnedValue::Integer(5),
-                expected_len: 5,
-            },
-            TestCase {
-                input: OwnedValue::Integer(0),
-                expected_len: 1,
-            },
-            TestCase {
-                input: OwnedValue::Integer(-1),
-                expected_len: 1,
-            },
-            TestCase {
-                input: OwnedValue::build_text(Rc::new(String::from(""))),
-                expected_len: 1,
-            },
-            TestCase {
-                input: OwnedValue::build_text(Rc::new(String::from("5"))),
-                expected_len: 5,
-            },
-            TestCase {
-                input: OwnedValue::build_text(Rc::new(String::from("0"))),
-                expected_len: 1,
-            },
-            TestCase {
-                input: OwnedValue::build_text(Rc::new(String::from("-1"))),
-                expected_len: 1,
-            },
-            TestCase {
-                input: OwnedValue::Float(2.9),
-                expected_len: 2,
-            },
-            TestCase {
-                input: OwnedValue::Float(-3.15),
-                expected_len: 1,
-            },
-            TestCase {
-                input: OwnedValue::Null,
-                expected_len: 1,
-            },
-        ];
-
-        for test_case in &test_cases {
-            let result = exec_randomblob(&test_case.input);
-            match result {
-                OwnedValue::Blob(blob) => {
-                    assert_eq!(blob.len(), test_case.expected_len);
+                state.result_row = Some(Row {
+                    values: &state.registers[0] as *const Register,
+                    count: 5,
+                });
+
+                let state = Arc::new(state);
+                let mut handles = vec![];
+
+                for _ in 0..4 {
+                    let state_clone = Arc::clone(&state);
+                    let h = thread::spawn(move || {
+                        if let Some(row) = &state_clone.result_row {
+                            // All threads should see the same values
+                            for i in 0..5 {
+                                let val = row.get::<i64>(i).unwrap();
+                                assert_eq!(val, i as i64 * 10);
+                            }
+                        }
+                    });
+                    handles.push(h);
                 }
-                _ => panic!("exec_randomblob did not return a Blob variant"),
-            }
-        }
-    }
 
-    #[test]
-    fn test_exec_round() {
-        let input_val = OwnedValue::Float(123.456);
-        let expected_val = OwnedValue::Float(123.0);
-        assert_eq!(exec_round(&input_val, None), expected_val);
-
-        let input_val = OwnedValue::Float(123.456);
-        let precision_val = OwnedValue::Integer(2);
-        let expected_val = OwnedValue::Float(123.46);
-        assert_eq!(exec_round(&input_val, Some(precision_val)), expected_val);
-
-        let input_val = OwnedValue::Float(123.456);
-        let precision_val = OwnedValue::build_text(Rc::new(String::from("1")));
-        let expected_val = OwnedValue::Float(123.5);
-        assert_eq!(exec_round(&input_val, Some(precision_val)), expected_val);
-
-        let input_val = OwnedValue::build_text(Rc::new(String::from("123.456")));
-        let precision_val = OwnedValue::Integer(2);
-        let expected_val = OwnedValue::Float(123.46);
-        assert_eq!(exec_round(&input_val, Some(precision_val)), expected_val);
-
-        let input_val = OwnedValue::Integer(123);
-        let precision_val = OwnedValue::Integer(1);
-        let expected_val = OwnedValue::Float(123.0);
-        assert_eq!(exec_round(&input_val, Some(precision_val)), expected_val);
-
-        let input_val = OwnedValue::Float(100.123);
-        let expected_val = OwnedValue::Float(100.0);
-        assert_eq!(exec_round(&input_val, None), expected_val);
-
-        let input_val = OwnedValue::Float(100.123);
-        let expected_val = OwnedValue::Null;
-        assert_eq!(exec_round(&input_val, Some(OwnedValue::Null)), expected_val);
-    }
-
-    #[test]
-    fn test_exec_if() {
-        let reg = OwnedValue::Integer(0);
-        let null_reg = OwnedValue::Integer(0);
-        assert!(!exec_if(&reg, &null_reg, false));
-        assert!(exec_if(&reg, &null_reg, true));
-
-        let reg = OwnedValue::Integer(1);
-        let null_reg = OwnedValue::Integer(0);
-        assert!(exec_if(&reg, &null_reg, false));
-        assert!(!exec_if(&reg, &null_reg, true));
-
-        let reg = OwnedValue::Null;
-        let null_reg = OwnedValue::Integer(0);
-        assert!(!exec_if(&reg, &null_reg, false));
-        assert!(!exec_if(&reg, &null_reg, true));
-
-        let reg = OwnedValue::Null;
-        let null_reg = OwnedValue::Integer(1);
-        assert!(exec_if(&reg, &null_reg, false));
-        assert!(exec_if(&reg, &null_reg, true));
-
-        let reg = OwnedValue::Null;
-        let null_reg = OwnedValue::Null;
-        assert!(!exec_if(&reg, &null_reg, false));
-        assert!(!exec_if(&reg, &null_reg, true));
-    }
-
-    #[test]
-    fn test_nullif() {
-        assert_eq!(
-            exec_nullif(&OwnedValue::Integer(1), &OwnedValue::Integer(1)),
-            OwnedValue::Null
-        );
-        assert_eq!(
-            exec_nullif(&OwnedValue::Float(1.1), &OwnedValue::Float(1.1)),
-            OwnedValue::Null
-        );
-        assert_eq!(
-            exec_nullif(
-                &OwnedValue::build_text(Rc::new("limbo".to_string())),
-                &OwnedValue::build_text(Rc::new("limbo".to_string()))
-            ),
-            OwnedValue::Null
-        );
-
-        assert_eq!(
-            exec_nullif(&OwnedValue::Integer(1), &OwnedValue::Integer(2)),
-            OwnedValue::Integer(1)
-        );
-        assert_eq!(
-            exec_nullif(&OwnedValue::Float(1.1), &OwnedValue::Float(1.2)),
-            OwnedValue::Float(1.1)
-        );
-        assert_eq!(
-            exec_nullif(
-                &OwnedValue::build_text(Rc::new("limbo".to_string())),
-                &OwnedValue::build_text(Rc::new("limb".to_string()))
-            ),
-            OwnedValue::build_text(Rc::new("limbo".to_string()))
+                for h in handles {
+                    h.join().unwrap();
+                }
+            },
+            1000,
         );
     }
 
+    /// Test the result_row invalidation pattern.
+    /// When result_row is taken (invalidated), concurrent reads should not see stale data.
+    /// This simulates the pattern used in `normal_step()` where `result_row.take()` is called.
     #[test]
-    fn test_substring() {
-        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
-        let start_value = OwnedValue::Integer(1);
-        let length_value = OwnedValue::Integer(3);
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("lim")));
-        assert_eq!(
-            exec_substring(&str_value, &start_value, &length_value),
-            expected_val
-        );
+    fn shuttle_result_row_invalidation() {
+        shuttle::check_random(
+            || {
+                let mut state = create_test_state(10, 2);
 
-        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
-        let start_value = OwnedValue::Integer(1);
-        let length_value = OwnedValue::Integer(10);
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        assert_eq!(
-            exec_substring(&str_value, &start_value, &length_value),
-            expected_val
-        );
+                state.registers[0].set_int(100);
+                state.result_row = Some(Row {
+                    values: &state.registers[0] as *const Register,
+                    count: 1,
+                });
 
-        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
-        let start_value = OwnedValue::Integer(10);
-        let length_value = OwnedValue::Integer(3);
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("")));
-        assert_eq!(
-            exec_substring(&str_value, &start_value, &length_value),
-            expected_val
-        );
+                // Simulate the invalidation pattern from normal_step
+                // In real code, this requires &mut self, so there's no concurrent access
+                let taken_row = state.result_row.take();
 
-        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
-        let start_value = OwnedValue::Integer(3);
-        let length_value = OwnedValue::Null;
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("mbo")));
-        assert_eq!(
-            exec_substring(&str_value, &start_value, &length_value),
-            expected_val
-        );
+                // After take(), result_row should be None
+                assert!(state.result_row.is_none());
 
-        let str_value = OwnedValue::build_text(Rc::new("limbo".to_string()));
-        let start_value = OwnedValue::Integer(10);
-        let length_value = OwnedValue::Null;
-        let expected_val = OwnedValue::build_text(Rc::new(String::from("")));
-        assert_eq!(
-            exec_substring(&str_value, &start_value, &length_value),
-            expected_val
+                // The taken row still holds valid data (until dropped)
+                if let Some(row) = taken_row {
+                    let val = row.get::<i64>(0).unwrap();
+                    assert_eq!(val, 100);
+                }
+            },
+            1000,
         );
     }
 
+    /// Test register modification after row invalidation.
+    /// This validates that modifying registers after take() is safe.
     #[test]
-    fn test_exec_instr() {
-        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("im")));
-        let expected = OwnedValue::Integer(2);
-        assert_eq!(exec_instr(&input, &pattern), expected);
+    fn shuttle_register_modification_after_invalidation() {
+        shuttle::check_random(
+            || {
+                let mut state = create_test_state(10, 2);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let expected = OwnedValue::Integer(1);
-        assert_eq!(exec_instr(&input, &pattern), expected);
+                state.registers[0].set_int(1);
+                state.result_row = Some(Row {
+                    values: &state.registers[0] as *const Register,
+                    count: 1,
+                });
 
-        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("o")));
-        let expected = OwnedValue::Integer(5);
-        assert_eq!(exec_instr(&input, &pattern), expected);
+                // Invalidate row (simulating what normal_step does)
+                let _ = state.result_row.take();
 
-        let input = OwnedValue::build_text(Rc::new(String::from("liiiiimbo")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("ii")));
-        let expected = OwnedValue::Integer(2);
-        assert_eq!(exec_instr(&input, &pattern), expected);
+                // Now safe to modify registers
+                state.registers[0].set_int(999);
 
-        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("limboX")));
-        let expected = OwnedValue::Integer(0);
-        assert_eq!(exec_instr(&input, &pattern), expected);
+                // Create new row pointing to modified registers
+                state.result_row = Some(Row {
+                    values: &state.registers[0] as *const Register,
+                    count: 1,
+                });
 
-        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("")));
-        let expected = OwnedValue::Integer(1);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::build_text(Rc::new(String::from("")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let expected = OwnedValue::Integer(0);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::build_text(Rc::new(String::from("")));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("")));
-        let expected = OwnedValue::Integer(1);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Null;
-        let pattern = OwnedValue::Null;
-        let expected = OwnedValue::Null;
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let pattern = OwnedValue::Null;
-        let expected = OwnedValue::Null;
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Null;
-        let pattern = OwnedValue::build_text(Rc::new(String::from("limbo")));
-        let expected = OwnedValue::Null;
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Integer(123);
-        let pattern = OwnedValue::Integer(2);
-        let expected = OwnedValue::Integer(2);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Integer(123);
-        let pattern = OwnedValue::Integer(5);
-        let expected = OwnedValue::Integer(0);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Float(12.34);
-        let pattern = OwnedValue::Float(2.3);
-        let expected = OwnedValue::Integer(2);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Float(12.34);
-        let pattern = OwnedValue::Float(5.6);
-        let expected = OwnedValue::Integer(0);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Float(12.34);
-        let pattern = OwnedValue::build_text(Rc::new(String::from(".")));
-        let expected = OwnedValue::Integer(3);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Blob(Rc::new(vec![1, 2, 3, 4, 5]));
-        let pattern = OwnedValue::Blob(Rc::new(vec![3, 4]));
-        let expected = OwnedValue::Integer(3);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Blob(Rc::new(vec![1, 2, 3, 4, 5]));
-        let pattern = OwnedValue::Blob(Rc::new(vec![3, 2]));
-        let expected = OwnedValue::Integer(0);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Blob(Rc::new(vec![0x61, 0x62, 0x63, 0x64, 0x65]));
-        let pattern = OwnedValue::build_text(Rc::new(String::from("cd")));
-        let expected = OwnedValue::Integer(3);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::build_text(Rc::new(String::from("abcde")));
-        let pattern = OwnedValue::Blob(Rc::new(vec![0x63, 0x64]));
-        let expected = OwnedValue::Integer(3);
-        assert_eq!(exec_instr(&input, &pattern), expected);
+                // New row should see new value
+                if let Some(row) = &state.result_row {
+                    let val = row.get::<i64>(0).unwrap();
+                    assert_eq!(val, 999);
+                }
+            },
+            1000,
+        );
     }
 
+    /// Test sequential send-receive pattern (simulating async task scheduling).
+    /// ProgramState is moved between threads in a producer-consumer pattern.
     #[test]
-    fn test_exec_sign() {
-        let input = OwnedValue::Integer(42);
-        let expected = Some(OwnedValue::Integer(1));
-        assert_eq!(exec_sign(&input), expected);
+    fn shuttle_sequential_thread_transfer() {
+        shuttle::check_random(
+            || {
+                let mut state = create_test_state(10, 2);
+                state.registers[0].set_int(0);
 
-        let input = OwnedValue::Integer(-42);
-        let expected = Some(OwnedValue::Integer(-1));
-        assert_eq!(exec_sign(&input), expected);
+                // Thread 1: increment
+                let h1 = thread::spawn(move || {
+                    if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
+                        &state.registers[0]
+                    {
+                        state.registers[0].set_int(v + 1);
+                    }
+                    state
+                });
 
-        let input = OwnedValue::Integer(0);
-        let expected = Some(OwnedValue::Integer(0));
-        assert_eq!(exec_sign(&input), expected);
+                let mut state = h1.join().unwrap();
 
-        let input = OwnedValue::Float(0.0);
-        let expected = Some(OwnedValue::Integer(0));
-        assert_eq!(exec_sign(&input), expected);
+                // Thread 2: increment
+                let h2 = thread::spawn(move || {
+                    if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
+                        &state.registers[0]
+                    {
+                        state.registers[0].set_int(v + 1);
+                    }
+                    state
+                });
 
-        let input = OwnedValue::Float(0.1);
-        let expected = Some(OwnedValue::Integer(1));
-        assert_eq!(exec_sign(&input), expected);
+                let mut state = h2.join().unwrap();
 
-        let input = OwnedValue::Float(42.0);
-        let expected = Some(OwnedValue::Integer(1));
-        assert_eq!(exec_sign(&input), expected);
+                // Thread 3: increment
+                let h3 = thread::spawn(move || {
+                    if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
+                        &state.registers[0]
+                    {
+                        state.registers[0].set_int(v + 1);
+                    }
+                    state
+                });
 
-        let input = OwnedValue::Float(-42.0);
-        let expected = Some(OwnedValue::Integer(-1));
-        assert_eq!(exec_sign(&input), expected);
+                let state = h3.join().unwrap();
 
-        let input = OwnedValue::build_text(Rc::new("abc".to_string()));
-        let expected = Some(OwnedValue::Null);
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::build_text(Rc::new("42".to_string()));
-        let expected = Some(OwnedValue::Integer(1));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::build_text(Rc::new("-42".to_string()));
-        let expected = Some(OwnedValue::Integer(-1));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::build_text(Rc::new("0".to_string()));
-        let expected = Some(OwnedValue::Integer(0));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Blob(Rc::new(b"abc".to_vec()));
-        let expected = Some(OwnedValue::Null);
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Blob(Rc::new(b"42".to_vec()));
-        let expected = Some(OwnedValue::Integer(1));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Blob(Rc::new(b"-42".to_vec()));
-        let expected = Some(OwnedValue::Integer(-1));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Blob(Rc::new(b"0".to_vec()));
-        let expected = Some(OwnedValue::Integer(0));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Null;
-        let expected = Some(OwnedValue::Null);
-        assert_eq!(exec_sign(&input), expected);
+                // Final value should be 3
+                assert!(matches!(
+                    &state.registers[0],
+                    Register::Value(Value::Numeric(Numeric::Integer(3)))
+                ));
+            },
+            1000,
+        );
     }
 
+    /// Test that ProgramState can be wrapped in Arc for shared ownership.
+    /// This is the typical pattern for concurrent database operations.
     #[test]
-    fn test_exec_zeroblob() {
-        let input = OwnedValue::Integer(0);
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
-        assert_eq!(exec_zeroblob(&input), expected);
+    fn shuttle_arc_wrapped_state() {
+        shuttle::check_random(
+            || {
+                let mut state = create_test_state(10, 2);
 
-        let input = OwnedValue::Null;
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
-        assert_eq!(exec_zeroblob(&input), expected);
+                // Initialize with test data
+                for i in 0..5 {
+                    state.registers[i].set_int(i as i64);
+                }
 
-        let input = OwnedValue::Integer(4);
-        let expected = OwnedValue::Blob(Rc::new(vec![0; 4]));
-        assert_eq!(exec_zeroblob(&input), expected);
+                let state = Arc::new(state);
+                let mut handles = vec![];
 
-        let input = OwnedValue::Integer(-1);
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
-        assert_eq!(exec_zeroblob(&input), expected);
+                // Multiple threads reading registers through Arc
+                for thread_id in 0u8..4 {
+                    let state_clone = Arc::clone(&state);
+                    let h = thread::spawn(move || {
+                        // Each thread reads all registers
+                        for i in 0..5 {
+                            if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
+                                &state_clone.registers[i]
+                            {
+                                assert_eq!(*v, i as i64);
+                            }
+                        }
+                        thread_id
+                    });
+                    handles.push(h);
+                }
 
-        let input = OwnedValue::build_text(Rc::new("5".to_string()));
-        let expected = OwnedValue::Blob(Rc::new(vec![0; 5]));
-        assert_eq!(exec_zeroblob(&input), expected);
-
-        let input = OwnedValue::build_text(Rc::new("-5".to_string()));
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
-        assert_eq!(exec_zeroblob(&input), expected);
-
-        let input = OwnedValue::build_text(Rc::new("text".to_string()));
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
-        assert_eq!(exec_zeroblob(&input), expected);
-
-        let input = OwnedValue::Float(2.6);
-        let expected = OwnedValue::Blob(Rc::new(vec![0; 2]));
-        assert_eq!(exec_zeroblob(&input), expected);
-
-        let input = OwnedValue::Blob(Rc::new(vec![1]));
-        let expected = OwnedValue::Blob(Rc::new(vec![]));
-        assert_eq!(exec_zeroblob(&input), expected);
+                for h in handles {
+                    h.join().unwrap();
+                }
+            },
+            1000,
+        );
     }
 
+    /// Test Row::get_values iterator under concurrent access.
     #[test]
-    fn test_execute_sqlite_version() {
-        let version_integer = 3046001;
-        let expected = "3.46.1";
-        assert_eq!(execute_sqlite_version(version_integer), expected);
+    fn shuttle_row_get_values_concurrent() {
+        shuttle::check_random(
+            || {
+                let mut state = create_test_state(10, 2);
+
+                state.registers[0].set_int(10);
+                state.registers[1].set_int(20);
+                state.registers[2].set_int(30);
+
+                state.result_row = Some(Row {
+                    values: &state.registers[0] as *const Register,
+                    count: 3,
+                });
+
+                let state = Arc::new(state);
+                let state2 = Arc::clone(&state);
+
+                let h1 = thread::spawn(move || {
+                    if let Some(row) = &state.result_row {
+                        let values: Vec<_> = row.get_values().collect();
+                        assert_eq!(values.len(), 3);
+                    }
+                });
+
+                let h2 = thread::spawn(move || {
+                    if let Some(row) = &state2.result_row {
+                        let mut sum = 0i64;
+                        for val in row.get_values() {
+                            if let Value::Numeric(Numeric::Integer(i)) = val {
+                                sum += i;
+                            }
+                        }
+                        assert_eq!(sum, 60); // 10 + 20 + 30
+                    }
+                });
+
+                h1.join().unwrap();
+                h2.join().unwrap();
+            },
+            1000,
+        );
     }
 
+    /// Stress test: Many threads reading from shared ProgramState.
     #[test]
-    fn test_replace() {
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("b")));
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("aoa")));
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
+    fn shuttle_stress_concurrent_reads() {
+        shuttle::check_random(
+            || {
+                let mut state = create_test_state(20, 2);
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("b")));
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("o")));
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
+                // Fill registers with identifiable data
+                for i in 0..20 {
+                    state.registers[i].set_int(i as i64 * 100);
+                }
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("b")));
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("abc")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("abcoabc")));
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
+                state.result_row = Some(Row {
+                    values: &state.registers[0] as *const Register,
+                    count: 20,
+                });
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("a")));
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("b")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
+                let state = Arc::new(state);
+                let mut handles = vec![];
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        let pattern_str = OwnedValue::build_text(Rc::new(String::from("")));
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
+                for thread_id in 0..6u8 {
+                    let state_clone = Arc::clone(&state);
+                    let h = thread::spawn(move || {
+                        // Each thread reads different parts
+                        let start = (thread_id as usize * 3) % 20;
+                        if let Some(row) = &state_clone.result_row {
+                            for i in 0..3 {
+                                let idx = (start + i) % row.len();
+                                let val = row.get::<i64>(idx).unwrap();
+                                assert_eq!(val, idx as i64 * 100);
+                            }
+                        }
+                        thread_id
+                    });
+                    handles.push(h);
+                }
 
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bob")));
-        let pattern_str = OwnedValue::Null;
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
-        let expected_str = OwnedValue::Null;
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bo5")));
-        let pattern_str = OwnedValue::Integer(5);
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("boa")));
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bo5.0")));
-        let pattern_str = OwnedValue::Float(5.0);
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("boa")));
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bo5")));
-        let pattern_str = OwnedValue::Float(5.0);
-        let replace_str = OwnedValue::build_text(Rc::new(String::from("a")));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("bo5")));
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        let input_str = OwnedValue::build_text(Rc::new(String::from("bo5.0")));
-        let pattern_str = OwnedValue::Float(5.0);
-        let replace_str = OwnedValue::Float(6.0);
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("bo6.0")));
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        // todo: change this test to use (0.1 + 0.2) instead of 0.3 when decimals are implemented.
-        let input_str = OwnedValue::build_text(Rc::new(String::from("tes3")));
-        let pattern_str = OwnedValue::Integer(3);
-        let replace_str = OwnedValue::Agg(Box::new(AggContext::Sum(OwnedValue::Float(0.3))));
-        let expected_str = OwnedValue::build_text(Rc::new(String::from("tes0.3")));
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
+                for h in handles {
+                    h.join().unwrap();
+                }
+            },
+            1000,
         );
     }
 }

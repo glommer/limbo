@@ -1,15 +1,43 @@
-# Contributing to Limbo
+# Contributing to Turso
 
-We'd love to have you contribute to Limbo!
+We'd love to have you contribute to Turso!
 
 This document is a quick helper to get you going.
 
-## Getting started
+<!--toc:start-->
+- [Contributing to Turso](#contributing-to-turso)
+  - [Getting Started](#getting-started)
+    - [Configuring `mold` Linker](#configuring-mold-linker)
+    - [Running Tests On Linux](#running-tests-on-linux)
+  - [Developing with AI coding agents](#developing-with-ai-coding-agents)
+  - [Debugging bugs](#debugging-bugs)
+    - [Query execution debugging](#query-execution-debugging)
+    - [Stress testing with sanitizers](#stress-testing-with-sanitizers)
+  - [Finding things to work on](#finding-things-to-work-on)
+  - [Submitting your work](#submitting-your-work)
+  - [Compatibility tests](#compatibility-tests)
+    - [Prerequisites](#prerequisites)
+    - [Running the tests](#running-the-tests)
+  - [SQL Test Runner](#sql-test-runner)
+  - [TPC-H](#tpc-h)
+  - [Deterministic simulation tests](#deterministic-simulation-tests)
+    - [Whopper](#whopper)
+  - [Python Bindings](#python-bindings)
+  - [Fault injection with unreliable libc](#fault-injection-with-unreliable-libc)
+  - [Antithesis](#antithesis)
+  - [Adding Third Party Dependencies](#adding-third-party-dependencies)
+  - [Making Releases](#making-releases)
+    - [Pre-releases](#pre-releases)
+    - [Releases](#releases)
+    - [Cleaning up PyPI Storage](#cleaning-up-pypi-storage)
+<!--toc:end-->
 
-Limbo is a rewrite of SQLite in Rust. If you are new to SQLite, the following articles and books are a good starting point:
+## Getting Started
+
+Turso is a rewrite of SQLite in Rust. If you are new to SQLite, the following articles and books are a good starting point:
 
 * [Architecture of SQLite](https://www.sqlite.org/arch.html)
-* Sibsankar Haldar. [SQLite Database System Design and Implementation (2nd Edition)](https://books.google.fi/books/?id=yWzwCwAAQBAJ&redir_esc=y). 2016
+* Sibsankar Haldar. [SQLite Database System Design and Implementation (2nd Edition)](https://books.google.com/books/?id=yWzwCwAAQBAJ&redir_esc=y). 2016
 * Jay Kreibich. [Using SQLite: Small. Fast. Reliable. Choose Any Three. 1st Edition](https://www.oreilly.com/library/view/using-sqlite/9781449394592/). 2010
 
 If you are new to Rust, the following books are recommended reading:
@@ -19,39 +47,121 @@ If you are new to Rust, the following books are recommended reading:
 
 Examples of contributing
 
-* [How to contribute a SQL function implementation](docs/internals/functions.md)
+* [How to contribute a SQL function implementation](docs/contributing/contributing_functions.md)
+* [Rickrolling Turso DB](https://avi.im/blag/2025/rickrolling-turso)
 
-## Finding things to work on
+To build and run `tursodb` CLI:
 
-The issue tracker has issues tagged with [good first issue](https://github.com/penberg/limbo/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22),
-which are considered to be things to work on to get going. If you're interested in working on one of them, comment on the issue tracker, and we're happy to help you get going.
+```shell
+cargo run --package turso_cli --bin tursodb database.db
+```
 
-## Submitting your work
+Run tests:
+```console
+cargo build -p turso_sqlite3 --features capi
+cargo test
+```
 
-Fork the repository and open a pull request to submit your work.
+### Configuring `mold` Linker
 
-The CI checks for formatting, Clippy warnings, and test failures so remember to run the following before submitting your pull request:
+The `mold` linker can reduce your build time from a minute to just few seconds.
 
-* `cargo fmt` and `cargo clippy` to keep the code formatting in check.
-* `make` to run the test suite.
+First, install `mold`:
 
-**Keep your pull requests focused and as small as possible, but not smaller.** IOW, when preparing a pull request, ensure it focuses on a single thing and that your commits align with that. For example, a good pull request might fix a specific bug or a group of related bugs. Or a good pull request might add a new feature and test for it. Conversely, a bad pull request might fix a bug, add a new feature, and refactor some code.
+```console
+# Fedora/RHEL
+sudo dnf install mold
 
-**The commits in your pull request tell the story of your change.** Break your pull request into multiple commits when needed to make it easier to review and ensure that future developers can also understand the change as they are in the middle of a `git bisect` run to debug a nasty bug. A developer should be able to reconstruct the intent of your change and how you got to the end-result by reading the commits. To keep a clean commit history, make sure the commits are _atomic_:
+# Ubuntu/Debian
+sudo apt install mold
+```
 
-* **Keep commits as small as possible**. The smaller the commit, the easier it is to review, but also easier `git revert` when things go bad.
-* **Don't mix logic and cleanups in same commit**. If you need to refactor the code, do it in a commit of its own. Mixing refactoring with logic changes makes it very hard to review a commit.
-* **Don't mix logic and formatting changes in same commit**. Resist the urge to fix random formatting issues in the same commit as your logic changes, because it only makes it harder to review the commit.
-* **Write a good commit message**. You know your commit is atomic when it's easy to write a short commit message that describes the intent of the change.
+Then configure Cargo to use mold by creating `.cargo/config.toml`:
 
-To produce pull requests like this, you should learn how to use Git's interactive rebase (`git rebase -i`).
+**For Linux:**
 
-For a longer discussion on good commits, see Al Tenhundfeld's [What makes a good git commit](https://www.simplethread.com/what-makes-a-good-git-commit/), for example.
+```toml
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
 
+### Running Tests On Linux
 
-## Debugging query execution
+> [!NOTE]
+> These steps have been tested on Ubuntu Noble 24.04.2 LTS
 
-Limbo aims towards SQLite compatibility. If you find a query that has different behavior than SQLite, the first step is to check what the generated bytecode looks like.
+Running tests on Linux and getting them pass requires a few additional steps
+
+1. Install [SQLite](https://www.sqlite.org/index.html) headers
+```console
+sudo apt install sqlite3 libsqlite3-dev
+```
+2. Install Python3 dev files
+```console
+sudo apt install python3.12 python3.12-dev
+```
+3. Set env var for Maturin
+```console
+export PYO3_PYTHON=$(which python3)
+```
+4. Build Cargo
+```console
+cargo build -p turso_sqlite3 --features capi
+```
+5. Run tests
+```console
+cargo test
+```
+
+Test coverage report:
+
+```
+cargo tarpaulin -o html
+```
+
+> [!NOTE]
+> Generation of coverage report requires [tarpaulin](https://github.com/xd009642/tarpaulin) binary to be installed.
+> You can install it with `cargo install cargo-tarpaulin`
+
+[//]: # (TODO remove the below tip when the bug is solved)
+
+> [!TIP]
+> If coverage fails with "Test failed during run" error and all of the tests passed it might be the result of tarpaulin [bug](https://github.com/xd009642/tarpaulin/issues/1642). You can temporarily set [dynamic libraries linking manually](https://doc.rust-lang.org/cargo/reference/environment-variables.html#dynamic-library-paths) as a workaround, e.g. for linux  `LD_LIBRARY_PATH="$(rustc --print=target-libdir)" cargo tarpaulin -o html`.
+
+Run benchmarks:
+
+```console
+cargo bench --profile bench-profile --bench benchmark
+```
+
+Run benchmarks and generate flamegraphs:
+
+```console
+echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+cargo bench --profile bench-profile --bench benchmark -- --profile-time=5
+```
+
+## Developing with AI coding agents
+
+You're welcome to develop Turso with AI coding agents such as Claude Code, Codex, or OpenCode. Used well, they can help you explore the codebase, draft tests, and polish your contributions. To make the most of them — and to get your PRs merged — keep the following in mind.
+
+We expect you to understand the code you submit. The best AI-assisted contributions come from people who treat the agent as a collaborator, not a substitute: you direct the work, review it critically, and own the result. A PR you can explain and defend is far more valuable than a large one you can't.
+
+To give your PR the best chance of being merged:
+
+* **Keep it small and focused.** Describe the change in your own words, or heavily edit any AI-generated summary so it reads naturally and accurately.
+* **Include regression tests.** Verify that your tests actually FAIL without your changes — this is especially important when the tests are AI-generated.
+* **Contribute in areas you understand.** If you spot a bug in something like the MVCC or b-tree layer but aren't familiar with it, the most helpful thing you can do is file a clear bug report rather than submit an AI-generated fix.
+* **Do a self-review.** LLMs tend to make the same mistakes repeatedly: removing existing comments, adding verbose new ones, writing overly elaborate tests instead of using existing test helpers, etc. Always self-review your code before submitting - make sure it's correct and follows the existing code standards in this repo.
+
+Finally, a well-written bug report with a solid reproducer is often more valuable to maintainers than a sloppy PR. If you're not sure your change is ready, opening an issue is always a great contribution.
+
+## Debugging bugs
+
+### Query execution debugging
+
+Turso aims towards SQLite compatibility. If you find a query that has different behavior than SQLite, the first step is to check what the generated bytecode looks like.
 
 To do that, first run the `EXPLAIN` command in `sqlite3` shell:
 
@@ -70,21 +180,66 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 8     Goto           0     1     0                    0
 ```
 
-and then run the same command in Limbo's shell.
+and then run the same command in Turso's shell.
 
 If the bytecode is different, that's the bug -- work towards fixing code generation.
 If the bytecode is the same, but query results are different, then the bug is somewhere in the virtual machine interpreter or storage layer.
 
+### Stress testing with sanitizers
+
+If you suspect a multi-threading issue, you can run the stress test with ThreadSanitizer enabled as follows:
+
+```console
+rustup toolchain install nightly
+rustup override set nightly
+cargo run -Zbuild-std --target x86_64-unknown-linux-gnu -p turso_stress -- --vfs syscall --nr-threads 4 --nr-iterations 1000
+```
+
+## Finding things to work on
+
+The issue tracker has issues tagged with [good first issue](https://github.com/tursodatabase/limbo/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22),
+which are considered to be things to work on to get going. If you're interested in working on one of them, comment on the issue tracker, and we're happy to help you get going.
+
+You don't need to ask "can I work on this?" The answer is always yes. Pick something, work on it, and open a pull request. A few things to keep in mind:
+
+* You don't need permission to start. Anyone can work on any open issue at any time.
+* Commenting that you're working on something doesn't reserve it. Someone else may work on the same issue in parallel, so don't assume an issue is yours just because you claimed it.
+* Claiming an issue does not obligate a maintainer to merge your work, and asking to work on something is not a commitment from us to review or accept it. Work gets merged on its merits.
+
+If you want to coordinate or ask for guidance on an approach, that's welcome. Just don't wait for a permission slip before getting started.
+
+## Submitting your work
+
+Fork the repository and open a pull request to submit your work.
+
+The CI checks for formatting, Clippy warnings, and test failures so remember to run the following before submitting your pull request:
+
+* `cargo fmt` and `cargo clippy --workspace --all-features --all-targets -- --deny=warnings` to keep the code formatting in check.
+* `make test` to run the test suite.
+
+**Keep your pull requests focused and as small as possible, but not smaller.** IOW, when preparing a pull request, ensure it focuses on a single thing and that your commits align with that. For example, a good pull request might fix a specific bug or a group of related bugs. Or a good pull request might add a new feature and test for it. Conversely, a bad pull request might fix a bug, add a new feature, and refactor some code.
+
+**The commits in your pull request tell the story of your change.** Break your pull request into multiple commits when needed to make it easier to review and ensure that future developers can also understand the change as they are in the middle of a `git bisect` run to debug a nasty bug. A developer should be able to reconstruct the intent of your change and how you got to the end-result by reading the commits. To keep a clean commit history, make sure the commits are _atomic_:
+
+* **Keep commits as small as possible**. The smaller the commit, the easier it is to review, but also easier `git revert` when things go bad.
+* **Don't mix logic and cleanups in same commit**. If you need to refactor the code, do it in a commit of its own. Mixing refactoring with logic changes makes it very hard to review a commit.
+* **Don't mix logic and formatting changes in same commit**. Resist the urge to fix random formatting issues in the same commit as your logic changes, because it only makes it harder to review the commit.
+* **Write a good commit message**. You know your commit is atomic when it's easy to write a short commit message that describes the intent of the change.
+
+To produce pull requests like this, you should learn how to use Git's interactive rebase (`git rebase -i`).
+
+For a longer discussion on good commits, see Al Tenhundfeld's [What makes a good git commit](https://www.simplethread.com/what-makes-a-good-git-commit/), for example.
+
 ## Compatibility tests
 
 The `testing/test.all` is a starting point for adding functional tests using a similar syntax to SQLite.
-The purpose of these tests is to verify behavior matches with SQLite and Limbo.
+The purpose of these tests is to verify behavior matches with SQLite and Turso.
 
 ### Prerequisites
 
 1. [Cargo-c](https://github.com/lu-zero/cargo-c) is needed for building C-ABI compatible library. You can get it via:
 ```console
-cargo install cargo-c
+cargo install cargo-c --version 0.10.16 --locked
 ```
 2. [SQLite](https://www.sqlite.org/index.html) is needed for compatibility checking. You can install it using `brew` on macOS/Linux:
 ```console
@@ -96,7 +251,7 @@ choco install sqlite
 ```
 
 ### Running the tests
-To run the test suite with Limbo, simply run:
+To run the test suite with Turso, simply run:
 
 ```
 make test
@@ -110,9 +265,22 @@ SQLITE_EXEC=sqlite3 SQLITE_FLAGS="" make test
 
 When working on a new feature, please consider adding a test case for it.
 
+## SQL Test Runner
+
+The `test-runner` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
+Tests should be added to `testing/sqltests/tests/` using the `.sqltest` format.
+
+To run tests:
+
+```console
+make -C testing/sqltests run
+```
+
+For full documentation on the DSL syntax and CLI usage, see the [test-runner docs](testing/sqltests/docs/).
+
 ## TPC-H
 
-[TPC-H](https://www.tpc.org/tpch/) is a standard benchmark for testing database performance. To try out Limbo's performance against a TPC-H compatible workload,
+[TPC-H](https://www.tpc.org/tpch/) is a standard benchmark for testing database performance. To try out Turso's performance against a TPC-H compatible workload,
 you can generate or download a TPC-H compatible SQLite database e.g. [here](https://github.com/lovasoa/TPCH-sqlite).
 
 ## Deterministic simulation tests
@@ -121,3 +289,190 @@ The `simulator` directory contains a deterministic simulator for testing.
 What this means is that the behavior of a test run is deterministic based on the seed value.
 If the simulator catches a bug, you can always reproduce the exact same sequence of events by passing the same seed.
 The simulator also performs fault injection to discover interesting bugs.
+
+### Whopper
+
+Whopper is a DST that, unlike `simulator`, performs concurrent query execution.
+
+To run Whopper for your local changes, run:
+
+```console
+./testing/concurrent-simulator/bin/run
+```
+
+The output of the simulation run looks as follows:
+
+```
+mode = fast
+seed = 11621338508193870992
+       .             I/U/D/C
+       .             22/17/15/0
+       .             41/34/20/3
+       |             62/43/27/4
+       |             88/55/30/5
+      ╱|╲            97/58/30/6
+     ╱╲|╱╲           108/62/30/7
+    ╱╲╱|╲╱╲          115/67/32/7
+   ╱╲╱╲|╱╲╱╲         121/74/35/7
+  ╱╲╱╲╱|╲╱╲╱╲        125/80/38/7
+ ╱╲╱╲╱╲|╱╲╱╲╱╲       141/94/43/8
+
+real    0m1.250s
+user    0m0.843s
+sys     0m0.043s
+```
+
+The simulator prints ten progress indication lines, regardless of how long a run takes. The progress indicator line shows the following stats:
+
+* `I` -- the number of `INSERT` statements executed
+* `U` -- the number of `UPDATE` statements executed
+* `D` -- the number of `DELETE` statements executed
+* `C` -- the number of `PRAGMA integrity_check` statements executed
+
+This will do a short sanity check run in using the `fast` mode.
+
+If you need to reproduce a run, just defined the `SEED` environment variable as follows:
+
+```console
+SEED=1234 ./testing/concurrent-simulator/bin/run
+```
+
+You can also run Whopper in exploration mode to find more serious bugs:
+
+```console
+./testing/concurrent-simulator/bin/explore
+```
+
+Note that exploration uses the `chaos` mode so if you need to reproduce a run, use:
+
+```console
+SEED=1234 ./testing/concurrent-simulator/bin/run --mode chaos
+```
+
+Both `explore` and `run` accept the `--enable-checksums` and `--enable-encryption` flags for per page checksums and encryption respectively.
+
+## Python Bindings
+
+Turso provides Python bindings built on top of the [PyO3](https://pyo3.rs) project.
+To compile the Python bindings locally, you first need to create and activate a Python virtual environment (for example, with Python `3.12`):
+
+```bash
+python3.12 -m venv venv
+source venv/bin/activate
+```
+
+Then, install [Maturin](https://pypi.org/project/maturin/):
+
+```bash
+pip install maturin
+```
+
+Once Maturin is installed, you can build the crate and install it as a Python module directly into the current virtual environment by running:
+
+```bash
+cd bindings/python && maturin develop
+```
+
+## Fault injection with unreliable libc
+
+First, build the unreliable libc:
+
+```
+cd testing/unreliable-libc
+make
+```
+
+The run the stress testing tool with fault injection enabled:
+
+```
+RUST_BACKTRACE=1 LD_PRELOAD=./testing/unreliable-libc/unreliable-libc.so cargo run -p turso_stress -- --nr-iterations 10000
+```
+
+## Antithesis
+
+Antithesis is a testing platform for finding bugs with reproducibility. In
+Turso, we use Antithesis in addition to our own deterministic simulation
+testing (DST) tool for the following:
+
+- Discovering bugs that the DST did not catch (and improve the DST)
+- Discovering bugs that the DST does not cover (for example, non-simulated I/O)
+
+If you have an Antithesis account, you first need to configure some
+environment variables:
+
+```bash
+export ANTITHESIS_USER=
+export ANTITHESIS_TENANT=
+export ANTITHESIS_PASSWD=
+export ANTITHESIS_DOCKER_HOST=
+export ANTITHESIS_DOCKER_REPO=
+export ANTITHESIS_EMAIL=
+```
+
+You can then publish a new Antithesis workflow with:
+
+```bash
+scripts/antithesis/publish-workload.sh
+```
+
+And launch an Antithesis test run with:
+
+```bash
+scripts/antithesis/launch.sh
+```
+
+## Adding Third Party Dependencies
+
+When you want to add third party dependencies, please follow these steps:
+
+1. Add Licenses: Place the appropriate licenses for the third-party dependencies under the licenses directory. Ensure
+   that each license is in a separate file and named appropriately.
+2. Update NOTICE.md: Specify the licenses for the third-party dependencies in the NOTICE.md file. Include the name of
+   the dependency, the license file path, and the homepage of the dependency.
+
+By following these steps, you ensure that all third-party dependencies are properly documented and their licenses are
+included in the project.
+
+## Making Releases
+
+Releases are made using the `scripts/update-version.py` script, which updates version numbers across all `Cargo.toml`, `package.json`, `package-lock.json`, and `gradle.properties` files in the workspace, creates a git commit, and adds a version tag.
+
+The process is:
+
+1. Run the version update script with the desired version number.
+2. Push the commit and tag to the remote.
+
+### Pre-releases
+
+Pre-releases use a version suffix such as `-pre.N`:
+
+```console
+./scripts/update-version.py 0.6.0-pre.9
+git push origin main v0.6.0-pre.9
+```
+
+### Releases
+
+Releases use a plain version number:
+
+```console
+./scripts/update-version.py 0.6.0
+git push origin main v0.6.0
+```
+
+## Cleaning up PyPI Storage
+
+PyPI has a storage quota for the `pyturso` package. If you run out of storage, you need to delete old release candidate (RC) packages to free up space.
+
+Use the `scripts/pypi-cleanup` script to manage this:
+
+```console
+# Dry run — lists RC packages older than 90 days (safe, no changes made)
+./scripts/pypi-cleanup
+
+# Actually delete the packages
+./scripts/pypi-cleanup --execute
+```
+
+Always run the dry run first to review what will be deleted before executing.
+

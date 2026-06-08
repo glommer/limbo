@@ -8,106 +8,386 @@
 //! will read rows from the database and filter them according to a WHERE clause.
 
 pub(crate) mod aggregation;
+pub(crate) mod alter;
+pub(crate) mod analyze;
+pub(crate) mod attach;
+pub(crate) mod collate;
+mod compound_select;
 pub(crate) mod delete;
+pub(crate) mod display;
 pub(crate) mod emitter;
 pub(crate) mod expr;
+pub(crate) mod expression_index;
+pub(crate) mod fkeys;
 pub(crate) mod group_by;
+pub(crate) mod index;
 pub(crate) mod insert;
+pub(crate) mod integrity_check;
+pub(crate) mod logical;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;
 pub(crate) mod order_by;
 pub(crate) mod plan;
 pub(crate) mod planner;
+pub(crate) mod pragma;
 pub(crate) mod result_row;
+pub(crate) mod rollback;
+pub(crate) mod schema;
 pub(crate) mod select;
+pub(crate) mod sequence;
+pub(crate) mod stmt_journal;
 pub(crate) mod subquery;
+pub(crate) mod transaction;
+pub(crate) mod trigger;
+pub(crate) mod trigger_exec;
+pub(crate) mod update;
+pub(crate) mod upsert;
+pub(crate) mod vacuum;
+mod values;
+pub(crate) mod view;
+mod window;
 
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
-use crate::storage::sqlite3_ondisk::{DatabaseHeader, MIN_PAGE_CACHE_SIZE};
+use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
-use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
-use crate::vdbe::{builder::ProgramBuilder, insn::Insn, Program};
-use crate::{bail_parse_error, Connection, LimboError, Result, SymbolTable};
+use crate::translate::emitter::Resolver;
+use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
+use crate::vdbe::Program;
+use crate::{bail_parse_error, Connection, Result, SymbolTable};
+use alter::translate_alter_table;
+use analyze::translate_analyze;
+use index::{translate_create_index, translate_drop_index, translate_optimize, translate_reindex};
 use insert::translate_insert;
+use rollback::{translate_release, translate_rollback, translate_savepoint};
+use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
-use sqlite3_parser::ast::fmt::ToTokens;
-use sqlite3_parser::ast::{self, PragmaName};
-use std::cell::RefCell;
-use std::fmt::Display;
-use std::rc::{Rc, Weak};
-use std::str::FromStr;
+use tracing::{instrument, Level};
+use transaction::{translate_tx_begin, translate_tx_commit};
+use turso_parser::ast;
+use update::translate_update;
 
-/// Translate SQL statement into bytecode program.
+#[instrument(skip_all, level = Level::DEBUG)]
+#[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
-    database_header: Rc<RefCell<DatabaseHeader>>,
-    pager: Rc<Pager>,
-    connection: Weak<Connection>,
+    pager: Arc<Pager>,
+    connection: Arc<Connection>,
     syms: &SymbolTable,
+    query_mode: QueryMode,
+    input: &str,
 ) -> Result<Program> {
+    tracing::trace!("querying {}", input);
+    let change_cnt_on = matches!(
+        stmt,
+        ast::Stmt::CreateIndex { .. }
+            | ast::Stmt::Delete { .. }
+            | ast::Stmt::Insert { .. }
+            | ast::Stmt::Update { .. }
+    );
+
+    // Boxed so the ~800 B builder sits on the heap instead of the prepare frame.
+    let mut program = Box::new(ProgramBuilder::new(
+        query_mode,
+        connection.get_capture_data_changes_info().clone(),
+        // These options will be extended whithin each translate program
+        ProgramBuilderOpts::new(1, 32, 2),
+    ));
+
+    program.prologue();
+    let mut resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        syms,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+    );
+
     match stmt {
-        ast::Stmt::AlterTable(_, _) => bail_parse_error!("ALTER TABLE not supported yet"),
-        ast::Stmt::Analyze(_) => bail_parse_error!("ANALYZE not supported yet"),
-        ast::Stmt::Attach { .. } => bail_parse_error!("ATTACH not supported yet"),
-        ast::Stmt::Begin(_, _) => bail_parse_error!("BEGIN not supported yet"),
-        ast::Stmt::Commit(_) => bail_parse_error!("COMMIT not supported yet"),
-        ast::Stmt::CreateIndex { .. } => bail_parse_error!("CREATE INDEX not supported yet"),
+        // There can be no nesting with pragma, so lift it up here
+        ast::Stmt::Pragma { name, body } => {
+            pragma::translate_pragma(
+                &resolver,
+                &name,
+                body,
+                pager,
+                connection.clone(),
+                &mut program,
+            )?;
+        }
+        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
+    };
+
+    program.epilogue(schema);
+
+    program.build(connection, change_cnt_on, input)
+}
+
+// TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
+// statements, we would have to return a program builder instead
+/// Translate SQL statement into bytecode program.
+#[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
+pub fn translate_inner(
+    stmt: ast::Stmt,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    input: &str,
+) -> Result<()> {
+    let is_write = matches!(
+        stmt,
+        ast::Stmt::AlterTable { .. }
+            | ast::Stmt::Analyze { .. }
+            | ast::Stmt::CreateIndex { .. }
+            | ast::Stmt::CreateTable { .. }
+            | ast::Stmt::CreateTrigger { .. }
+            | ast::Stmt::CreateView { .. }
+            | ast::Stmt::CreateMaterializedView { .. }
+            | ast::Stmt::CreateVirtualTable(..)
+            | ast::Stmt::CreateType { .. }
+            | ast::Stmt::CreateDomain { .. }
+            | ast::Stmt::Delete { .. }
+            | ast::Stmt::DropIndex { .. }
+            | ast::Stmt::DropTable { .. }
+            | ast::Stmt::DropType { .. }
+            | ast::Stmt::DropDomain { .. }
+            | ast::Stmt::DropView { .. }
+            | ast::Stmt::Optimize { .. }
+            | ast::Stmt::Update { .. }
+            | ast::Stmt::Insert { .. }
+            | ast::Stmt::CreateSequence { .. }
+            | ast::Stmt::DropSequence { .. }
+    );
+    let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
+
+    if is_vacuum && connection.get_query_only() {
+        bail_parse_error!("Cannot execute VACUUM in query_only mode")
+    }
+
+    if is_write && connection.get_query_only() {
+        bail_parse_error!("Cannot execute write statement in query_only mode")
+    }
+
+    let is_select = matches!(stmt, ast::Stmt::Select { .. });
+
+    match stmt {
+        ast::Stmt::AlterTable(alter) => {
+            translate_alter_table(alter, resolver, program, connection, input)?;
+        }
+        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
+        ast::Stmt::Attach { expr, db_name, key } => {
+            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
+        }
+        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
+        ast::Stmt::Commit { name } => {
+            translate_tx_commit(name, resolver.schema(), resolver, program)?
+        }
+        ast::Stmt::CreateIndex { .. } => {
+            translate_create_index(program, connection, resolver, stmt)?;
+        }
         ast::Stmt::CreateTable {
             temporary,
             if_not_exists,
             tbl_name,
             body,
+        } => translate_create_table(
+            tbl_name,
+            resolver,
+            temporary,
+            if_not_exists,
+            body,
+            program,
+            connection,
+        )?,
+        ast::Stmt::CreateTrigger {
+            temporary,
+            if_not_exists,
+            trigger_name,
+            time,
+            event,
+            tbl_name,
+            for_each_row,
+            when_clause,
+            commands,
         } => {
-            if temporary {
-                bail_parse_error!("TEMPORARY table not supported yet");
-            }
-            translate_create_table(
-                tbl_name,
-                body,
+            // Reconstruct SQL for storage
+            let sql = trigger::create_trigger_to_sql(
+                temporary,
                 if_not_exists,
-                database_header,
-                connection,
-                schema,
-            )
+                &trigger_name,
+                time,
+                &event,
+                &tbl_name,
+                for_each_row,
+                when_clause.as_deref(),
+                &commands,
+            );
+            trigger::translate_create_trigger(
+                trigger_name,
+                resolver,
+                temporary,
+                if_not_exists,
+                time,
+                tbl_name,
+                program,
+                sql,
+                &commands,
+                when_clause.as_deref(),
+            )?
         }
-        ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),
-        ast::Stmt::CreateView { .. } => bail_parse_error!("CREATE VIEW not supported yet"),
-        ast::Stmt::CreateVirtualTable { .. } => {
-            bail_parse_error!("CREATE VIRTUAL TABLE not supported yet")
+        ast::Stmt::CreateView {
+            view_name,
+            select,
+            columns,
+            ..
+        } => view::translate_create_view(&view_name, resolver, &select, &columns, program)?,
+        ast::Stmt::CreateMaterializedView {
+            view_name, select, ..
+        } => view::translate_create_materialized_view(
+            &view_name,
+            resolver,
+            &select,
+            connection.clone(),
+            program,
+        )?,
+        ast::Stmt::CreateVirtualTable(vtab) => {
+            translate_create_virtual_table(vtab, resolver, program, connection)?
         }
         ast::Stmt::Delete {
             tbl_name,
             where_clause,
             limit,
-            ..
-        } => translate_delete(
-            schema,
-            &tbl_name,
-            where_clause,
-            limit,
-            database_header,
-            connection,
-            syms,
-        ),
-        ast::Stmt::Detach(_) => bail_parse_error!("DETACH not supported yet"),
-        ast::Stmt::DropIndex { .. } => bail_parse_error!("DROP INDEX not supported yet"),
-        ast::Stmt::DropTable { .. } => bail_parse_error!("DROP TABLE not supported yet"),
-        ast::Stmt::DropTrigger { .. } => bail_parse_error!("DROP TRIGGER not supported yet"),
-        ast::Stmt::DropView { .. } => bail_parse_error!("DROP VIEW not supported yet"),
-        ast::Stmt::Pragma(name, body) => {
-            translate_pragma(&name, body, database_header, pager, connection)
+            returning,
+            indexed,
+            order_by,
+            with,
+        } => {
+            if !order_by.is_empty() {
+                bail_parse_error!("ORDER BY clause is not supported in DELETE");
+            }
+            if where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            translate_delete(
+                &tbl_name,
+                resolver,
+                where_clause,
+                limit,
+                returning,
+                indexed,
+                with,
+                program,
+                connection,
+            )?
         }
-        ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
-        ast::Stmt::Release(_) => bail_parse_error!("RELEASE not supported yet"),
-        ast::Stmt::Rollback { .. } => bail_parse_error!("ROLLBACK not supported yet"),
-        ast::Stmt::Savepoint(_) => bail_parse_error!("SAVEPOINT not supported yet"),
+        ast::Stmt::Detach { name } => {
+            attach::translate_detach(&name, resolver, program, connection.clone())?
+        }
+        ast::Stmt::DropIndex {
+            if_exists,
+            idx_name,
+        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
+        ast::Stmt::DropTable {
+            if_exists,
+            tbl_name,
+        } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
+        ast::Stmt::DropTrigger {
+            if_exists,
+            trigger_name,
+        } => trigger::translate_drop_trigger(resolver, &trigger_name, if_exists, program)?,
+        ast::Stmt::DropView {
+            if_exists,
+            view_name,
+        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        ast::Stmt::CreateType {
+            if_not_exists,
+            type_name,
+            body,
+        } => {
+            if !connection.experimental_custom_types_enabled() {
+                bail_parse_error!("Custom types require --experimental-custom-types flag");
+            }
+            schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
+        }
+        ast::Stmt::CreateDomain {
+            if_not_exists,
+            domain_name,
+            base_type,
+            default,
+            not_null,
+            constraints,
+        } => {
+            if !connection.experimental_custom_types_enabled() {
+                bail_parse_error!("Custom types require --experimental-custom-types flag");
+            }
+            schema::translate_create_domain(
+                &domain_name,
+                &base_type,
+                not_null,
+                &constraints,
+                default,
+                if_not_exists,
+                resolver,
+                program,
+            )?
+        }
+        ast::Stmt::DropType {
+            if_exists,
+            type_name,
+        } => {
+            if !connection.experimental_custom_types_enabled() {
+                bail_parse_error!("Custom types require --experimental-custom-types flag");
+            }
+            schema::translate_drop_type(&type_name, if_exists, false, resolver, program)?
+        }
+        ast::Stmt::DropDomain {
+            if_exists,
+            domain_name,
+        } => {
+            if !connection.experimental_custom_types_enabled() {
+                bail_parse_error!("Custom types require --experimental-custom-types flag");
+            }
+            schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
+        }
+        ast::Stmt::Pragma { .. } => {
+            bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
+        }
+        ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection)?,
+        ast::Stmt::Optimize { idx_name } => {
+            translate_optimize(idx_name, resolver, program, connection)?
+        }
+        ast::Stmt::Release { name } => translate_release(program, name)?,
+        ast::Stmt::Rollback {
+            tx_name,
+            savepoint_name,
+        } => translate_rollback(program, tx_name, savepoint_name)?,
+        ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
         ast::Stmt::Select(select) => {
-            translate_select(schema, *select, database_header, connection, syms)
+            translate_select(
+                select,
+                resolver,
+                program,
+                plan::QueryDestination::ResultRows,
+                connection,
+            )?;
         }
-        ast::Stmt::Update { .. } => bail_parse_error!("UPDATE not supported yet"),
-        ast::Stmt::Vacuum(_, _) => bail_parse_error!("VACUUM not supported yet"),
+        ast::Stmt::Update(update) => {
+            if update.where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            translate_update(update, resolver, program, connection)?
+        }
+        ast::Stmt::Vacuum { name, into } => {
+            vacuum::translate_vacuum(program, name.as_ref(), into.as_deref(), connection.clone())?
+        }
         ast::Stmt::Insert {
             with,
             or_conflict,
@@ -116,580 +396,241 @@ pub fn translate(
             body,
             returning,
         } => translate_insert(
-            schema,
-            &with,
-            &or_conflict,
-            &tbl_name,
-            &columns,
-            &body,
-            &returning,
-            database_header,
-            connection,
-            syms,
-        ),
-    }
-}
-
-/* Example:
-
-sqlite> EXPLAIN CREATE TABLE users (id INT, email TEXT);;
-addr  opcode         p1    p2    p3    p4             p5  comment
-----  -------------  ----  ----  ----  -------------  --  -------------
-0     Init           0     30    0                    0   Start at 30
-1     ReadCookie     0     3     2                    0
-2     If             3     5     0                    0
-3     SetCookie      0     2     4                    0
-4     SetCookie      0     5     1                    0
-5     CreateBtree    0     2     1                    0   r[2]=root iDb=0 flags=1
-6     OpenWrite      0     1     0     5              0   root=1 iDb=0
-7     NewRowid       0     1     0                    0   r[1]=rowid
-8     Blob           6     3     0                   0   r[3]= (len=6)
-9     Insert         0     3     1                    8   intkey=r[1] data=r[3]
-10    Close          0     0     0                    0
-11    Close          0     0     0                    0
-12    Null           0     4     5                    0   r[4..5]=NULL
-13    Noop           2     0     4                    0
-14    OpenWrite      1     1     0     5              0   root=1 iDb=0; sqlite_master
-15    SeekRowid      1     17    1                    0   intkey=r[1]
-16    Rowid          1     5     0                    0   r[5]= rowid of 1
-17    IsNull         5     26    0                    0   if r[5]==NULL goto 26
-18    String8        0     6     0     table          0   r[6]='table'
-19    String8        0     7     0     users          0   r[7]='users'
-20    String8        0     8     0     users          0   r[8]='users'
-21    Copy           2     9     0                    0   r[9]=r[2]
-22    String8        0     10    0     CREATE TABLE users (id INT, email TEXT) 0   r[10]='CREATE TABLE users (id INT, email TEXT)'
-23    MakeRecord     6     5     4     BBBDB          0   r[4]=mkrec(r[6..10])
-24    Delete         1     68    5                    0
-25    Insert         1     4     5                    0   intkey=r[5] data=r[4]
-26    SetCookie      0     1     1                    0
-27    ParseSchema    0     0     0     tbl_name='users' AND type!='trigger' 0
-28    SqlExec        1     0     0     PRAGMA "main".integrity_check('users') 0
-29    Halt           0     0     0                    0
-30    Transaction    0     1     0     0              1   usesStmtJournal=1
-31    Goto           0     1     0                    0
-
-*/
-#[derive(Debug)]
-enum SchemaEntryType {
-    Table,
-    Index,
-}
-
-impl SchemaEntryType {
-    fn as_str(&self) -> &'static str {
-        match self {
-            SchemaEntryType::Table => "table",
-            SchemaEntryType::Index => "index",
-        }
-    }
-}
-
-fn emit_schema_entry(
-    program: &mut ProgramBuilder,
-    sqlite_schema_cursor_id: usize,
-    entry_type: SchemaEntryType,
-    name: &str,
-    tbl_name: &str,
-    root_page_reg: usize,
-    sql: Option<String>,
-) {
-    let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: sqlite_schema_cursor_id,
-        rowid_reg,
-        prev_largest_reg: 0,
-    });
-
-    let type_reg = program.alloc_register();
-    program.emit_insn(Insn::String8 {
-        value: entry_type.as_str().to_string(),
-        dest: type_reg,
-    });
-
-    let name_reg = program.alloc_register();
-    program.emit_insn(Insn::String8 {
-        value: name.to_string(),
-        dest: name_reg,
-    });
-
-    let tbl_name_reg = program.alloc_register();
-    program.emit_insn(Insn::String8 {
-        value: tbl_name.to_string(),
-        dest: tbl_name_reg,
-    });
-
-    let rootpage_reg = program.alloc_register();
-    program.emit_insn(Insn::Copy {
-        src_reg: root_page_reg,
-        dst_reg: rootpage_reg,
-        amount: 1,
-    });
-
-    let sql_reg = program.alloc_register();
-    if let Some(sql) = sql {
-        program.emit_insn(Insn::String8 {
-            value: sql,
-            dest: sql_reg,
-        });
-    } else {
-        program.emit_insn(Insn::Null {
-            dest: sql_reg,
-            dest_end: None,
-        });
-    }
-
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: type_reg,
-        count: 5,
-        dest_reg: record_reg,
-    });
-
-    program.emit_insn(Insn::InsertAsync {
-        cursor: sqlite_schema_cursor_id,
-        key_reg: rowid_reg,
-        record_reg,
-        flag: 0,
-    });
-    program.emit_insn(Insn::InsertAwait {
-        cursor_id: sqlite_schema_cursor_id,
-    });
-}
-
-/// Check if an automatic PRIMARY KEY index is required for the table.
-/// If so, create a register for the index root page and return it.
-///
-/// An automatic PRIMARY KEY index is not required if:
-/// - The table has no PRIMARY KEY
-/// - The table has a single-column PRIMARY KEY whose typename is _exactly_ "INTEGER" e.g. not "INT".
-///   In this case, the PRIMARY KEY column becomes an alias for the rowid.
-///
-/// Otherwise, an automatic PRIMARY KEY index is required.
-fn check_automatic_pk_index_required(
-    body: &ast::CreateTableBody,
-    program: &mut ProgramBuilder,
-    tbl_name: &str,
-) -> Result<Option<usize>> {
-    match body {
-        ast::CreateTableBody::ColumnsAndConstraints {
+            resolver,
+            or_conflict,
+            tbl_name,
             columns,
-            constraints,
-            options,
+            body,
+            returning,
+            with,
+            program,
+            connection,
+        )?,
+        ast::Stmt::CreateSequence {
+            if_not_exists,
+            seq_name,
+            start,
+            increment,
+            min_value,
+            max_value,
+            cycle,
         } => {
-            let mut primary_key_definition = None;
-
-            // Check table constraints for PRIMARY KEY
-            if let Some(constraints) = constraints {
-                for constraint in constraints {
-                    if let ast::TableConstraint::PrimaryKey {
-                        columns: pk_cols, ..
-                    } = &constraint.constraint
-                    {
-                        let primary_key_column_results: Vec<Result<&String>> = pk_cols
-                            .iter()
-                            .map(|col| match &col.expr {
-                                ast::Expr::Id(name) => Ok(&name.0),
-                                _ => Err(LimboError::ParseError(
-                                    "expressions prohibited in PRIMARY KEY and UNIQUE constraints"
-                                        .to_string(),
-                                )),
-                            })
-                            .collect();
-
-                        for result in primary_key_column_results {
-                            if let Err(e) = result {
-                                crate::bail_parse_error!("{}", e);
-                            }
-                            let column_name = result.unwrap();
-                            let column_def = columns.get(&ast::Name(column_name.clone()));
-                            if column_def.is_none() {
-                                crate::bail_parse_error!("No such column: {}", column_name);
-                            }
-
-                            if matches!(
-                                primary_key_definition,
-                                Some(PrimaryKeyDefinitionType::Simple { .. })
-                            ) {
-                                primary_key_definition = Some(PrimaryKeyDefinitionType::Composite);
-                                continue;
-                            }
-                            if primary_key_definition.is_none() {
-                                let column_def = column_def.unwrap();
-                                let typename =
-                                    column_def.col_type.as_ref().map(|t| t.name.as_str());
-                                primary_key_definition =
-                                    Some(PrimaryKeyDefinitionType::Simple { typename });
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Check column constraints for PRIMARY KEY
-            for (_, col_def) in columns.iter() {
-                for constraint in &col_def.constraints {
-                    if matches!(
-                        constraint.constraint,
-                        ast::ColumnConstraint::PrimaryKey { .. }
-                    ) {
-                        if primary_key_definition.is_some() {
-                            crate::bail_parse_error!(
-                                "table {} has more than one primary key",
-                                tbl_name
-                            );
-                        }
-                        let typename = col_def.col_type.as_ref().map(|t| t.name.as_str());
-                        primary_key_definition =
-                            Some(PrimaryKeyDefinitionType::Simple { typename });
-                    }
-                }
-            }
-
-            // Check if table has rowid
-            if options.contains(ast::TableOptions::WITHOUT_ROWID) {
-                crate::bail_parse_error!("WITHOUT ROWID tables are not supported yet");
-            }
-
-            // Check if we need an automatic index
-            let needs_auto_index = if let Some(primary_key_definition) = &primary_key_definition {
-                match primary_key_definition {
-                    PrimaryKeyDefinitionType::Simple { typename } => {
-                        let is_integer = typename.is_some() && typename.unwrap() == "INTEGER";
-                        !is_integer
-                    }
-                    PrimaryKeyDefinitionType::Composite => true,
-                }
-            } else {
-                false
-            };
-
-            if needs_auto_index {
-                let index_root_reg = program.alloc_register();
-                Ok(Some(index_root_reg))
-            } else {
-                Ok(None)
-            }
-        }
-        ast::CreateTableBody::AsSelect(_) => {
-            crate::bail_parse_error!("CREATE TABLE AS SELECT not supported yet")
-        }
-    }
-}
-
-fn translate_create_table(
-    tbl_name: ast::QualifiedName,
-    body: ast::CreateTableBody,
-    if_not_exists: bool,
-    database_header: Rc<RefCell<DatabaseHeader>>,
-    connection: Weak<Connection>,
-    schema: &Schema,
-) -> Result<Program> {
-    let mut program = ProgramBuilder::new();
-    if schema.get_table(tbl_name.name.0.as_str()).is_some() {
-        if if_not_exists {
-            let init_label = program.allocate_label();
-            program.emit_insn(Insn::Init {
-                target_pc: init_label,
-            });
-            let start_offset = program.offset();
-            program.emit_insn(Insn::Halt {
-                err_code: 0,
-                description: String::new(),
-            });
-            program.resolve_label(init_label, program.offset());
-            program.emit_insn(Insn::Transaction { write: true });
-            program.emit_constant_insns();
-            program.emit_insn(Insn::Goto {
-                target_pc: start_offset,
-            });
-            return Ok(program.build(database_header, connection));
-        }
-        bail_parse_error!("Table {} already exists", tbl_name);
-    }
-
-    let sql = create_table_body_to_str(&tbl_name, &body);
-
-    let parse_schema_label = program.allocate_label();
-    let init_label = program.allocate_label();
-    program.emit_insn(Insn::Init {
-        target_pc: init_label,
-    });
-    let start_offset = program.offset();
-    // TODO: ReadCookie
-    // TODO: If
-    // TODO: SetCookie
-    // TODO: SetCookie
-
-    // Create the table B-tree
-    let table_root_reg = program.alloc_register();
-    program.emit_insn(Insn::CreateBtree {
-        db: 0,
-        root: table_root_reg,
-        flags: 1, // Table leaf page
-    });
-
-    // Create an automatic index B-tree if needed
-    //
-    // NOTE: we are deviating from SQLite bytecode here. For some reason, SQLite first creates a placeholder entry
-    // for the table in sqlite_schema, then writes the index to sqlite_schema, then UPDATEs the table placeholder entry
-    // in sqlite_schema with actual data.
-    //
-    // What we do instead is:
-    // 1. Create the table B-tree
-    // 2. Create the index B-tree
-    // 3. Add the table entry to sqlite_schema
-    // 4. Add the index entry to sqlite_schema
-    //
-    // I.e. we skip the weird song and dance with the placeholder entry. Unclear why sqlite does this.
-    // The sqlite code has this comment:
-    //
-    // "This just creates a place-holder record in the sqlite_schema table.
-    // The record created does not contain anything yet.  It will be replaced
-    // by the real entry in code generated at sqlite3EndTable()."
-    //
-    // References:
-    // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1355
-    // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L2856-L2871
-    // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
-
-    let index_root_reg = check_automatic_pk_index_required(&body, &mut program, &tbl_name.name.0)?;
-    if let Some(index_root_reg) = index_root_reg {
-        program.emit_insn(Insn::CreateBtree {
-            db: 0,
-            root: index_root_reg,
-            flags: 2, // Index leaf page
-        });
-    }
-
-    let table_id = "sqlite_schema".to_string();
-    let table = schema.get_table(&table_id).unwrap();
-    let table = crate::schema::Table::BTree(table.clone());
-    let sqlite_schema_cursor_id =
-        program.alloc_cursor_id(Some(table_id.to_owned()), Some(table.to_owned()));
-    program.emit_insn(Insn::OpenWriteAsync {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1,
-    });
-    program.emit_insn(Insn::OpenWriteAwait {});
-
-    // Add the table entry to sqlite_schema
-    emit_schema_entry(
-        &mut program,
-        sqlite_schema_cursor_id,
-        SchemaEntryType::Table,
-        &tbl_name.name.0,
-        &tbl_name.name.0,
-        table_root_reg,
-        Some(sql),
-    );
-
-    // If we need an automatic index, add its entry to sqlite_schema
-    if let Some(index_root_reg) = index_root_reg {
-        let index_name = format!(
-            "{}{}_1",
-            PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX, tbl_name.name.0
-        );
-        emit_schema_entry(
-            &mut program,
-            sqlite_schema_cursor_id,
-            SchemaEntryType::Index,
-            &index_name,
-            &tbl_name.name.0,
-            index_root_reg,
-            None,
-        );
-    }
-
-    program.resolve_label(parse_schema_label, program.offset());
-    // TODO: SetCookie
-    //
-    // TODO: remove format, it sucks for performance but is convinient
-    let parse_schema_where_clause = format!("tbl_name = '{}' AND type != 'trigger'", tbl_name);
-    program.emit_insn(Insn::ParseSchema {
-        db: sqlite_schema_cursor_id,
-        where_clause: parse_schema_where_clause,
-    });
-
-    // TODO: SqlExec
-    program.emit_insn(Insn::Halt {
-        err_code: 0,
-        description: String::new(),
-    });
-    program.resolve_label(init_label, program.offset());
-    program.emit_insn(Insn::Transaction { write: true });
-    program.emit_constant_insns();
-    program.emit_insn(Insn::Goto {
-        target_pc: start_offset,
-    });
-    Ok(program.build(database_header, connection))
-}
-
-enum PrimaryKeyDefinitionType<'a> {
-    Simple { typename: Option<&'a str> },
-    Composite,
-}
-
-fn translate_pragma(
-    name: &ast::QualifiedName,
-    body: Option<ast::PragmaBody>,
-    database_header: Rc<RefCell<DatabaseHeader>>,
-    pager: Rc<Pager>,
-    connection: Weak<Connection>,
-) -> Result<Program> {
-    let mut program = ProgramBuilder::new();
-    let init_label = program.allocate_label();
-    program.emit_insn(Insn::Init {
-        target_pc: init_label,
-    });
-    let start_offset = program.offset();
-    let mut write = false;
-    match body {
-        None => {
-            let pragma_name = &name.name.0;
-            query_pragma(pragma_name, database_header.clone(), &mut program)?;
-        }
-        Some(ast::PragmaBody::Equals(value)) => {
-            write = true;
-            update_pragma(
-                &name.name.0,
-                value,
-                database_header.clone(),
-                pager,
-                &mut program,
+            sequence::translate_create_sequence(
+                &seq_name,
+                if_not_exists,
+                &start,
+                &increment,
+                &min_value,
+                &max_value,
+                cycle,
+                resolver,
+                program,
             )?;
         }
-        Some(ast::PragmaBody::Call(_)) => {
-            todo!()
+        ast::Stmt::DropSequence {
+            if_exists,
+            seq_name,
+        } => {
+            sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
         }
     };
-    program.emit_insn(Insn::Halt {
-        err_code: 0,
-        description: String::new(),
-    });
-    program.resolve_label(init_label, program.offset());
-    program.emit_insn(Insn::Transaction { write });
-    program.emit_constant_insns();
-    program.emit_insn(Insn::Goto {
-        target_pc: start_offset,
-    });
-    Ok(program.build(database_header, connection))
-}
 
-fn update_pragma(
-    name: &str,
-    value: ast::Expr,
-    header: Rc<RefCell<DatabaseHeader>>,
-    pager: Rc<Pager>,
-    program: &mut ProgramBuilder,
-) -> Result<()> {
-    let pragma = match PragmaName::from_str(name) {
-        Ok(pragma) => pragma,
-        Err(()) => bail_parse_error!("Not a valid pragma name"),
-    };
-    match pragma {
-        PragmaName::CacheSize => {
-            let cache_size = match value {
-                ast::Expr::Literal(ast::Literal::Numeric(numeric_value)) => {
-                    numeric_value.parse::<i64>().unwrap()
-                }
-                ast::Expr::Unary(ast::UnaryOperator::Negative, expr) => match *expr {
-                    ast::Expr::Literal(ast::Literal::Numeric(numeric_value)) => {
-                        -numeric_value.parse::<i64>().unwrap()
-                    }
-                    _ => bail_parse_error!("Not a valid value"),
-                },
-                _ => bail_parse_error!("Not a valid value"),
-            };
-            update_cache_size(cache_size, header, pager);
-            Ok(())
-        }
-        PragmaName::JournalMode => {
-            query_pragma("journal_mode", header, program)?;
-            Ok(())
-        }
-    }
-}
-
-fn query_pragma(
-    name: &str,
-    database_header: Rc<RefCell<DatabaseHeader>>,
-    program: &mut ProgramBuilder,
-) -> Result<()> {
-    let pragma = match PragmaName::from_str(name) {
-        Ok(pragma) => pragma,
-        Err(()) => bail_parse_error!("Not a valid pragma name"),
-    };
-    let register = program.alloc_register();
-    match pragma {
-        PragmaName::CacheSize => {
-            program.emit_insn(Insn::Integer {
-                value: database_header.borrow().default_page_cache_size.into(),
-                dest: register,
-            });
-        }
-        PragmaName::JournalMode => {
-            program.emit_insn(Insn::String8 {
-                value: "wal".into(),
-                dest: register,
-            });
-        }
+    // Indicate write operations so that in the epilogue we can emit the correct type of transaction
+    if is_write {
+        program.begin_write_operation()?;
     }
 
-    program.emit_insn(Insn::ResultRow {
-        start_reg: register,
-        count: 1,
-    });
+    // Indicate read operations so that in the epilogue we can emit the correct type of transaction
+    if is_select && !program.table_references.is_empty() {
+        program.begin_read_operation()?;
+    }
+
     Ok(())
 }
 
-fn update_cache_size(value: i64, header: Rc<RefCell<DatabaseHeader>>, pager: Rc<Pager>) {
-    let mut cache_size_unformatted: i64 = value;
-    let mut cache_size = if cache_size_unformatted < 0 {
-        let kb = cache_size_unformatted.abs() * 1024;
-        kb / 512 // assume 512 page size for now
-    } else {
-        value
-    } as usize;
-
-    if cache_size < MIN_PAGE_CACHE_SIZE {
-        // update both in memory and stored disk value
-        cache_size = MIN_PAGE_CACHE_SIZE;
-        cache_size_unformatted = MIN_PAGE_CACHE_SIZE as i64;
+fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
+    match stmt {
+        ast::Stmt::AlterTable(_) => "alter_table",
+        ast::Stmt::Analyze { .. } => "analyze",
+        ast::Stmt::Attach { .. } => "attach",
+        ast::Stmt::Begin { .. } => "begin",
+        ast::Stmt::Commit { .. } => "commit",
+        ast::Stmt::CreateIndex { .. } => "create_index",
+        ast::Stmt::CreateTable { .. } => "create_table",
+        ast::Stmt::CreateTrigger { .. } => "create_trigger",
+        ast::Stmt::CreateView { .. } => "create_view",
+        ast::Stmt::CreateMaterializedView { .. } => "create_materialized_view",
+        ast::Stmt::CreateVirtualTable(_) => "create_virtual_table",
+        ast::Stmt::CreateType { .. } => "create_type",
+        ast::Stmt::CreateDomain { .. } => "create_domain",
+        ast::Stmt::Delete { .. } => "delete",
+        ast::Stmt::Detach { .. } => "detach",
+        ast::Stmt::DropIndex { .. } => "drop_index",
+        ast::Stmt::DropTable { .. } => "drop_table",
+        ast::Stmt::DropType { .. } => "drop_type",
+        ast::Stmt::DropDomain { .. } => "drop_domain",
+        ast::Stmt::DropTrigger { .. } => "drop_trigger",
+        ast::Stmt::DropView { .. } => "drop_view",
+        ast::Stmt::Insert { .. } => "insert",
+        ast::Stmt::Pragma { .. } => "pragma",
+        ast::Stmt::Reindex { .. } => "reindex",
+        ast::Stmt::Release { .. } => "release",
+        ast::Stmt::Rollback { .. } => "rollback",
+        ast::Stmt::Savepoint { .. } => "savepoint",
+        ast::Stmt::Select { .. } => "select",
+        ast::Stmt::Update { .. } => "update",
+        ast::Stmt::Vacuum { .. } => "vacuum",
+        ast::Stmt::Optimize { .. } => "optimize",
+        ast::Stmt::CreateSequence { .. } => "create_sequence",
+        ast::Stmt::DropSequence { .. } => "drop_sequence",
     }
-
-    // update in-memory header
-    header.borrow_mut().default_page_cache_size = cache_size_unformatted
-        .try_into()
-        .unwrap_or_else(|_| panic!("invalid value, too big for a i32 {}", value));
-
-    // update in disk
-    let header_copy = header.borrow().clone();
-    pager.write_database_header(&header_copy);
-
-    // update cache size
-    pager.change_page_cache_size(cache_size);
 }
 
-struct TableFormatter<'a> {
-    body: &'a ast::CreateTableBody,
-}
-impl Display for TableFormatter<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.body.to_fmt(f)
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::MemoryIO;
+    use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
+    use crate::Database;
 
-fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTableBody) -> String {
-    let mut sql = String::new();
-    let formatter = TableFormatter { body };
-    sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.0, formatter).as_str());
-    match body {
-        ast::CreateTableBody::ColumnsAndConstraints {
-            columns: _,
-            constraints: _,
-            options: _,
-        } => {}
-        ast::CreateTableBody::AsSelect(_select) => todo!("as select not yet supported"),
+    /// Verify that REGEXP produces the correct error when no regexp function is registered.
+    #[test]
+    fn test_regexp_no_function_registered() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        let schema = db.schema.lock().clone();
+        let pager = conn.pager.load().clone();
+
+        // Use an empty SymbolTable so regexp() is not available.
+        let empty_syms = SymbolTable::new();
+        let mut parser = turso_parser::parser::Parser::new(b"SELECT 'x' REGEXP 'y'");
+        let cmd = parser.next().unwrap().unwrap();
+        let stmt = match cmd {
+            ast::Cmd::Stmt(s) => s,
+            _ => panic!("expected statement"),
+        };
+
+        let result = translate(
+            &schema,
+            stmt,
+            pager,
+            conn,
+            &empty_syms,
+            QueryMode::Normal,
+            "",
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no such function: regexp"),
+            "expected 'no such function: regexp', got: {err}"
+        );
     }
-    sql
+
+    #[test]
+    fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+
+        let mut schema = db.schema.lock().as_ref().clone();
+        let seq_root_page = schema
+            .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+            .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
+            .root_page;
+        let malformed_seq =
+            BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
+                .expect("malformed sqlite_sequence SQL should parse");
+        schema.tables.insert(
+            SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            Arc::new(Table::BTree(Arc::new(malformed_seq))),
+        );
+
+        let pager = conn.pager.load().clone();
+        let syms = SymbolTable::new();
+
+        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
+        let cmd = parser.next().unwrap().unwrap();
+        let stmt = match cmd {
+            ast::Cmd::Stmt(s) => s,
+            _ => panic!("expected statement"),
+        };
+
+        let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
+            .expect_err("translation should fail with malformed sqlite_sequence");
+        match err {
+            crate::LimboError::Corrupt(msg) => {
+                assert!(
+                    msg.contains("sqlite_sequence"),
+                    "expected sqlite_sequence corruption error, got: {msg}"
+                );
+            }
+            other => panic!("expected LimboError::Corrupt, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+            .unwrap();
+
+        let mut schema = db.schema.lock().as_ref().clone();
+        schema.tables.remove(SQLITE_SEQUENCE_TABLE_NAME);
+
+        let pager = conn.pager.load().clone();
+        let syms = SymbolTable::new();
+
+        let mut parser = turso_parser::parser::Parser::new(b"INSERT INTO t(v) VALUES('x')");
+        let cmd = parser.next().unwrap().unwrap();
+        let stmt = match cmd {
+            ast::Cmd::Stmt(s) => s,
+            _ => panic!("expected statement"),
+        };
+
+        let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
+            .expect_err("translation should fail with missing sqlite_sequence");
+        match err {
+            crate::LimboError::Corrupt(msg) => {
+                assert!(
+                    msg.contains("missing sqlite_sequence"),
+                    "expected missing sqlite_sequence error, got: {msg}"
+                );
+            }
+            other => panic!("expected LimboError::Corrupt, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_trigger_compile_error_does_not_poison_future_insert_compilation() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("CREATE TABLE ref(x);").unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER);").unwrap();
+        conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT * FROM ref; END;")
+            .unwrap();
+        conn.execute("DROP TABLE ref;").unwrap();
+
+        let err = conn
+            .execute("INSERT INTO t VALUES (1);")
+            .expect_err("single-row insert should fail while trigger references dropped table");
+        assert!(
+            err.to_string().contains("no such table: ref"),
+            "expected missing-table error, got: {err}"
+        );
+
+        let err = conn.execute("INSERT INTO t VALUES (2), (3);").expect_err(
+            "multi-row insert should still fail instead of skipping the poisoned trigger",
+        );
+        assert!(
+            err.to_string().contains("no such table: ref"),
+            "expected missing-table error, got: {err}"
+        );
+    }
 }

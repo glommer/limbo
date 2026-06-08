@@ -1,16 +1,18 @@
-use super::{Buffer, Completion, File, OpenFlags, IO};
+use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
+use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
+use crate::io::FileSyncType;
+use crate::sync::Mutex;
+use crate::turso_assert;
 use crate::Result;
-
 use std::{
-    cell::{RefCell, RefMut},
-    collections::BTreeMap,
-    rc::Rc,
+    cell::{Cell, UnsafeCell},
+    collections::{BTreeMap, HashMap},
     sync::Arc,
 };
+use tracing::debug;
 
 pub struct MemoryIO {
-    pages: RefCell<BTreeMap<usize, MemPage>>,
-    size: RefCell<usize>,
+    files: Arc<Mutex<HashMap<String, Arc<MemoryFile>>>>,
 }
 
 // TODO: page size flag
@@ -19,57 +21,82 @@ type MemPage = Box<[u8; PAGE_SIZE]>;
 
 impl MemoryIO {
     #[allow(clippy::arc_with_non_send_sync)]
-    pub fn new() -> Result<Arc<Self>> {
-        Ok(Arc::new(Self {
-            pages: RefCell::new(BTreeMap::new()),
-            size: RefCell::new(0),
-        }))
-    }
-
-    fn get_or_allocate_page(&self, page_no: usize) -> RefMut<MemPage> {
-        let pages = self.pages.borrow_mut();
-        RefMut::map(pages, |p| {
-            p.entry(page_no).or_insert_with(|| Box::new([0; PAGE_SIZE]))
-        })
-    }
-
-    fn get_page(&self, page_no: usize) -> Option<RefMut<MemPage>> {
-        match RefMut::filter_map(self.pages.borrow_mut(), |pages| pages.get_mut(&page_no)) {
-            Ok(page) => Some(page),
-            Err(_) => None,
+    pub fn new() -> Self {
+        debug!("Using IO backend 'memory'");
+        Self {
+            files: Arc::new(Mutex::new(HashMap::default())),
         }
     }
 }
 
-impl IO for Arc<MemoryIO> {
-    fn open_file(&self, _path: &str, _flags: OpenFlags, _direct: bool) -> Result<Rc<dyn File>> {
-        Ok(Rc::new(MemoryFile {
-            io: Arc::clone(self),
-        }))
+impl Default for MemoryIO {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for MemoryIO {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
     }
 
-    fn run_once(&self) -> Result<()> {
-        // nop
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
+    }
+}
+
+impl IO for MemoryIO {
+    fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
+        let mut files = self.files.lock();
+        if !files.contains_key(path) && !flags.contains(OpenFlags::Create) {
+            return Err(crate::error::CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                "open",
+            )
+            .into());
+        }
+        if !files.contains_key(path) {
+            files.insert(
+                path.to_string(),
+                Arc::new(MemoryFile {
+                    path: path.to_string(),
+                    pages: BTreeMap::new().into(),
+                    size: 0.into(),
+                }),
+            );
+        }
+        Ok(files
+            .get(path)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("file should exist after insert".to_string())
+            })?
+            .clone())
+    }
+    fn remove_file(&self, path: &str) -> Result<()> {
+        let mut files = self.files.lock();
+        files.remove(path);
         Ok(())
     }
 
-    fn generate_random_number(&self) -> i64 {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
-        i64::from_ne_bytes(buf)
+    fn file_id(&self, path: &str) -> Result<super::FileId> {
+        Ok(super::FileId::from_path_hash(path))
     }
 
-    fn get_current_time(&self) -> String {
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    fn supports_shared_wal_coordination(&self) -> bool {
+        false
     }
 }
 
 pub struct MemoryFile {
-    io: Arc<MemoryIO>,
+    path: String,
+    pages: UnsafeCell<BTreeMap<usize, MemPage>>,
+    size: Cell<u64>,
 }
 
+unsafe impl Sync for MemoryFile {}
+crate::assert::assert_sync!(MemoryFile);
+
 impl File for MemoryFile {
-    // no-ops
     fn lock_file(&self, _exclusive: bool) -> Result<()> {
         Ok(())
     }
@@ -77,44 +104,37 @@ impl File for MemoryFile {
         Ok(())
     }
 
-    fn pread(&self, pos: usize, c: Rc<Completion>) -> Result<()> {
-        let r = match &*c {
-            Completion::Read(r) => r,
-            _ => unreachable!(),
-        };
-        let buf_len = r.buf().len();
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+        tracing::debug!("pread(path={}): pos={}", self.path, pos);
+        let r = c.as_read();
+        let buf_len = r.buf().len() as u64;
         if buf_len == 0 {
             c.complete(0);
-            return Ok(());
+            return Ok(c);
         }
 
-        let file_size = *self.io.size.borrow();
+        let file_size = self.size.get();
         if pos >= file_size {
             c.complete(0);
-            return Ok(());
+            return Ok(c);
         }
 
         let read_len = buf_len.min(file_size - pos);
         {
-            let mut read_buf = r.buf_mut();
-            let mut offset = pos;
-            let mut remaining = read_len;
+            let read_buf = r.buf();
+            let mut offset = pos as usize;
+            let mut remaining = read_len as usize;
             let mut buf_offset = 0;
 
             while remaining > 0 {
                 let page_no = offset / PAGE_SIZE;
                 let page_offset = offset % PAGE_SIZE;
                 let bytes_to_read = remaining.min(PAGE_SIZE - page_offset);
-                if let Some(page) = self.io.get_page(page_no) {
-                    {
-                        let page_data = &*page;
-                        read_buf.as_mut_slice()[buf_offset..buf_offset + bytes_to_read]
-                            .copy_from_slice(&page_data[page_offset..page_offset + bytes_to_read]);
-                    }
+                if let Some(page) = self.get_page(page_no) {
+                    read_buf.as_mut_slice()[buf_offset..buf_offset + bytes_to_read]
+                        .copy_from_slice(&page[page_offset..page_offset + bytes_to_read]);
                 } else {
-                    for b in &mut read_buf.as_mut_slice()[buf_offset..buf_offset + bytes_to_read] {
-                        *b = 0;
-                    }
+                    read_buf.as_mut_slice()[buf_offset..buf_offset + bytes_to_read].fill(0);
                 }
 
                 offset += bytes_to_read;
@@ -123,21 +143,26 @@ impl File for MemoryFile {
             }
         }
         c.complete(read_len as i32);
-        Ok(())
+        Ok(c)
     }
 
-    fn pwrite(&self, pos: usize, buffer: Rc<RefCell<Buffer>>, c: Rc<Completion>) -> Result<()> {
-        let buf = buffer.borrow();
-        let buf_len = buf.len();
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+        tracing::debug!(
+            "pwrite(path={}): pos={}, size={}",
+            self.path,
+            pos,
+            buffer.len()
+        );
+        let buf_len = buffer.len();
         if buf_len == 0 {
             c.complete(0);
-            return Ok(());
+            return Ok(c);
         }
 
-        let mut offset = pos;
+        let mut offset = pos as usize;
         let mut remaining = buf_len;
         let mut buf_offset = 0;
-        let data = &buf.as_slice();
+        let data = &buffer.as_slice();
 
         while remaining > 0 {
             let page_no = offset / PAGE_SIZE;
@@ -145,7 +170,7 @@ impl File for MemoryFile {
             let bytes_to_write = remaining.min(PAGE_SIZE - page_offset);
 
             {
-                let mut page = self.io.get_or_allocate_page(page_no);
+                let page = self.get_or_allocate_page(page_no as u64);
                 page[page_offset..page_offset + bytes_to_write]
                     .copy_from_slice(&data[buf_offset..buf_offset + bytes_to_write]);
             }
@@ -155,28 +180,119 @@ impl File for MemoryFile {
             remaining -= bytes_to_write;
         }
 
-        {
-            let mut size = self.io.size.borrow_mut();
-            *size = (*size).max(pos + buf_len);
-        }
+        self.size
+            .set(core::cmp::max(pos + buf_len as u64, self.size.get()));
 
         c.complete(buf_len as i32);
-        Ok(())
+        Ok(c)
     }
 
-    fn sync(&self, c: Rc<Completion>) -> Result<()> {
+    fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
+        tracing::debug!("sync(path={})", self.path);
         // no-op
         c.complete(0);
-        Ok(())
+        Ok(c)
+    }
+
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        tracing::debug!("truncate(path={}): len={}", self.path, len);
+        if len < self.size.get() {
+            // Truncate pages
+            unsafe {
+                let pages = &mut *self.pages.get();
+                pages.retain(|&k, _| k * PAGE_SIZE < len as usize);
+            }
+        }
+        self.size.set(len);
+        c.complete(0);
+        Ok(c)
+    }
+
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
+        tracing::debug!(
+            "pwritev(path={}): pos={}, buffers={:?}",
+            self.path,
+            pos,
+            buffers.iter().map(|x| x.len()).collect::<Vec<_>>()
+        );
+        let mut offset = pos as usize;
+        let mut total_written = 0;
+
+        for buffer in buffers {
+            let buf_len = buffer.len();
+            if buf_len == 0 {
+                continue;
+            }
+
+            let mut remaining = buf_len;
+            let mut buf_offset = 0;
+            let data = &buffer.as_slice();
+
+            while remaining > 0 {
+                let page_no = offset / PAGE_SIZE;
+                let page_offset = offset % PAGE_SIZE;
+                let bytes_to_write = remaining.min(PAGE_SIZE - page_offset);
+
+                {
+                    let page = self.get_or_allocate_page(page_no as u64);
+                    page[page_offset..page_offset + bytes_to_write]
+                        .copy_from_slice(&data[buf_offset..buf_offset + bytes_to_write]);
+                }
+
+                offset += bytes_to_write;
+                buf_offset += bytes_to_write;
+                remaining -= bytes_to_write;
+            }
+            total_written += buf_len;
+        }
+        c.complete(total_written as i32);
+        self.size
+            .set(core::cmp::max(pos + total_written as u64, self.size.get()));
+        Ok(c)
     }
 
     fn size(&self) -> Result<u64> {
-        Ok(*self.io.size.borrow() as u64)
+        tracing::debug!("size(path={}): {}", self.path, self.size.get());
+        Ok(self.size.get())
+    }
+
+    fn has_hole(&self, pos: usize, len: usize) -> Result<bool> {
+        let start_page = pos / PAGE_SIZE;
+        let end_page = ((pos + len.max(1)) - 1) / PAGE_SIZE;
+        for page_no in start_page..=end_page {
+            if self.get_page(page_no).is_some() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn punch_hole(&self, pos: usize, len: usize) -> Result<()> {
+        turso_assert!(
+            pos % PAGE_SIZE == 0 && len % PAGE_SIZE == 0,
+            "hole must be page aligned"
+        );
+        let start_page = pos / PAGE_SIZE;
+        let end_page = ((pos + len.max(1)) - 1) / PAGE_SIZE;
+        for page_no in start_page..=end_page {
+            unsafe { (*self.pages.get()).remove(&page_no) };
+        }
+        Ok(())
     }
 }
 
-impl Drop for MemoryFile {
-    fn drop(&mut self) {
-        // no-op
+impl MemoryFile {
+    #[allow(clippy::mut_from_ref)]
+    fn get_or_allocate_page(&self, page_no: u64) -> &mut MemPage {
+        unsafe {
+            let pages = &mut *self.pages.get();
+            pages
+                .entry(page_no as usize)
+                .or_insert_with(|| Box::new([0; PAGE_SIZE]))
+        }
+    }
+
+    fn get_page(&self, page_no: usize) -> Option<&MemPage> {
+        unsafe { (*self.pages.get()).get(&page_no) }
     }
 }

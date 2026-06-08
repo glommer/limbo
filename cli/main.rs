@@ -1,29 +1,106 @@
 #![allow(clippy::arc_with_non_send_sync)]
 mod app;
-mod import;
+mod commands;
+mod config;
+mod helper;
+mod input;
+mod manual;
+mod mcp_server;
 mod opcodes_dictionary;
+mod read_state_machine;
+mod sync_server;
 
-use rustyline::{error::ReadlineError, DefaultEditor};
-use std::sync::atomic::Ordering;
+#[cfg(feature = "mvcc_repl")]
+mod mvcc_repl;
+
+use config::CONFIG_DIR;
+use mcp_server::TursoMcpServer;
+use rustyline::{error::ReadlineError, Config, Editor};
+use std::{
+    path::PathBuf,
+    sync::{atomic::Ordering, LazyLock},
+};
+
+use crate::sync_server::TursoSyncServer;
+
+#[cfg(all(feature = "mimalloc", not(target_family = "wasm"), not(miri)))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+fn rustyline_config() -> Config {
+    Config::builder()
+        .completion_type(rustyline::CompletionType::List)
+        .auto_add_history(true)
+        .build()
+}
+
+pub static HOME_DIR: LazyLock<PathBuf> =
+    LazyLock::new(|| dirs::home_dir().expect("Could not determine home directory"));
+
+pub static HISTORY_FILE: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join(".limbo_history"));
+
+fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
+    let conn = app.get_connection();
+    let interrupt_count = app.get_interrupt_count();
+    let mcp_server = TursoMcpServer::new(conn, interrupt_count);
+
+    mcp_server.run()
+}
+
+fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
+    let address = app.opts.sync_server_address.clone().unwrap();
+    let conn = app.get_connection();
+    let interrupt_count = app.get_interrupt_count();
+    let sync_server = TursoSyncServer::new(address, conn, interrupt_count);
+
+    sync_server.run()
+}
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
-    let mut app = app::Limbo::new()?;
-    let mut rl = DefaultEditor::new()?;
-    let home = dirs::home_dir().expect("Could not determine home directory");
-    let history_file = home.join(".limbo_history");
-    if history_file.exists() {
-        rl.load_history(history_file.as_path())?;
+    #[cfg(feature = "mvcc_repl")]
+    {
+        use clap::Parser as _;
+        let opts = app::Opts::parse();
+        if opts.mvcc {
+            let path = opts
+                .database
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .unwrap_or(":memory:")
+                .to_owned();
+            return mvcc_repl::run(&path);
+        }
     }
+
+    let (mut app, _guard) = app::Limbo::new()?;
+
+    if app.is_mcp_mode() {
+        return run_mcp_server(app);
+    }
+    if app.is_sync_server_mode() {
+        return run_sync_server(app);
+    }
+
+    let interactive_stdin = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if interactive_stdin {
+        let mut rl = Editor::with_config(rustyline_config())?;
+        if HISTORY_FILE.exists() {
+            rl.load_history(HISTORY_FILE.as_path())?;
+        }
+        let config_file = CONFIG_DIR.join("limbo.toml");
+
+        let config = config::Config::from_config_file(config_file);
+        tracing::info!("Configuration: {:?}", config);
+        app = app.with_config(config);
+
+        app = app.with_readline(rl);
+    } else {
+        tracing::debug!("not in tty");
+    }
+
     loop {
-        let readline = rl.readline(&app.prompt);
-        match readline {
-            Ok(line) => match app.handle_input_line(line.trim(), &mut rl) {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("{}", e);
-                }
-            },
+        match app.readline() {
+            Ok(_) => app.consume(false),
             Err(ReadlineError::Interrupted) => {
                 // At prompt, increment interrupt count
                 if app.interrupt_count.fetch_add(1, Ordering::SeqCst) >= 1 {
@@ -36,6 +113,8 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
             Err(ReadlineError::Eof) => {
+                // consume remaining input before exit
+                app.consume(true);
                 let _ = app.close_conn();
                 break;
             }
@@ -45,6 +124,8 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-    rl.save_history(history_file.as_path())?;
+    if !interactive_stdin && app.has_query_error() {
+        std::process::exit(1);
+    }
     Ok(())
 }

@@ -1,10 +1,18 @@
 /target
+/target.noindex
 /.idea
 /.vscode
+/.sqlite3
+**/target
 
 *.so
+*.dylib
+*.dSYM/
 *.ipynb
-
+*.o
+*.sqlite
+!bindings/dotnet/src/Turso.Data.Sqlite/
+!bindings/dotnet/src/Turso.Data.Sqlite/**
 # Python
 .mypy_cache/
 .pytest_cache/
@@ -19,13 +27,58 @@ env
 dist/
 .tmp/
 
-
+*.db
 **/*.db-wal
 **/*.db-shm
 **/*-wal
+**/*.db-tshm
+
+# perf
+**/*/Mobibench
+perf/mobibench/plot/results.csv
+perf/mobibench/plot/mobibench.pdf
+perf/mobibench/plot/uv.lock
 
 # OS
 .DS_Store
 
 # Javascript
 **/node_modules/
+
+# testing
+testing/limbo_output.txt
+**/limbo_output.txt
+testing/*.log
+.bugbase
+limbostress.log
+simulator.log
+**/*.txt
+profile.json.gz
+simulator-output/
+tests/*.sql
+stress-go/stress-go
+&1
+bisected.sql
+*.log
+
+*.db-log
+settings.local.json
+.claude/agents/
+.build-hash
+
+# Track empty wals for read only databases
+!testing/sqltests/database/*
+testing/sqltests/database/integrity_*.db
+
+
+# For simulator redo
+test.sql
+
+# for elle edn transaction history
+*.edn
+elle-history-results/
+custom-types-fuzzer-output/
+CLAUDE.md
+bindings/python/dev.py
+bindings/python/implementation-test/
+dhat-heap.json

@@ -4,11 +4,13 @@
 
 use clap::Parser;
 use hdrhistogram::Histogram;
-use limbo_core::{Database, PlatformIO, IO};
-use std::ops::{Coroutine, CoroutineState};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{
+    ops::{Coroutine, CoroutineState},
+    pin::Pin,
+    sync::Arc,
+    time::Instant,
+};
+use turso_core::{Database, PlatformIO, IO};
 
 #[derive(Parser)]
 struct Opts {
@@ -36,13 +38,14 @@ fn main() {
                     let mut rows = stmt.query().unwrap();
                     let mut count = 0;
                     loop {
-                        let row = rows.next_row().unwrap();
+                        let row = rows.step().unwrap();
                         match row {
-                            limbo_core::StepResult::Row(_) => {
+                            turso_core::StepResult::Row(_) => {
+                                let row = statement.row();
                                 count += 1;
                             }
-                            limbo_core::StepResult::IO => yield,
-                            limbo_core::StepResult::Done => break,
+                            turso_core::StepResult::IO => yield,
+                            turso_core::StepResult::Done => break,
                         }
                     }
                     assert!(count == 100);

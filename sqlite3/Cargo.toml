@@ -1,16 +1,18 @@
 # Copyright 2024 the Limbo authors. All rights reserved. MIT license.
 
 [package]
-name = "limbo_sqlite3"
+name = "turso_sqlite3"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+build = "build.rs"
 
 [features]
 capi = []
 lfs = []
+sqlite3 = []
 
 [package.metadata.dist]
 dist = true
@@ -20,11 +22,22 @@ doc = false
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
-env_logger = { version = "0.11.3", default-features = false }
+env_logger = { workspace = true, default-features = false }
 libc = "0.2.169"
-limbo_core = { path = "../core" }
-log = "0.4.22"
+turso_core = { workspace = true, features = ["conn_raw_api"] }
+turso_ext.workspace = true
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [package.metadata.capi.header]
 name = "sqlite3.h"
+
+[[test]]
+name = "compat"
+path = "tests/compat/mod.rs"
+
+[build-dependencies]
