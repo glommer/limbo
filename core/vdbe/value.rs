@@ -506,7 +506,11 @@ impl Value {
             if p1 < 0 {
                 p1 = p1.wrapping_add(len);
                 if p1 < 0 {
-                    p2 = p2.wrapping_add(p1);
+                    if p2 < 0 {
+                        p2 = 0;
+                    } else {
+                        p2 += p1;
+                    }
                     p1 = 0;
                 }
             } else if p1 > 0 {
@@ -877,6 +881,9 @@ impl Value {
             // NONE	Casting a value to a type-name with no affinity causes the value to be converted into a BLOB. Casting to a BLOB consists of first casting the value to TEXT in the encoding of the database connection, then interpreting the resulting byte sequence as a BLOB instead of as TEXT.
             // Historically called NONE, but it's the same as BLOB
             Affinity::Blob => {
+                if let Value::Blob(blob) = self {
+                    return Value::Blob(blob.clone());
+                }
                 // Convert to TEXT first, then interpret as BLOB
                 // TODO: handle encoding
                 let text = self.to_string();
@@ -2443,6 +2450,14 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_blob_preserves_blob_bytes() {
+        let input_blob = Value::Blob(vec![0xd2, 0x64, 0xc0, 0x07, 0xf6, 0x44, 0xe4, 0x59]);
+        let expected = input_blob.clone();
+
+        assert_eq!(input_blob.exec_cast("BLOB"), expected);
+    }
+
+    #[test]
     fn test_unhex() {
         let input = Value::build_text("6f");
         let expected = Value::Blob(vec![0x6f]);
@@ -2815,6 +2830,15 @@ mod tests {
         let start_value = Value::from_i64(10);
         let length_value = Value::Null;
         let expected_val = Value::Null;
+        assert_eq!(
+            Value::exec_substring(&str_value, &start_value, Some(&length_value)),
+            expected_val
+        );
+
+        let str_value = Value::build_text("limbo");
+        let start_value = Value::from_i64(-7_096_519_388_852_014_892);
+        let length_value = Value::from_i64(-4_829_175_794_346_763_833);
+        let expected_val = Value::build_text("");
         assert_eq!(
             Value::exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val

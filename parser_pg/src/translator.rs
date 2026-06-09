@@ -309,7 +309,6 @@ impl PostgreSQLTranslator {
                 increment: None,
                 min_value: None,
                 max_value: None,
-                cache: None,
                 cycle: false,
             })
             .collect();
@@ -402,6 +401,7 @@ impl PostgreSQLTranslator {
                     "'{seq_name}'"
                 ))))],
                 order_by: vec![],
+                within_group: vec![],
                 filter_over: ast::FunctionTail {
                     filter_clause: None,
                     over_clause: None,
@@ -2067,6 +2067,7 @@ impl PostgreSQLTranslator {
                     distinctness: None,
                     args,
                     order_by: vec![],
+                    within_group: vec![],
                     filter_over: ast::FunctionTail {
                         filter_clause: None,
                         over_clause: None,
@@ -2090,6 +2091,7 @@ impl PostgreSQLTranslator {
                     distinctness: None,
                     args,
                     order_by: vec![],
+                    within_group: vec![],
                     filter_over: ast::FunctionTail {
                         filter_clause: None,
                         over_clause: None,
@@ -2149,6 +2151,7 @@ impl PostgreSQLTranslator {
                     distinctness: None,
                     args,
                     order_by: vec![],
+                    within_group: vec![],
                     filter_over: ast::FunctionTail {
                         filter_clause: None,
                         over_clause: None,
@@ -2184,6 +2187,7 @@ impl PostgreSQLTranslator {
                                         Box::new(end_expr),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: ast::FunctionTail {
                                         filter_clause: None,
                                         over_clause: None,
@@ -2200,6 +2204,7 @@ impl PostgreSQLTranslator {
                                     distinctness: None,
                                     args: vec![Box::new(expr), Box::new(index_expr)],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: ast::FunctionTail {
                                         filter_clause: None,
                                         over_clause: None,
@@ -2358,6 +2363,7 @@ impl PostgreSQLTranslator {
                     distinctness: None,
                     args,
                     order_by: vec![],
+                    within_group: vec![],
                     filter_over: ast::FunctionTail {
                         filter_clause: None,
                         over_clause: None,
@@ -2558,6 +2564,7 @@ impl PostgreSQLTranslator {
                     distinctness: None,
                     args,
                     order_by: vec![],
+                    within_group: vec![],
                     filter_over: ast::FunctionTail {
                         filter_clause: None,
                         over_clause: None,
@@ -2723,6 +2730,7 @@ impl PostgreSQLTranslator {
             distinctness: None,
             args: vec![Box::new(lhs)],
             order_by: vec![],
+            within_group: vec![],
             filter_over: ast::FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -2734,6 +2742,7 @@ impl PostgreSQLTranslator {
             distinctness: None,
             args: vec![Box::new(rhs)],
             order_by: vec![],
+            within_group: vec![],
             filter_over: ast::FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -2879,6 +2888,7 @@ impl PostgreSQLTranslator {
             distinctness,
             args,
             order_by: vec![],
+            within_group: vec![],
             filter_over,
         })
     }
@@ -3610,7 +3620,6 @@ impl PostgreSQLTranslator {
         let mut increment = None;
         let mut min_value = None;
         let mut max_value = None;
-        let mut cache = None;
         let mut cycle = false;
 
         for opt_node in &seq.options {
@@ -3628,14 +3637,11 @@ impl PostgreSQLTranslator {
                     "maxvalue" => {
                         max_value = extract_def_elem_int(elem);
                     }
-                    "cache" => {
-                        cache = extract_def_elem_int(elem);
-                    }
                     "cycle" => {
                         // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
                         cycle = extract_def_elem_bool(elem);
                     }
-                    _ => {} // ignore unknown options
+                    _ => {} // ignore unknown options (including "cache", which Turso doesn't support)
                 }
             }
         }
@@ -3647,7 +3653,6 @@ impl PostgreSQLTranslator {
             increment,
             min_value,
             max_value,
-            cache,
             cycle,
         })
     }

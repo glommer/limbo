@@ -928,7 +928,7 @@ impl PgProcCursor {
         }
 
         // Extension functions
-        for (name, is_agg, argc) in self.conn.get_syms_functions() {
+        for (name, is_agg, argc, _deterministic) in self.conn.get_syms_functions() {
             let prokind = if is_agg { "a" } else { "f" };
 
             self.rows.push(vec![
@@ -2703,7 +2703,6 @@ struct PgSequencesCursor {
 
 impl PgSequencesCursor {
     fn load_sequences(&mut self) {
-        use std::sync::atomic::Ordering;
         self.rows.clear();
         let schema = self.conn.schema.read().clone();
         let mut names: Vec<_> = schema.sequences.keys().cloned().collect();
@@ -2711,7 +2710,12 @@ impl PgSequencesCursor {
         for name in names {
             if let Some(seq) = schema.sequences.get(&name) {
                 let seq_name = seq.name.clone();
-                let last_val = seq.current_value.load(Ordering::Relaxed);
+                // currval is per-connection; expose this connection's last
+                // value via the connection currval map, falling back to start.
+                let last_val = self
+                    .conn
+                    .get_sequence_currval(&seq_name)
+                    .unwrap_or(seq.start_value);
                 self.rows.push(vec![
                     Value::build_text("public"),           // schemaname
                     Value::build_text(seq_name),           // sequencename
@@ -2722,7 +2726,7 @@ impl PgSequencesCursor {
                     Value::from_i64(seq.max_value),        // max_value
                     Value::from_i64(seq.increment_by),     // increment_by
                     Value::from_i64(i64::from(seq.cycle)), // cycle
-                    Value::from_i64(seq.cache),            // cache_size
+                    Value::from_i64(1),                    // cache_size (PG default; Turso doesn't cache)
                     Value::from_i64(last_val),             // last_value
                 ]);
             }

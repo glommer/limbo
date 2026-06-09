@@ -121,8 +121,31 @@ pub enum Operation {
         value: i64,
         is_called: bool,
     },
+    /// Call currval('seq_name') — returns the last value from nextval in this session
+    CurrVal { seq_name: String },
     /// Drop a sequence
     DropSequence { seq_name: String },
+    /// Create a table with a column that defaults to nextval() of an existing sequence
+    CreateTableWithSeqDefault {
+        table_name: String,
+        seq_name: String,
+    },
+    /// Insert a row into a table that has a sequence-backed DEFAULT column
+    InsertSeqDefault { table_name: String },
+    /// Insert a row into the AUTOINCREMENT table with NULL rowid.
+    /// RETURNING id gives the engine-assigned rowid back so the
+    /// `AutoincWatermarkMonotonicity` property can verify it strictly
+    /// advanced past the previous committed max.
+    AutoincInsert { payload: String },
+    /// Reassign an existing rowid in the AUTOINCREMENT table to a higher
+    /// value. The historical bug class: this should bump
+    /// `sqlite_sequence.seq` so subsequent NULL-rowid inserts skip the
+    /// reassigned region instead of colliding with it.
+    AutoincUpdateRowid { old_id: i64, new_id: i64 },
+    /// Delete a row from the AUTOINCREMENT table.  Mostly there to give
+    /// the table some non-trivial churn so the watermark/btree interplay
+    /// has fewer trivially-flat scenarios.
+    AutoincDelete { id: i64 },
 }
 pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
 /// Context passed to Operation::start_op and Operation::finish_op.
@@ -229,8 +252,40 @@ impl Operation {
                     if *is_called { "true" } else { "false" }
                 )
             }
+            Operation::CurrVal { seq_name } => {
+                format!("SELECT currval('{seq_name}')")
+            }
             Operation::DropSequence { seq_name } => {
                 format!("DROP SEQUENCE IF EXISTS {seq_name}")
+            }
+            Operation::CreateTableWithSeqDefault {
+                table_name,
+                seq_name,
+            } => {
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER PRIMARY KEY, seq_col INTEGER DEFAULT (nextval('{seq_name}')), data TEXT)"
+                )
+            }
+            Operation::InsertSeqDefault { table_name } => {
+                format!("INSERT INTO {table_name}(data) VALUES ('row')")
+            }
+            Operation::AutoincInsert { payload } => {
+                format!(
+                    "INSERT INTO {table}(payload) VALUES ('{payload}') RETURNING id",
+                    table = crate::AUTOINC_TABLE_NAME
+                )
+            }
+            Operation::AutoincUpdateRowid { old_id, new_id } => {
+                format!(
+                    "UPDATE {table} SET id = {new_id} WHERE id = {old_id} RETURNING id",
+                    table = crate::AUTOINC_TABLE_NAME
+                )
+            }
+            Operation::AutoincDelete { id } => {
+                format!(
+                    "DELETE FROM {table} WHERE id = {id} RETURNING id",
+                    table = crate::AUTOINC_TABLE_NAME
+                )
             }
         }
     }
@@ -319,22 +374,50 @@ impl Operation {
                 max_value,
                 cycle,
             } => {
-                sim_state.sequences.insert(
-                    seq_name.clone(),
-                    SequenceParams {
-                        start: *start,
-                        increment: *increment,
-                        min_value: *min_value,
-                        max_value: *max_value,
-                        cycle: *cycle,
-                    },
-                );
+                // CREATE SEQUENCE IF NOT EXISTS is a no-op when the sequence
+                // already exists, so DO NOT overwrite params we've already
+                // tracked — the engine still has the original definition,
+                // and the workload's new params never took effect. Without
+                // this guard, subsequent NextVal results are validated
+                // against the wrong bounds/start/increment and false-positive.
+                if !sim_state.sequences.contains_key(seq_name) {
+                    sim_state.sequences.insert(
+                        seq_name.clone(),
+                        SequenceParams {
+                            start: *start,
+                            increment: *increment,
+                            min_value: *min_value,
+                            max_value: *max_value,
+                            cycle: *cycle,
+                        },
+                    );
+                }
             }
             Operation::DropSequence { seq_name } => {
                 sim_state.sequences.remove(seq_name);
             }
-            Operation::NextVal { .. } | Operation::SetVal { .. } => {
+            Operation::NextVal { .. } | Operation::SetVal { .. } | Operation::CurrVal { .. } => {
                 stats.sequence_nextvals += 1;
+            }
+            Operation::CreateTableWithSeqDefault {
+                table_name,
+                seq_name,
+            } => {
+                sim_state
+                    .seq_default_tables
+                    .insert(table_name.clone(), seq_name.clone());
+            }
+            Operation::InsertSeqDefault { .. } => {
+                stats.inserts += 1;
+            }
+            Operation::AutoincInsert { .. } => {
+                stats.inserts += 1;
+            }
+            Operation::AutoincUpdateRowid { .. } => {
+                stats.updates += 1;
+            }
+            Operation::AutoincDelete { .. } => {
+                stats.deletes += 1;
             }
             _ => {}
         }

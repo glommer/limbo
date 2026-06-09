@@ -75,6 +75,7 @@ impl QueryProfile {
             + self.delete_weight
             + self.drop_table_weight
             + self.alter_table_weight
+            + self.drop_index
             + self.pragma_weight
             + self.create_sequence_weight
             + self.drop_sequence_weight

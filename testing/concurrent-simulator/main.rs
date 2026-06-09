@@ -42,11 +42,18 @@ struct Args {
     /// Number of connections opened inside each worker process in multiprocess mode.
     #[arg(long, default_value_t = 1)]
     connections_per_process: usize,
-    #[arg(long, default_value_t = 0.01)]
-    reopen_probability: f64,
+    /// Reopen probability per step.
+    #[arg(long)]
+    reopen_probability: Option<f64>,
     /// Max steps
     #[arg(long)]
     max_steps: Option<usize>,
+    /// Max iterations the reopen drain loop runs before declaring an
+    /// engine-side infinite loop. Drain iterations do not count against
+    /// `--max-steps` — legitimate IO-heavy operations like
+    /// `PRAGMA integrity_check` can use thousands of yields per page.
+    #[arg(long)]
+    max_drain_steps: Option<usize>,
     /// Keep files on disk after run
     #[arg(long)]
     keep: bool,
@@ -243,6 +250,8 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         println!("cosmic ray probability = {}", opts.cosmic_ray_probability);
     }
 
+    let reopen_probability = args.reopen_probability.unwrap_or(opts.reopen_probability);
+
     let mut whopper = Whopper::new(opts)?;
 
     let max_steps = whopper.max_steps;
@@ -253,13 +262,21 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     println!("{}", progress_stages[progress_index]);
     progress_index += 1;
 
+    let mut loop_err: Option<anyhow::Error> = None;
     while !whopper.is_done() {
-        if whopper.rng.random_bool(args.reopen_probability) {
-            whopper.reopen().unwrap();
+        if whopper.rng.random_bool(reopen_probability) {
+            if let Err(e) = whopper.reopen() {
+                loop_err = Some(e);
+                break;
+            }
         }
-        match whopper.step()? {
-            StepResult::Ok => {}
-            StepResult::WalSizeLimitExceeded => break,
+        match whopper.step() {
+            Ok(StepResult::Ok) => {}
+            Ok(StepResult::WalSizeLimitExceeded) => break,
+            Err(e) => {
+                loop_err = Some(e);
+                break;
+            }
         }
 
         if progress_interval > 0 && whopper.current_step % progress_interval == 0 {
@@ -270,11 +287,20 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         }
     }
 
-    whopper.finalize_properties()?;
+    let prop_result = if loop_err.is_none() {
+        whopper.finalize_properties()
+    } else {
+        Ok(())
+    };
 
     if args.dump_db {
-        whopper.dump_db_files()?;
+        let _ = whopper.dump_db_files();
     }
+
+    if let Some(e) = loop_err {
+        return Err(e);
+    }
+    prop_result?;
 
     if args.elle.is_some() {
         println!("\nElle history exported to: {}", args.elle_output);
@@ -352,8 +378,14 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (2, Box::new(DropIndexWorkload)),
             (5, Box::new(CreateSequenceWorkload)),
             (15, Box::new(NextValWorkload)),
+            (5, Box::new(CurrValWorkload)),
             (5, Box::new(SetValWorkload)),
             (2, Box::new(DropSequenceWorkload)),
+            (3, Box::new(CreateTableWithSeqDefaultWorkload)),
+            (8, Box::new(InsertSeqDefaultWorkload)),
+            (10, Box::new(AutoincInsertWorkload)),
+            (5, Box::new(AutoincUpdateRowidWorkload)),
+            (3, Box::new(AutoincDeleteWorkload)),
             (30, Box::new(BeginWorkload)),
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),
@@ -363,6 +395,7 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             Box::new(IntegrityCheckProperty),
             Box::new(SimpleKeysDoNotDisappear::new()),
             Box::new(SequenceCorrectnessProperty::new()),
+            Box::new(AutoincWatermarkMonotonicity::new()),
         ];
 
         (w, p, vec![], vec![])
@@ -380,11 +413,15 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         "fast" => WhopperOpts::fast(),
         "chaos" => WhopperOpts::chaos(),
         "ragnarök" | "ragnarok" => WhopperOpts::ragnarok(),
+        "recovery-heavy" => WhopperOpts::recovery_heavy(),
         mode => return Err(anyhow::anyhow!("Unknown mode: {}", mode)),
     };
 
     if let Some(max_steps) = args.max_steps {
         base_opts = base_opts.with_max_steps(max_steps);
+    }
+    if let Some(max_drain_steps) = args.max_drain_steps {
+        base_opts = base_opts.with_max_drain_steps(max_drain_steps);
     }
 
     let (workloads, properties, elle_tables, chaotic_profiles) =

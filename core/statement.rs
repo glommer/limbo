@@ -13,6 +13,7 @@ use turso_parser::{
     parser::Parser,
 };
 
+use crate::alloc::TursoIteratorExt;
 use crate::{
     busy::BusyHandlerState,
     parameters,
@@ -193,6 +194,12 @@ impl Statement {
             .store(n, crate::sync::atomic::Ordering::SeqCst);
     }
 
+    pub fn n_total_change(&self) -> i64 {
+        self.state
+            .n_total_change
+            .load(crate::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
         self.program.connection.set_mv_tx(mv_tx);
     }
@@ -297,14 +304,22 @@ impl Statement {
             self.counted_as_active_root = true;
         }
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
-            && !self
+            && self.origin != StatementOrigin::InternalHelper
+        {
+            if self.program.connection.mvcc_enabled() {
+                // MVCC checkpoints can publish internal schema roots without changing
+                // SQLite's schema cookie, so refresh before deciding whether to reprepare.
+                self.program.connection.maybe_update_schema();
+            }
+            if !self
                 .program
                 .prepare_context
                 .matches_connection(&self.program.connection)
-        {
-            if let Err(err) = self.reprepare() {
-                self.release_active_root_if_counted();
-                return Err(err);
+            {
+                if let Err(err) = self.reprepare() {
+                    self.release_active_root_if_counted();
+                    return Err(err);
+                }
             }
         }
 
@@ -410,6 +425,18 @@ impl Statement {
             && (matches!(res, Ok(StepResult::Done | StepResult::Interrupt)) || res.is_err())
         {
             self.release_active_root_if_counted();
+        }
+
+        // If the bytecode aborted between SequenceBeginInnerTx and
+        // SequenceCommitInnerTx, the connection's mv_tx is still pointing
+        // at the orphan inner; subsequent statements (e.g. reparse_schema
+        // SELECTs from _step's own reprepare path) would inherit it and
+        // deadlock in commit_txn's WaitForDependencies. Roll back and
+        // restore the outer eagerly here — reset_internal alone is not
+        // enough because callers do not always reset on error before
+        // running another statement.
+        if res.is_err() {
+            self.cleanup_orphaned_seq_inner_tx();
         }
 
         res
@@ -547,28 +574,28 @@ impl Statement {
             .iter()
             .chain(self.program.prepared.read_databases.iter())
             .filter(|&id| id != crate::MAIN_DB_ID)
-            .collect();
+            .try_collect()?;
         for db_id in &attached_db_ids {
-            // Discard any connection-local schema changes for this non-main DB
-            // (temp or attached) so the re-translate reads the committed schema.
-            conn.database_schemas().write().remove(&db_id);
-            if db_id == crate::TEMP_DB_ID && conn.temp.database.read().is_none() {
+            // Reprepare must not roll back an explicit transaction. SQLite allows
+            // reprepare inside a transaction, and uncommitted writes in temp or
+            // attached databases remain visible after the statement is retried.
+            if db_id == crate::TEMP_DB_ID || !conn.get_auto_commit() {
                 continue;
             }
+            // Discard any connection-local schema changes for this attached DB
+            // so the re-translate reads the committed schema.
+            conn.database_schemas().write().remove(&db_id);
             let pager = conn.get_pager_from_database_index(&db_id)?;
             if pager.holds_read_lock() {
                 pager.rollback_attached();
             }
         }
 
-        // if current connection is within a transaction which changed schema - we must use its schema version instead of DB schema version
-        // see test_prepared_stmt_reprepare_ddl_change_txn (plus test_sync_pull_after_local_ddl_and_remote_writes)
-        {
-            let mut conn_schema = conn.schema.write();
-            if conn_schema.schema_version < conn.db.schema.lock().schema_version {
-                *conn_schema = conn.db.clone_schema();
-            }
-        }
+        // Refresh from shared schema only when shared is newer; this preserves a
+        // connection-local schema that is ahead of shared. An MVCC checkpoint can
+        // publish new btree roots without bumping the schema cookie, so
+        // same-version reprepare still refreshes it.
+        conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
@@ -871,8 +898,9 @@ impl Statement {
         self.program.parameters.index(name)
     }
 
-    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
-        self.state.bind_at(index, value);
+    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
+        self.state.bind_at(index, value)?;
+        Ok(())
     }
 
     pub fn clear_bindings(&mut self) {
@@ -881,6 +909,41 @@ impl Statement {
 
     pub fn reset(&mut self) -> Result<()> {
         self.reset_internal(None, None, false)
+    }
+
+    /// If `Insn::SequenceBeginInnerTx` swapped the connection's mv_tx to
+    /// an inner tx and the statement aborted before `SequenceCommitInnerTx`
+    /// could clean it up, roll back the inner and restore the outer
+    /// mv_tx. Otherwise the inner is leaked: it stays in `mv_store.txs`
+    /// (so subsequent `commit_dep_counter` walks may wait on it forever)
+    /// and the connection's mv_tx points to a dead tx, breaking the
+    /// next statement that runs on the connection.
+    fn cleanup_orphaned_seq_inner_tx(&mut self) {
+        let Some(pending) = self.state.sequence_inner_tx_pending.take() else {
+            return;
+        };
+        let conn = self.program.connection.clone();
+        let Some(mv_store) = conn.mv_store_for_db(pending.db) else {
+            return;
+        };
+        if mv_store.is_tx_rollbackable(pending.inner_tx_id) {
+            mv_store.rollback_tx(pending.inner_tx_id, self.pager.clone(), &conn, pending.db);
+        }
+        conn.set_mv_tx_for_db(pending.db, pending.saved_outer);
+        // When the inner tx aborted via the vdbe's catch-all error path
+        // (e.g. DatabaseFull on sequence exhaustion), rollback_current_txn_state
+        // rolled back what mv_tx pointed at — the inner — and set
+        // auto_commit=true under the assumption it was the only live tx.
+        // Restoring mv_tx to the outer without also restoring auto_commit=false
+        // leaves the connection in an inconsistent state where auto_commit=true
+        // but mv_tx points to a live outer tx, which causes subsequent BEGINs
+        // to silently no-op and pins the caller to the outer's stale snapshot.
+        if pending.saved_outer.is_some() {
+            conn.auto_commit.store(false, Ordering::SeqCst);
+        }
+        // The commit-state-machine, if any was in flight, is now dead:
+        // the inner tx it was committing is gone.
+        self.state.sequence_inner_commit = None;
     }
 
     pub fn reset_best_effort(&mut self) {
@@ -900,6 +963,7 @@ impl Statement {
     /// already handled trigger execution tracking. Only resets ProgramState
     /// fields so the subprogram can run again from the beginning.
     pub fn reset_for_subprogram_reuse(&mut self) {
+        self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(None, None);
         self.state
             .n_change
@@ -1040,8 +1104,8 @@ impl Statement {
         if self.counted_as_active_root && !preserve_active_root_count {
             self.release_active_root_if_counted();
         }
+        self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);
-        self.state.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
         self.busy_handler_state = None;
         self.query_timeout_override = None;

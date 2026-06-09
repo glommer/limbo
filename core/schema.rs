@@ -1,5 +1,6 @@
-use std::sync::atomic::{AtomicBool, AtomicI64};
-
+use crate::alloc::vec;
+use crate::alloc::TursoFromIterator;
+use crate::alloc::*;
 use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
@@ -13,7 +14,7 @@ use crate::translate::expr::{
 };
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
-use crate::types::IOResult;
+use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
@@ -180,6 +181,33 @@ pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
+pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
+// Prefix for the hidden sequence *name* owned by an AUTOINCREMENT table.
+// This is not itself a table name. Its physical backing table is still named
+// by applying SEQ_BACKING_TABLE_PREFIX to the full sequence name.
+pub const AUTOINCREMENT_SEQ_PREFIX: &str = "__turso_internal_autoincrement_";
+
+/// Name of the hidden sequence owned by an AUTOINCREMENT table.
+pub fn autoincrement_sequence_name(table_name: &str) -> String {
+    String::from(AUTOINCREMENT_SEQ_PREFIX) + table_name
+}
+
+struct SequenceBackingTableSource {
+    sequence_name: String,
+    root_page: i64,
+    num_columns: usize,
+}
+
+struct SequenceMetadata {
+    // is_called intentionally omitted from descriptor reconstruction —
+    // the runtime watermark (including is_called) is always read from
+    // the backing-table row at nextval time, not seeded from schema.
+    start: i64,
+    increment: i64,
+    min: i64,
+    max: i64,
+    cycle: bool,
+}
 
 use crate::util::quote_identifier as quote_ident;
 
@@ -429,7 +457,7 @@ impl TypeDef {
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
                     })
-                    .collect();
+                    .try_collect()?;
                 Self {
                     name: type_name.to_string(),
                     is_builtin,
@@ -458,7 +486,7 @@ impl TypeDef {
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
                     })
-                    .collect();
+                    .try_collect()?;
                 Self {
                     name: type_name.to_string(),
                     is_builtin,
@@ -470,7 +498,7 @@ impl TypeDef {
                         tag_names: variants
                             .iter()
                             .map(|v| v.tag_name.clone())
-                            .collect::<Vec<_>>()
+                            .try_collect::<Vec<_>>()?
                             .into(),
                         variants,
                     }),
@@ -552,6 +580,17 @@ pub enum MakeFromBtreePhase {
     Rewinding,
     FetchingRecord,
     Advancing,
+    /// After the sqlite_schema scan completes we walk each sequence's
+    /// backing table to reconstruct its descriptor (start / inc / min /
+    /// max / cycle). These two phases drive that scan via the
+    /// `sequence_cursor` field on the state, yielding `IOResult::IO` on
+    /// each cursor I/O — the previous implementation called the
+    /// synchronous `populate_sequences(pager)` helper at the EOF of
+    /// `FetchingRecord`, which blocked the pager inside an async state
+    /// machine (and inside whatever vdbe-level state machine was
+    /// driving the schema reparse).
+    PopulatingSequencesRewind,
+    PopulatingSequencesFetch,
     Done,
 }
 
@@ -561,6 +600,12 @@ pub struct MakeFromBtreeState {
     cursor: Option<BTreeCursor>,
     accumulators: Option<MakeFromBtreeAccumulators>,
     read_tx_active: bool,
+    /// Backing tables left to walk during the
+    /// `PopulatingSequencesRewind`/`PopulatingSequencesFetch` phases.
+    sequence_sources: Vec<SequenceBackingTableSource>,
+    /// Cursor for the source currently being scanned (the back of
+    /// `sequence_sources` is popped onto this when entering Rewind).
+    sequence_cursor: Option<BTreeCursor>,
 }
 
 impl Default for MakeFromBtreeState {
@@ -576,6 +621,8 @@ impl MakeFromBtreeState {
             cursor: None,
             accumulators: None,
             read_tx_active: false,
+            sequence_sources: Vec::new(),
+            sequence_cursor: None,
         }
     }
 
@@ -612,22 +659,55 @@ pub fn allow_user_dml(table_name: &str) -> bool {
         || table_name.starts_with(TURSO_INTERNAL_PREFIX)) // internal name wouldn't be uppercase
 }
 
-/// A named sequence — an atomic counter that advances monotonically.
-/// The current value lives outside the btree/WAL system (AtomicI64),
-/// so it advances even on transaction rollback (matching PostgreSQL semantics).
-#[derive(Debug)]
+// Sequence persistence design
+// ===========================
+//
+// Every sequence — user-created (CREATE SEQUENCE) and implicit
+// (AUTOINCREMENT) — is backed by a B-tree table
+// `__turso_internal_seq_<name>` with schema (value INTEGER PRIMARY KEY,
+// is_called, start, inc, min, max, cycle). The runtime watermark IS the
+// disk state: there is no in-memory counter. Every nextval/setval reads
+// the current watermark row inside the executing transaction, computes
+// the new value, and writes it back — nextval INSERTs a new row;
+// setval DELETEs every row then INSERTs one at the requested value.
+//
+// At commit time the backing table is compacted to one row at MAX(value)
+// for ascending sequences or MIN(value) for descending. AUTOINCREMENT
+// sequences additionally mirror their watermark into `sqlite_sequence` so
+// the high-water mark is readable by SQLite-compatible tools.
+//
+// Rollback semantics fall out of bundling the backing-table writes with
+// the user's transaction:
+//   * Commit → the sequence advance is on disk.
+//   * Rollback → the sequence advance is not on disk.
+// A value emitted only by rolled-back transactions may be re-emitted by a
+// later nextval — there is no allocator state retained outside the
+// committed row. This matches SQLite AUTOINCREMENT's behavior and does
+// not match PostgreSQL's "permanently burned" semantics; consumers
+// needing globally unique ids should pair nextval with an INSERT in the
+// same transaction.
+//
+// Cross-process correctness comes for free from the disk-only model:
+// under WAL the write lock serializes processes so the next holder
+// observes the latest committed watermark.
+/// Schema descriptor for a sequence. Pure data — the runtime state lives
+/// in the backing table `__turso_internal_seq_<name>` and is read from
+/// disk by `Insn::SequenceComputeNext` + surrounding cursor bytecode on
+/// every nextval/setval call. See `core/translate/sequence.rs` and the
+/// disk-only design notes above.
+///
+/// `Clone` is implemented so `Arc::make_mut` can in-place edit the `name`
+/// field during `ALTER TABLE … RENAME TO …` on an AUTOINCREMENT table —
+/// keeping the sequence's identity in sync with the parent table's new
+/// name without forcing a schema reparse.
+#[derive(Debug, Clone)]
 pub struct Sequence {
     pub name: String,
     pub start_value: i64,
     pub increment_by: i64,
     pub min_value: i64,
     pub max_value: i64,
-    pub cache: i64,
     pub cycle: bool,
-    pub current_value: AtomicI64,
-    pub is_called: AtomicBool,
-    /// True when the sequence value has been modified since last persist to sqlite_sequence.
-    pub is_dirty: AtomicBool,
 }
 
 impl Sequence {
@@ -637,7 +717,6 @@ impl Sequence {
         increment: Option<i64>,
         min_value: Option<i64>,
         max_value: Option<i64>,
-        cache: Option<i64>,
         cycle: bool,
     ) -> crate::Result<Self> {
         let increment_by = increment.unwrap_or(1);
@@ -645,12 +724,6 @@ impl Sequence {
             return Err(crate::LimboError::ParseError(
                 "INCREMENT must not be zero".to_string(),
             ));
-        }
-        let cache_val = cache.unwrap_or(1);
-        if cache_val < 1 {
-            return Err(crate::LimboError::ParseError(format!(
-                "CACHE ({cache_val}) must be greater than zero"
-            )));
         }
         let min_val = min_value.unwrap_or(if increment_by > 0 { 1 } else { i64::MIN });
         let max_val = max_value.unwrap_or(if increment_by > 0 { i64::MAX } else { -1 });
@@ -660,12 +733,12 @@ impl Sequence {
             )));
         }
         let start_val = start.unwrap_or(if increment_by > 0 { min_val } else { max_val });
-        if increment_by > 0 && start_val < min_val {
+        if start_val < min_val {
             return Err(crate::LimboError::ParseError(format!(
                 "START value ({start_val}) cannot be less than MINVALUE ({min_val})"
             )));
         }
-        if increment_by < 0 && start_val > max_val {
+        if start_val > max_val {
             return Err(crate::LimboError::ParseError(format!(
                 "START value ({start_val}) cannot be greater than MAXVALUE ({max_val})"
             )));
@@ -676,131 +749,8 @@ impl Sequence {
             increment_by,
             min_value: min_val,
             max_value: max_val,
-            cache: cache_val,
             cycle,
-            current_value: AtomicI64::new(start_val),
-            is_called: AtomicBool::new(false),
-            is_dirty: AtomicBool::new(false),
         })
-    }
-
-    /// Advance the sequence and return the next value.
-    ///
-    /// NOTE: There is a narrow ABA race between reading `is_called` and `current_value`
-    /// in the CAS loop. In the worst case a concurrent caller may skip one value.
-    /// This is acceptable for sequences (PostgreSQL also doesn't guarantee gap-free).
-    pub fn nextval(&self) -> crate::Result<i64> {
-        use std::sync::atomic::Ordering;
-
-        loop {
-            let current = self.current_value.load(Ordering::SeqCst);
-            let is_called = self.is_called.load(Ordering::SeqCst);
-
-            let next = if !is_called {
-                // First call: return start_value (which is already current_value)
-                current
-            } else {
-                let n = current.checked_add(self.increment_by).ok_or_else(|| {
-                    crate::LimboError::ParseError(format!(
-                        "nextval: reached maximum value of sequence \"{}\"",
-                        self.name
-                    ))
-                })?;
-                // Check bounds
-                if self.increment_by > 0 && n > self.max_value {
-                    if self.cycle {
-                        self.min_value
-                    } else {
-                        return Err(crate::LimboError::ParseError(format!(
-                            "nextval: reached maximum value of sequence \"{}\"",
-                            self.name
-                        )));
-                    }
-                } else if self.increment_by < 0 && n < self.min_value {
-                    if self.cycle {
-                        self.max_value
-                    } else {
-                        return Err(crate::LimboError::ParseError(format!(
-                            "nextval: reached minimum value of sequence \"{}\"",
-                            self.name
-                        )));
-                    }
-                } else {
-                    n
-                }
-            };
-
-            if self
-                .current_value
-                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                self.is_called.store(true, Ordering::SeqCst);
-                self.is_dirty.store(true, Ordering::SeqCst);
-                return Ok(next);
-            }
-            // CAS failed, retry
-        }
-    }
-
-    /// Reset the sequence to a given value.
-    pub fn setval(&self, value: i64, is_called: bool) -> crate::Result<()> {
-        if value < self.min_value || value > self.max_value {
-            return Err(crate::LimboError::ParseError(format!(
-                "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
-                value, self.name, self.min_value, self.max_value
-            )));
-        }
-        use std::sync::atomic::Ordering;
-        self.current_value.store(value, Ordering::SeqCst);
-        self.is_called.store(is_called, Ordering::SeqCst);
-        self.is_dirty.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Returns the sign of `increment_by`: 1 for ascending, -1 for descending.
-    pub fn direction_sign(&self) -> i64 {
-        self.increment_by.signum()
-    }
-
-    /// Atomically advance the sequence past the given value if it is "more advanced"
-    /// than the current value (direction-aware). Used by AUTOINCREMENT explicit rowids.
-    pub fn advance_past(&self, value: i64) {
-        use std::sync::atomic::Ordering;
-        let ascending = self.increment_by > 0;
-        loop {
-            let current = self.current_value.load(Ordering::SeqCst);
-            let should_advance = if ascending {
-                value > current
-            } else {
-                value < current
-            };
-            if !should_advance {
-                // Even when value <= current, ensure is_called is set so that
-                // the next nextval() returns current + increment (not current).
-                // This matters when initializing from sqlite_sequence: value ==
-                // current means the sequence was used up to this point.
-                if value == current && !self.is_called.load(Ordering::SeqCst) {
-                    self.is_called.store(true, Ordering::SeqCst);
-                }
-                return;
-            }
-            if self
-                .current_value
-                .compare_exchange(current, value, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                self.is_called.store(true, Ordering::SeqCst);
-                self.is_dirty.store(true, Ordering::SeqCst);
-                return;
-            }
-        }
-    }
-
-    /// Mark the sequence as clean (after persisting to sqlite_sequence).
-    pub fn mark_clean(&self) {
-        use std::sync::atomic::Ordering;
-        self.is_dirty.store(false, Ordering::SeqCst);
     }
 }
 
@@ -815,6 +765,8 @@ pub enum SchemaObjectType {
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
+    #[cfg(feature = "conn_raw_api")]
+    pub(crate) table_names_by_root_page: HashMap<i64, String>,
 
     /// Track which tables are actually materialized views
     pub materialized_view_names: HashSet<String>,
@@ -942,6 +894,8 @@ impl Schema {
 
     pub fn with_options(enable_custom_types: bool) -> crate::Result<Self> {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
+        #[cfg(feature = "conn_raw_api")]
+        let mut table_names_by_root_page = HashMap::default();
         let has_indexes = HashSet::default();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
         #[allow(clippy::arc_with_non_send_sync)]
@@ -949,6 +903,8 @@ impl Schema {
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
+        #[cfg(feature = "conn_raw_api")]
+        table_names_by_root_page.insert(1, SCHEMA_TABLE_NAME.to_string());
         for function in VirtualTable::builtin_functions(enable_custom_types) {
             tables.insert(
                 function.name.to_owned(),
@@ -974,6 +930,8 @@ impl Schema {
         }
         Ok(Self {
             tables,
+            #[cfg(feature = "conn_raw_api")]
+            table_names_by_root_page,
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
@@ -1059,7 +1017,7 @@ impl Schema {
             }
             match self.type_registry.get(&current) {
                 Some(td) => {
-                    chain.push(Arc::clone(td));
+                    chain.try_push(Arc::clone(td))?;
                     current = td.base().to_lowercase();
                 }
                 None => {
@@ -1121,14 +1079,14 @@ impl Schema {
         for sql in type_sqls {
             self.add_type_from_sql(sql)?;
         }
-        self.resolve_all_custom_type_affinities();
+        self.resolve_all_custom_type_affinities()?;
         Ok(())
     }
 
     /// Resolve custom type affinities for all STRICT tables in the schema.
     /// Call this after loading user-defined types from __turso_internal_types
     /// so that columns declared with custom types use the BASE type's affinity.
-    pub fn resolve_all_custom_type_affinities(&mut self) {
+    pub fn resolve_all_custom_type_affinities(&mut self) -> Result<()> {
         let mut tables: SmallVec<[(String, Arc<Table>); 8]> = SmallVec::with_capacity(8);
         for (name, table) in self.tables.iter().filter(|(_, t)| {
             t.is_strict()
@@ -1141,12 +1099,13 @@ impl Schema {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
             modified.resolve_custom_type_affinities(self);
-            modified.propagate_domain_constraints(self);
+            modified.propagate_domain_constraints(self)?;
             tables.push((name.clone(), Arc::new(Table::BTree(Arc::new(modified)))));
         }
         for (name, table) in tables {
             self.tables.insert(name, table);
         }
+        Ok(())
     }
 
     pub fn is_unique_idx_name(&self, name: &str) -> bool {
@@ -1160,6 +1119,8 @@ impl Schema {
         let name = normalize_ident(view.name());
 
         // Add to tables (so it appears as a regular table)
+        #[cfg(feature = "conn_raw_api")]
+        self.register_table_root_page(&name, table.as_ref());
         self.tables.insert(name.clone(), table);
 
         // Track that this is a materialized view
@@ -1215,11 +1176,11 @@ impl Schema {
             Ok(())
         } else if self.materialized_view_names.contains(&name) {
             // Remove from tables
-            self.tables.remove(&name);
+            self.remove_table(&name);
 
             // Remove DBSP state table and its indexes from in-memory schema
             let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}");
-            self.tables.remove(&dbsp_table_name);
+            self.remove_table(&dbsp_table_name);
             self.remove_indices_for_table(&dbsp_table_name);
 
             // Remove from materialized view tracking
@@ -1380,6 +1341,9 @@ impl Schema {
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
         self.check_object_name_conflict(&table.name)?;
         let name = normalize_ident(&table.name);
+        #[cfg(feature = "conn_raw_api")]
+        self.table_names_by_root_page
+            .insert(table.root_page, name.clone());
         self.tables.insert(name, Table::BTree(table).into());
         Ok(())
     }
@@ -1411,15 +1375,46 @@ impl Schema {
             || name.eq_ignore_ascii_case("sqlite_dbpage")
     }
 
+    #[cfg(feature = "conn_raw_api")]
+    pub fn table_name_for_root_page(&self, root_page: i64) -> Option<&str> {
+        self.table_names_by_root_page
+            .get(&root_page)
+            .map(String::as_str)
+    }
+
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
-        self.tables.remove(&name);
+        #[cfg(feature = "conn_raw_api")]
+        {
+            if let Some(table) = self.tables.remove(&name) {
+                self.unregister_table_root_page(&table);
+            }
+        }
+        #[cfg(not(feature = "conn_raw_api"))]
+        {
+            self.tables.remove(&name);
+        }
         self.analyze_stats.remove_table(&name);
 
         // If this was a materialized view, also clean up the metadata
         if self.materialized_view_names.remove(&name) {
             self.incremental_views.remove(&name);
             self.materialized_view_sql.remove(&name);
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn register_table_root_page(&mut self, name: &str, table: &Table) {
+        if let Table::BTree(table) = table {
+            self.table_names_by_root_page
+                .insert(table.root_page, normalize_ident(name));
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn unregister_table_root_page(&mut self, table: &Table) {
+        if let Table::BTree(table) = table {
+            self.table_names_by_root_page.remove(&table.root_page);
         }
     }
 
@@ -1562,7 +1557,7 @@ impl Schema {
                     state.read_tx_active = true;
 
                     state.accumulators = Some(MakeFromBtreeAccumulators {
-                        from_sql_indexes: Vec::with_capacity(10),
+                        from_sql_indexes: Vec::try_with_capacity_ext(10)?,
                         automatic_indices: HashMap::with_capacity_and_hasher(10, FxBuildHasher),
                         dbsp_state_roots: HashMap::default(),
                         dbsp_state_index_roots: HashMap::default(),
@@ -1589,29 +1584,19 @@ impl Schema {
                     let row = return_if_io!(cursor.record());
 
                     let Some(row) = row else {
-                        // EOF - finalize
-                        pager.end_read_tx();
-                        state.read_tx_active = false;
-
-                        let acc = state
-                            .accumulators
-                            .take()
-                            .expect("accumulators must be initialized in Init phase");
-                        self.populate_indices(
-                            syms,
-                            acc.from_sql_indexes,
-                            acc.automatic_indices,
-                            mv_cursor.is_some(),
-                        )?;
-                        self.populate_materialized_views(
-                            acc.materialized_view_info,
-                            acc.dbsp_state_roots,
-                            acc.dbsp_state_index_roots,
-                        )?;
-
+                        // EOF on the sqlite_schema scan. Hand off to the
+                        // async sequence-descriptor walk — pulled out of
+                        // the prior synchronous `populate_sequences(pager)`
+                        // call so the schema state machine can yield
+                        // `IOResult::IO` on each cursor read instead of
+                        // blocking the pager. The Rewind/Fetch phases
+                        // below pop the back of `state.sequence_sources`,
+                        // install the descriptor, drop the cursor, and
+                        // repeat until empty.
+                        state.sequence_sources = self.sequence_backing_tables();
                         state.cursor = None;
-                        state.phase = MakeFromBtreePhase::Done;
-                        return Ok(IOResult::Done(()));
+                        state.phase = MakeFromBtreePhase::PopulatingSequencesRewind;
+                        continue;
                     };
 
                     // Process the row (no IO - CPU only)
@@ -1676,6 +1661,87 @@ impl Schema {
                     state.phase = MakeFromBtreePhase::FetchingRecord;
                 }
 
+                MakeFromBtreePhase::PopulatingSequencesRewind => {
+                    // Either no sources left → finalize, or pop the next
+                    // source and rewind its cursor.
+                    if state.sequence_sources.is_empty() {
+                        pager.end_read_tx();
+                        state.read_tx_active = false;
+
+                        let acc = state
+                            .accumulators
+                            .take()
+                            .expect("accumulators must be initialized in Init phase");
+                        self.populate_indices(
+                            syms,
+                            acc.from_sql_indexes,
+                            acc.automatic_indices,
+                            mv_cursor.is_some(),
+                        )?;
+                        self.populate_materialized_views(
+                            acc.materialized_view_info,
+                            acc.dbsp_state_roots,
+                            acc.dbsp_state_index_roots,
+                        )?;
+
+                        state.phase = MakeFromBtreePhase::Done;
+                        return Ok(IOResult::Done(()));
+                    }
+                    // Drop any cursor from a previous source before opening
+                    // the new one (Drop logic on the BTreeCursor releases
+                    // its page pins).
+                    state.sequence_cursor = None;
+                    let source = state
+                        .sequence_sources
+                        .last()
+                        .expect("non-empty checked above");
+                    // MVCC backing tables that haven't been checkpointed
+                    // yet carry the negative-root sentinel; the pager
+                    // can't read them directly. Skip — the SQL fallback
+                    // (`Connection::populate_sequences_via_sql`) will
+                    // load them via the MVCC row layer.
+                    if source.root_page <= 0 {
+                        state.sequence_sources.pop();
+                        continue;
+                    }
+                    let cursor =
+                        BTreeCursor::new_table(pager.clone(), source.root_page, source.num_columns);
+                    state.sequence_cursor = Some(cursor);
+                    let cursor = state.sequence_cursor.as_mut().expect("just set");
+                    return_if_io!(cursor.rewind());
+                    state.phase = MakeFromBtreePhase::PopulatingSequencesFetch;
+                }
+
+                MakeFromBtreePhase::PopulatingSequencesFetch => {
+                    let cursor = state
+                        .sequence_cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in PopulatingSequencesRewind");
+                    let record = return_if_io!(cursor.record());
+                    let source = state.sequence_sources.pop().expect("at least one source");
+                    let record = record.ok_or_else(|| {
+                        LimboError::Corrupt(format!(
+                            "internal sequence backing table for \"{}\" is empty; \
+                             the descriptor metadata row must always be present",
+                            source.sequence_name
+                        ))
+                    })?;
+                    let metadata = Self::read_sequence_metadata(record).ok_or_else(|| {
+                        LimboError::Corrupt(format!(
+                            "internal sequence backing table for \"{}\" descriptor \
+                             row is malformed (expected integers for \
+                             start/inc/min/max/cycle)",
+                            source.sequence_name
+                        ))
+                    })?;
+                    self.install_sequence_descriptor(&source.sequence_name, metadata)?;
+                    // Drop the cursor before transitioning back so we
+                    // release its page pins before the next source's
+                    // rewind starts.
+                    state.sequence_cursor = None;
+                    state.phase = MakeFromBtreePhase::PopulatingSequencesRewind;
+                }
+
                 MakeFromBtreePhase::Done => {
                     return Ok(IOResult::Done(()));
                 }
@@ -1734,7 +1800,13 @@ impl Schema {
             let mut pk_index_added = false;
             for unique_set in &table.unique_sets {
                 if unique_set.is_primary_key {
-                    assert!(table.primary_key_columns.len() == unique_set.columns.len(), "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns", unique_set.columns.len(), table.name, table.primary_key_columns.len());
+                    assert!(
+                        table.primary_key_columns.len() == unique_set.columns.len(),
+                        "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns",
+                        unique_set.columns.len(),
+                        table.name,
+                        table.primary_key_columns.len()
+                    );
                     // Add composite primary key index
                     assert!(
                         !pk_index_added,
@@ -1777,7 +1849,7 @@ impl Schema {
                 } else {
                     // Add composite unique index
                     let mut column_indices_and_sort_orders =
-                        Vec::with_capacity(unique_set.columns.len());
+                        Vec::try_with_capacity_ext(unique_set.columns.len())?;
                     for (col_name, sort_order) in unique_set.columns.iter() {
                         let Some((pos_in_table, _)) = table.get_column(col_name) else {
                             return Err(crate::LimboError::ParseError(format!(
@@ -1785,6 +1857,7 @@ impl Schema {
                                 col_name, table.name
                             )));
                         };
+                        // preallocated enough to no use try_push
                         column_indices_and_sort_orders.push((pos_in_table, *sort_order));
                     }
                     if let Some(index_entry) = automatic_indexes.pop() {
@@ -1810,7 +1883,11 @@ impl Schema {
             // In MVCC mode during recovery, not all automatic index schema rows might be visible yet
             // during incremental schema reparsing, so we may have extra entries
             if !mvcc_enabled {
-                assert!(automatic_indexes.is_empty(), "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain", automatic_indexes.len());
+                assert!(
+                    automatic_indexes.is_empty(),
+                    "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain",
+                    automatic_indexes.len()
+                );
             }
         }
         Ok(())
@@ -1902,6 +1979,80 @@ impl Schema {
         Ok(())
     }
 
+    /// Yield (backing_table_name, sequence_name) for every backing table
+    /// currently in the schema. Shared shape for the SQL-based descriptor
+    /// loader in `Connection` so the prefix-strip lives in one place.
+    pub fn sequence_backing_table_names(&self) -> Vec<(String, String)> {
+        self.tables
+            .keys()
+            .filter_map(|name| {
+                let seq_name = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX)?;
+                Some((name.clone(), seq_name.to_string()))
+            })
+            .collect()
+    }
+
+    fn sequence_backing_tables(&self) -> Vec<SequenceBackingTableSource> {
+        self.tables
+            .iter()
+            .filter_map(|(name, table)| {
+                let bt = table.btree()?;
+                let sequence_name = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX)?.to_string();
+                Some(SequenceBackingTableSource {
+                    sequence_name,
+                    root_page: bt.root_page,
+                    num_columns: bt.columns().len(),
+                })
+            })
+            .collect()
+    }
+
+    fn read_sequence_metadata(record: &ImmutableRecord) -> Option<SequenceMetadata> {
+        let mut values = [0i64; 6];
+        for (i, value) in values.iter_mut().enumerate() {
+            match record.get_value(i + 1) {
+                Ok(ValueRef::Numeric(crate::numeric::Numeric::Integer(v))) => {
+                    *value = v;
+                }
+                _ => return None,
+            }
+        }
+        let [_is_called, start, increment, min, max, cycle] = values;
+        Some(SequenceMetadata {
+            start,
+            increment,
+            min,
+            max,
+            cycle: cycle != 0,
+        })
+    }
+
+    fn install_sequence_descriptor(
+        &mut self,
+        sequence_name: &str,
+        metadata: SequenceMetadata,
+    ) -> crate::Result<()> {
+        let seq = Sequence::new(
+            sequence_name.to_string(),
+            Some(metadata.start),
+            Some(metadata.increment),
+            Some(metadata.min),
+            Some(metadata.max),
+            metadata.cycle,
+        )
+        .map_err(|err| {
+            LimboError::Corrupt(format!(
+                "internal sequence backing table for \"{sequence_name}\" \
+                 has invalid persisted metadata \
+                 (start={}, increment={}, min={}, max={}, cycle={}): {err}",
+                metadata.start, metadata.increment, metadata.min, metadata.max, metadata.cycle,
+            ))
+        })?;
+        self.sequences
+            .insert(normalize_ident(sequence_name), std::sync::Arc::new(seq));
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn handle_schema_row(
         &mut self,
@@ -1956,15 +2107,10 @@ impl Schema {
                         )));
                     }
 
-                    // Detect sequence-backing tables: first column is __turso_seq_value.
+                    // Detect sequence-backing tables by name prefix.
                     // Just add the table (for B-tree access); sequences are created by
                     // AddSequence at CREATE time or initialize_sequences at open time.
-                    if table
-                        .columns
-                        .first()
-                        .and_then(|c| c.name.as_deref())
-                        .is_some_and(|n| n == "__turso_seq_value")
-                    {
+                    if table.name.starts_with(SEQ_BACKING_TABLE_PREFIX) {
                         self.add_btree_table(Arc::new(table))?;
                         return Ok(());
                     }
@@ -1989,7 +2135,9 @@ impl Schema {
                                     // This will cause populate_materialized_views to skip this view
                                     tracing::warn!(
                                         "Skipping materialized view '{}' - has version {} but current version is {}. DROP and recreate the view to use it.",
-                                        view_name, stored_version, DBSP_CIRCUIT_VERSION
+                                        view_name,
+                                        stored_version,
+                                        DBSP_CIRCUIT_VERSION
                                     );
                                     // We can't track incompatible views here since we're in handle_schema_row
                                     // which doesn't have mutable access to self
@@ -2000,16 +2148,18 @@ impl Schema {
 
                     let mut table = table;
                     table.resolve_custom_type_affinities(self);
-                    table.propagate_domain_constraints(self);
+                    table.propagate_domain_constraints(self)?;
                     let has_autoinc = table.has_autoincrement;
                     let tbl_name = table.name.clone();
                     self.add_btree_table(Arc::new(table))?;
 
-                    // Create an implicit sequence for AUTOINCREMENT tables.
-                    // This sequence is used in MVCC mode to avoid write-write
-                    // conflicts on the sqlite_sequence B-tree table.
+                    // Create the hidden sequence object owned by this
+                    // AUTOINCREMENT table. The `__turso_internal_autoincrement_`
+                    // prefix is a sequence namespace marker, not a table name;
+                    // the physical table is the corresponding
+                    // `__turso_internal_seq_<sequence-name>` backing table.
                     if has_autoinc {
-                        let seq_name = format!("_autoincrement_{tbl_name}");
+                        let seq_name = autoincrement_sequence_name(&tbl_name);
                         if let std::collections::hash_map::Entry::Vacant(e) =
                             self.sequences.entry(normalize_ident(&seq_name))
                         {
@@ -2017,7 +2167,6 @@ impl Schema {
                                 seq_name.clone(),
                                 Some(1),
                                 Some(1),
-                                None,
                                 None,
                                 None,
                                 false,
@@ -2217,7 +2366,7 @@ impl Schema {
             .get_btree_table(&target)
             .ok_or_else(|| fk_mismatch_err("<unknown>", &target))?;
 
-        let mut out = Vec::with_capacity(4); // arbitrary estimate
+        let mut out = Vec::try_with_capacity_ext(4)?; // arbitrary estimate
         for t in self.tables.values() {
             let Some(child) = t.btree() else {
                 continue;
@@ -2226,12 +2375,12 @@ impl Schema {
                 if !fk.parent_table.eq_ignore_ascii_case(&target) {
                     continue;
                 }
-                out.push(self.resolve_fk(
+                out.try_push(self.resolve_fk(
                     fk,
                     &child,
                     &parent_tbl,
                     /*require_unique=*/ false,
-                )?);
+                )?)?;
             }
         }
         Ok(out)
@@ -2246,12 +2395,13 @@ impl Schema {
             .get_btree_table(&child_name)
             .ok_or_else(|| fk_mismatch_err(&child_name, "<unknown>"))?;
 
-        let mut out = Vec::with_capacity(child.foreign_keys.len());
+        let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
         for fk in &child.foreign_keys {
             let parent_name = normalize_ident(&fk.parent_table);
             let parent_tbl = self
                 .get_btree_table(&parent_name)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
+            // Preallocated enough to not use try_push
             out.push(self.resolve_fk(fk, &child, &parent_tbl, /*require_unique=*/ true)?);
         }
         Ok(out)
@@ -2273,11 +2423,12 @@ impl Schema {
             return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
         }
 
-        let mut child_pos: Vec<usize> = Vec::with_capacity(fk.child_columns.len());
+        let mut child_pos: Vec<usize> = Vec::try_with_capacity_ext(fk.child_columns.len())?;
         for cname in fk.child_columns.iter() {
             let (i, _) = child
                 .get_column(cname)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?;
+            // Preallocated enough to not use try_push
             child_pos.push(i);
         }
 
@@ -2290,7 +2441,7 @@ impl Schema {
                 .primary_key_columns
                 .iter()
                 .map(|(col, _)| col.clone())
-                .collect()
+                .try_collect()?
         } else {
             fk.parent_columns.clone()
         };
@@ -2299,7 +2450,7 @@ impl Schema {
             return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
         }
 
-        let mut parent_pos: Vec<usize> = Vec::with_capacity(parent_cols.len());
+        let mut parent_pos: Vec<usize> = Vec::try_with_capacity_ext(parent_cols.len())?;
         for pc in parent_cols.iter() {
             let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
                 ROWID_STRS
@@ -2310,6 +2461,7 @@ impl Schema {
             let Some(p) = pos else {
                 return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
             };
+            // Preallocated enough to not use try_push
             parent_pos.push(p);
         }
 
@@ -2394,6 +2546,18 @@ impl Schema {
         Ok(())
     }
 
+    pub fn get_sequence(&self, name: &str) -> Option<&Arc<Sequence>> {
+        self.sequences.get(&normalize_ident(name))
+    }
+
+    /// Remove a sequence and its backing table from the in-memory schema.
+    pub fn remove_sequence(&mut self, name: &str) {
+        let normalized = normalize_ident(name);
+        self.sequences.remove(&normalized);
+        let backing_table = crate::translate::sequence::sequence_backing_table_name(&normalized);
+        self.tables.remove(&backing_table);
+    }
+
     /// Returns the type of schema object with the given name, if one exists.
     /// Checks tables, views, and indexes.
     pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
@@ -2448,7 +2612,8 @@ impl Clone for Schema {
                     ))),
                 ),
             })
-            .collect();
+            .try_collect()
+            .expect("TODO: Clone is supposed to be fallible");
         let indexes = self
             .indexes
             .iter()
@@ -2456,35 +2621,46 @@ impl Clone for Schema {
                 let indexes = indexes
                     .iter()
                     .map(|index| Arc::new((**index).clone()))
-                    .collect();
-                (name.clone(), indexes)
+                    .try_collect()?;
+                Ok::<_, LimboError>((name.clone(), indexes))
             })
-            .collect();
+            .try_collect::<Result<_>>()
+            .expect("TODO: Clone is supposed to be fallible")
+            .unwrap();
         let materialized_view_names = self.materialized_view_names.clone();
         let materialized_view_sql = self.materialized_view_sql.clone();
         let incremental_views = self
             .incremental_views
             .iter()
             .map(|(name, view)| (name.clone(), view.clone()))
-            .collect();
+            .try_collect()
+            .expect("TODO: Clone is supposed to be fallible");
         let views = self
             .views
             .iter()
             .map(|(name, view)| (name.clone(), Arc::new((**view).clone())))
-            .collect();
+            .try_collect()
+            .expect("TODO: Clone is supposed to be fallible");
         let triggers = self
             .triggers
             .iter()
             .map(|(table_name, triggers)| {
-                (
+                Ok::<_, LimboError>((
                     table_name.clone(),
-                    triggers.iter().map(|t| Arc::new((**t).clone())).collect(),
-                )
+                    triggers
+                        .iter()
+                        .map(|t| Arc::new((**t).clone()))
+                        .try_collect()?,
+                ))
             })
-            .collect();
+            .try_collect::<Result<_>>()
+            .expect("TODO: Clone is supposed to be fallible")
+            .unwrap();
         let incompatible_views = self.incompatible_views.clone();
         Self {
             tables,
+            #[cfg(feature = "conn_raw_api")]
+            table_names_by_root_page: self.table_names_by_root_page.clone(),
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
@@ -2836,23 +3012,23 @@ impl GeneratedColGraph {
                     col.name.as_deref().unwrap_or("?")
                 );
             }
-            let direct_mask: ColumnMask = ColumnMask::from_iter(direct.iter());
-            direct_deps[j].union_with(&direct_mask);
+            let direct_mask: ColumnMask = ColumnMask::try_from_iter(direct.iter())?;
+            direct_deps[j].union_with(&direct_mask)?;
             for i in direct.iter() {
-                direct_dependents[i].set(j);
+                direct_dependents[i].set(j)?;
                 in_degree[j] += 1;
             }
         }
 
         // Kahn's algorithm (topological sort) over direct_deps.
-        let mut topological_sort: Vec<usize> = Vec::with_capacity(n);
-        let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+        let mut topological_sort: Vec<usize> = Vec::try_with_capacity_ext(n)?;
+        let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).try_collect()?;
         while let Some(i) = ready.pop() {
-            topological_sort.push(i);
+            topological_sort.try_push(i)?;
             for j in direct_dependents[i].iter() {
                 in_degree[j] -= 1;
                 if in_degree[j] == 0 {
-                    ready.push(j);
+                    ready.try_push(j)?;
                 }
             }
         }
@@ -2862,7 +3038,7 @@ impl GeneratedColGraph {
             let cycle_names: Vec<&str> = (0..n)
                 .filter(|i| in_degree[*i] > 0)
                 .filter_map(|i| columns[i].name.as_deref())
-                .collect();
+                .try_collect()?;
             bail_parse_error!(
                 "circular dependency in generated columns: {}",
                 cycle_names.join(", ")
@@ -2875,7 +3051,7 @@ impl GeneratedColGraph {
             dependencies[j] = direct_deps[j].clone();
             for i in direct_deps[j].iter() {
                 let snapshot = dependencies[i].clone();
-                dependencies[j].union_with(&snapshot);
+                dependencies[j].union_with(&snapshot)?;
             }
         }
 
@@ -2885,7 +3061,7 @@ impl GeneratedColGraph {
             dependents[i] = direct_dependents[i].clone();
             for j in direct_dependents[i].iter() {
                 let snapshot = dependents[j].clone();
-                dependents[i].union_with(&snapshot);
+                dependents[i].union_with(&snapshot)?;
             }
         }
 
@@ -3027,31 +3203,33 @@ impl BTreeTable {
         table: &Arc<BTreeTable>,
         schema: &Schema,
         only_columns: Option<&ColumnMask>,
-    ) -> Arc<BTreeTable> {
+    ) -> Result<Arc<BTreeTable>> {
         let has_virtual = table.has_virtual_columns();
         let has_custom = table
             .columns
             .iter()
             .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
         if !has_custom && !has_virtual {
-            return Arc::clone(table);
+            return Ok(Arc::clone(table));
         }
         let mut modified = (**table).clone();
         let remapped_only_columns = if has_virtual {
-            let remapped = only_columns.map(|only| {
-                let mut new_set = ColumnMask::default();
-                let mut physical = 0usize;
-                for (orig, col) in modified.columns.iter().enumerate() {
-                    if col.is_virtual_generated() {
-                        continue;
+            let remapped = only_columns
+                .map(|only| {
+                    let mut new_set = ColumnMask::default();
+                    let mut physical = 0usize;
+                    for (orig, col) in modified.columns.iter().enumerate() {
+                        if col.is_virtual_generated() {
+                            continue;
+                        }
+                        if only.get(orig) {
+                            new_set.set(physical)?;
+                        }
+                        physical += 1;
                     }
-                    if only.get(orig) {
-                        new_set.set(physical);
-                    }
-                    physical += 1;
-                }
-                new_set
-            });
+                    Ok::<_, LimboError>(new_set)
+                })
+                .transpose()?;
             modified.columns.retain(|c| !c.is_virtual_generated());
             modified.has_virtual_columns = false;
             remapped
@@ -3074,7 +3252,7 @@ impl BTreeTable {
                 col.ty_str = type_def.value_input_type().to_uppercase();
             }
         }
-        Arc::new(modified)
+        Ok(Arc::new(modified))
     }
 
     /// Override column type metadata for custom type columns so that
@@ -3105,9 +3283,9 @@ impl BTreeTable {
     /// - Sets the column's NOT NULL flag if any domain in the chain has NOT NULL
     /// - Adds domain CHECK constraints (with `value` rewritten to the column name)
     ///   to the table's check_constraints list
-    pub fn propagate_domain_constraints(&mut self, schema: &Schema) {
+    pub fn propagate_domain_constraints(&mut self, schema: &Schema) -> Result<()> {
         if !self.is_strict {
-            return;
+            return Ok(());
         }
         // Collect new constraints and notnull flags to avoid borrowing issues
         let mut new_checks = Vec::new();
@@ -3123,7 +3301,7 @@ impl BTreeTable {
             let col_name = col.name.as_deref().unwrap_or("").to_string();
             for td in &resolved.chain {
                 if td.not_null {
-                    notnull_cols.push(col_idx);
+                    notnull_cols.try_push(col_idx)?;
                 }
                 for (i, dc) in td.domain_checks.iter().enumerate() {
                     let rewritten = rewrite_value_to_column(&dc.check, &col_name);
@@ -3131,11 +3309,11 @@ impl BTreeTable {
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("{}_{}", td.name, i));
-                    new_checks.push(CheckConstraint {
+                    new_checks.try_push(CheckConstraint {
                         name: Some(name),
                         expr: *rewritten,
                         column: Some(col_name.clone()),
-                    });
+                    })?;
                 }
             }
         }
@@ -3143,7 +3321,8 @@ impl BTreeTable {
         for col_idx in notnull_cols {
             self.columns[col_idx].set_notnull(true);
         }
-        self.check_constraints.extend(new_checks);
+        self.check_constraints.try_extend(new_checks)?;
+        Ok(())
     }
 
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
@@ -3243,6 +3422,9 @@ impl BTreeTable {
             }
             if needs_pk_inline && column.primary_key() {
                 sql.push_str(" PRIMARY KEY");
+                if self.has_autoincrement && column.is_rowid_alias() {
+                    sql.push_str(" AUTOINCREMENT");
+                }
             }
 
             if let Some(default) = &column.default {
@@ -3388,11 +3570,12 @@ impl BTreeTable {
         !self.has_rowid && self.primary_key_columns.len() == 1 && column.primary_key()
     }
 
-    pub fn column_collations(&self) -> Vec<CollationSeq> {
-        self.columns
+    pub fn column_collations(&self) -> Result<Vec<CollationSeq>> {
+        Ok(self
+            .columns
             .iter()
             .map(|column| column.collation())
-            .collect()
+            .try_collect()?)
     }
 
     #[inline]
@@ -3531,10 +3714,10 @@ impl BTreeTable {
         let graph = self.column_graph()?;
         let mut affected = ColumnMask::default();
         for i in updated_cols {
-            affected.set(i);
+            affected.set(i)?;
             if i < graph.dependents.len() {
                 let snapshot = graph.dependents[i].clone();
-                affected.union_with(&snapshot);
+                affected.union_with(&snapshot)?;
             }
         }
         Ok(affected)
@@ -3548,12 +3731,12 @@ impl BTreeTable {
         let mut deps = ColumnMask::default();
         for j in targets {
             if !self.columns[j].is_virtual_generated() {
-                deps.set(j);
+                deps.set(j)?;
                 continue;
             }
             for i in graph.dependencies[j].iter() {
                 if !self.columns[i].is_virtual_generated() {
-                    deps.set(i);
+                    deps.set(i)?;
                 }
             }
         }
@@ -3700,16 +3883,16 @@ fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &
     let _ = walk_expr(expr, &mut |e| {
         match e {
             Expr::Column { table, column, .. } if table.is_self_table() => {
-                out.set(*column);
+                out.set(*column)?;
             }
             Expr::Id(name) | Expr::Name(name) => {
                 if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
-                    out.set(idx);
+                    out.set(idx)?;
                 }
             }
             Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
                 if let Some(idx) = find_column_index_by_name(columns, col.as_str()) {
-                    out.set(idx);
+                    out.set(idx)?;
                 }
             }
             Expr::Subquery(_)
@@ -3988,8 +4171,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     conflict_clause,
                 } = &c.constraint
                 {
-                    let mut unique_columns = Vec::with_capacity(columns.len());
+                    let mut unique_columns = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
+                        // preallocated enough to not need try_push
                         match column.expr.as_ref() {
                             Expr::Id(id) => unique_columns.push((
                                 id.as_str().to_string(),
@@ -4019,14 +4203,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let child_columns: Box<[String]> = columns
                         .iter()
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
-                        .collect();
+                        .try_collect()?;
                     // derive parent columns: explicit or default to parent PK
                     let parent_table = normalize_ident(clause.tbl_name.as_str());
                     let parent_columns: Box<[String]> = clause
                         .columns
                         .iter()
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
-                        .collect();
+                        .try_collect()?;
 
                     // Only check arity if parent columns were explicitly listed
                     if !parent_columns.is_empty() && child_columns.len() != parent_columns.len() {
@@ -4210,7 +4394,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             });
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
-                            collation = Some(CollationSeq::new(collation_name.as_str())?);
+                            let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                            if collation_seq.is_custom() {
+                                crate::bail_parse_error!(
+                                    "custom collations are not supported in schema definitions"
+                                );
+                            }
+                            collation = Some(collation_seq);
                         }
                         ast::ColumnConstraint::ForeignKey {
                             clause,
@@ -4229,8 +4419,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     .columns
                                     .iter()
                                     .map(|c| normalize_ident(c.col_name.as_str()))
-                                    .collect::<Vec<_>>()
-                                    .into_boxed_slice(),
+                                    .try_collect()?,
                                 on_delete: clause
                                     .args
                                     .iter()
@@ -4377,7 +4566,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut unique_sets = unique_sets_columns
         .into_iter()
         .chain(unique_sets_constraints)
-        .collect::<Vec<_>>();
+        .try_collect::<Vec<_>>()?;
     // Capture PK conflict clause before the rowid-alias UniqueSet is removed.
     let rowid_alias_conflict_clause = unique_sets
         .iter()
@@ -4635,7 +4824,7 @@ pub struct Column {
     pub ty_params: Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
-    raw: u16,
+    raw: u32,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -4666,26 +4855,26 @@ pub enum GeneratedType {
 }
 
 // flags
-const F_PRIMARY_KEY: u16 = 1;
-const F_ROWID_ALIAS: u16 = 2;
-const F_NOTNULL: u16 = 4;
-const F_UNIQUE: u16 = 8;
-const F_HIDDEN: u16 = 16;
+const F_PRIMARY_KEY: u32 = 1;
+const F_ROWID_ALIAS: u32 = 2;
+const F_NOTNULL: u32 = 4;
+const F_UNIQUE: u32 = 8;
+const F_HIDDEN: u32 = 16;
 
 // pack Type and Collation in the remaining bits
-const TYPE_SHIFT: u16 = 5;
-const TYPE_MASK: u16 = 0b111 << TYPE_SHIFT;
-const COLL_SHIFT: u16 = TYPE_SHIFT + 3;
-const COLL_MASK: u16 = 0b11 << COLL_SHIFT;
+const TYPE_SHIFT: u32 = 5;
+const TYPE_MASK: u32 = 0b111 << TYPE_SHIFT;
+const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
+const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
 
-// Bits 10-12: base type affinity override for custom type columns.
+// Bits 20-22: base type affinity override for custom type columns.
 // 0 = not set (use ty_str-based affinity), 1-5 = Affinity value + 1
-const BASE_AFF_SHIFT: u16 = COLL_SHIFT + 2;
-const BASE_AFF_MASK: u16 = 0b111 << BASE_AFF_SHIFT;
+const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
+const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
 
-// Bits 13-15: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
-const ARRAY_DIM_SHIFT: u16 = 13;
-const ARRAY_DIM_MASK: u16 = 0b111 << ARRAY_DIM_SHIFT;
+// Bits 23-25: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
+const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
+const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
 impl Column {
     pub fn affinity(&self) -> Affinity {
@@ -4708,7 +4897,7 @@ impl Column {
     /// This ensures affinity rules use the custom type's BASE type
     /// rather than applying SQLite name-based rules to the type name.
     pub fn set_base_affinity(&mut self, affinity: Affinity) {
-        let v: u16 = match affinity {
+        let v: u32 = match affinity {
             Affinity::Integer => 1,
             Affinity::Text => 2,
             Affinity::Blob => 3,
@@ -4771,10 +4960,10 @@ impl Column {
             }
             None => GeneratedType::NotGenerated,
         };
-        let mut raw = 0u16;
-        raw |= (ty as u16) << TYPE_SHIFT;
+        let mut raw = 0u32;
+        raw |= (ty as u32) << TYPE_SHIFT;
         if let Some(c) = col {
-            raw |= (c as u16) << COLL_SHIFT;
+            raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK;
         }
         if coldef.primary_key {
             raw |= F_PRIMARY_KEY
@@ -4810,7 +4999,7 @@ impl Column {
 
     #[inline]
     pub const fn set_ty(&mut self, ty: Type) {
-        self.raw = (self.raw & !TYPE_MASK) | (((ty as u16) << TYPE_SHIFT) & TYPE_MASK);
+        self.raw = (self.raw & !TYPE_MASK) | (((ty as u32) << TYPE_SHIFT) & TYPE_MASK);
     }
 
     #[inline]
@@ -4824,20 +5013,24 @@ impl Column {
 
     #[inline]
     pub const fn collation(&self) -> CollationSeq {
-        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u8;
-        CollationSeq::from_bits(v)
+        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u16;
+        if v == CollationSeq::Unset.to_bits() {
+            CollationSeq::Binary
+        } else {
+            CollationSeq::from_storage_bits(v)
+        }
     }
 
     #[inline]
     pub const fn has_explicit_collation(&self) -> bool {
-        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u8;
-        v != CollationSeq::Unset as u8
+        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u16;
+        v != CollationSeq::Unset.to_bits()
     }
 
     #[inline]
     pub const fn set_collation(&mut self, c: Option<CollationSeq>) {
         if let Some(c) = c {
-            self.raw = (self.raw & !COLL_MASK) | (((c as u16) << COLL_SHIFT) & COLL_MASK);
+            self.raw = (self.raw & !COLL_MASK) | (((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK);
         }
     }
 
@@ -4946,17 +5139,17 @@ impl Column {
     /// Number of array dimensions (0 = scalar, 1 = `[]`, 2 = `[][]`, etc.)
     #[inline]
     pub const fn array_dimensions(&self) -> u32 {
-        ((self.raw & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT) as u32
+        (self.raw & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT
     }
 
     #[inline]
     pub fn set_array_dimensions(&mut self, dims: u32) {
         assert!(dims <= 7, "array dimensions must be <= 7");
-        self.raw = (self.raw & !ARRAY_DIM_MASK) | ((dims as u16) << ARRAY_DIM_SHIFT);
+        self.raw = (self.raw & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
     }
 
     #[inline]
-    const fn set_flag(&mut self, mask: u16, val: bool) {
+    const fn set_flag(&mut self, mask: u32, val: bool) {
         if val {
             self.raw |= mask
         } else {
@@ -4996,7 +5189,13 @@ impl TryFrom<&ColumnDefinition> for Column {
                     );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
-                    collation.replace(CollationSeq::new(collation_name.as_str())?);
+                    let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                    if collation_seq.is_custom() {
+                        crate::bail_parse_error!(
+                            "custom collations are not supported in schema definitions"
+                        );
+                    }
+                    collation.replace(collation_seq);
                 }
                 ast::ColumnConstraint::Generated { expr, .. } => {
                     generated = Some(expr.clone());
@@ -5256,7 +5455,7 @@ impl Index {
         assert!(has_primary_key_index);
         let (index_name, root_page) = auto_index;
 
-        let mut primary_keys = Vec::with_capacity(column_count);
+        let mut primary_keys = Vec::try_with_capacity_ext(column_count)?;
         for (col_name, order) in table.primary_key_columns.iter() {
             let Some((pos_in_table, _)) = table.get_column(col_name) else {
                 return Err(crate::LimboError::ParseError(format!(
@@ -5265,6 +5464,7 @@ impl Index {
                 )));
             };
             let (_, column) = table.get_column(col_name).unwrap();
+            // preallocated enough to not need try_push
             primary_keys.push(IndexColumn {
                 name: normalize_ident(col_name),
                 order: *order,
@@ -5299,7 +5499,7 @@ impl Index {
     ) -> Result<Index> {
         let (index_name, root_page) = auto_index;
 
-        let mut unique_cols = Vec::with_capacity(column_indices_and_sort_orders.len());
+        let mut unique_cols = Vec::try_with_capacity_ext(column_indices_and_sort_orders.len())?;
         for (pos, sort_order) in &column_indices_and_sort_orders {
             let Some((pos_in_table, col)) = table
                 .columns
@@ -5312,6 +5512,7 @@ impl Index {
                     table.name
                 )));
             };
+            // preallocated enough to not need try_push
             unique_cols.push(IndexColumn {
                 name: normalize_ident(col.name.as_ref().unwrap()),
                 order: *sort_order,
@@ -5468,6 +5669,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
 
     #[test]
     pub fn test_has_rowid_true() -> Result<()> {
@@ -5482,6 +5684,16 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         assert!(!table.has_rowid, "has_rowid should be set to false");
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_column_default_collation_is_effective_binary() -> Result<()> {
+        let sql = r#"CREATE TABLE t1 (a TEXT);"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        let column = table.get_column("a").unwrap().1;
+        assert_eq!(column.collation(), CollationSeq::Binary);
+        assert_eq!(column.collation_opt(), None);
         Ok(())
     }
 
@@ -6143,6 +6355,20 @@ mod tests {
     }
 
     #[test]
+    fn test_autoincrement_preserved_in_to_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, doomed INT, v TEXT)"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+
+        assert!(table.has_autoincrement);
+        assert_eq!(
+            table.to_sql(),
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, doomed INT, v TEXT)"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_without_rowid_preserved_in_sql() -> Result<()> {
         let sql = r#"CREATE TABLE t(code TEXT PRIMARY KEY, val TEXT) WITHOUT ROWID"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -6409,7 +6635,7 @@ mod tests {
         )?;
         let mut expected = t.columns_affected_by_update([0])?;
         let b_mask = t.columns_affected_by_update([1])?;
-        expected.union_with(&b_mask);
+        expected.union_with(&b_mask).unwrap();
         let union_mask = t.columns_affected_by_update([0, 1])?;
         assert_eq!(indices(&union_mask), indices(&expected));
         Ok(())
@@ -6487,5 +6713,37 @@ mod tests {
         let _ = t.columns_mut();
         assert!(t.peek_column_dependencies().is_none());
         Ok(())
+    }
+
+    /// `install_sequence_descriptor` must surface an error when the
+    /// persisted metadata is invalid (e.g. min > max) rather than
+    /// silently dropping the sequence. The internal backing table is
+    /// the only persistent record of the sequence; a silent drop would
+    /// manifest later as a misleading "sequence does not exist" on the
+    /// next nextval that masks real on-disk corruption.
+    #[test]
+    fn install_sequence_descriptor_rejects_invalid_metadata_with_corruption_error() {
+        let mut schema = Schema::new();
+        let bogus = SequenceMetadata {
+            // increment of zero is universally invalid; Sequence::new
+            // rejects it with a clear error.
+            start: 0,
+            increment: 0,
+            min: 0,
+            max: 100,
+            cycle: false,
+        };
+        let result = schema.install_sequence_descriptor("broken_seq", bogus);
+        let err = result.expect_err(
+            "invalid persisted descriptor must surface as an error, not be silently dropped",
+        );
+        assert!(
+            matches!(err, LimboError::Corrupt(_)),
+            "expected Corrupt error for unreadable internal backing table, got: {err:?}",
+        );
+        assert!(
+            !schema.sequences.contains_key("broken_seq"),
+            "rejected descriptor must not land in the sequences map",
+        );
     }
 }

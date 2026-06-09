@@ -19,7 +19,7 @@ use sql_generation::{
             transaction::{Begin, Commit, Rollback},
             update::{SetValue, Update},
         },
-        table::{ColumnType, SimValue, Table},
+        table::{Column, ColumnType, SimValue, Table},
     },
 };
 use strum::IntoEnumIterator;
@@ -31,7 +31,7 @@ use crate::{
     generation::{Shadow, WeightedDistribution, query::QueryDistribution},
     model::{
         CreateSequence, DropSequence, Query, QueryCapabilities, QueryDiscriminants,
-        ReleaseSavepoint, ResultSet, RollbackToSavepoint, Savepoint,
+        ReleaseSavepoint, ResultSet, RollbackToSavepoint, Savepoint, expand_with_generated_columns,
         interactions::{
             Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
@@ -65,19 +65,37 @@ impl Property {
                     };
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
                     let table_name = insert.table();
-                    let table = ctx
-                        .tables()
-                        .iter()
-                        .find(|table| table.name == table_name)
-                        .unwrap();
+                    // Concurrent connections can drop the target table between
+                    // when this property was scheduled and when we generate its
+                    // middle query. The property's invariant (rows inserted are
+                    // visible later) can no longer be checked once the table is
+                    // gone, so emit the generated query unmodified — the
+                    // post-tx validator will see the resulting "no such table"
+                    // error and skip the assertion cleanly.
+                    let Some(table) = ctx.tables().iter().find(|table| table.name == table_name)
+                    else {
+                        return Some(query);
+                    };
 
-                    let rows = insert.rows();
-                    let row = &rows[*row_index];
+                    let partial_rows = insert.rows();
+                    let partial_row = &partial_rows[*row_index];
+
+                    // full_row has its generated columns evaluated
+                    let full_row = match insert {
+                        Insert::ValuesWithColumns { columns, .. } => {
+                            expand_with_generated_columns(table, Some(columns), partial_row)
+                        }
+                        Insert::Values { .. } => {
+                            expand_with_generated_columns(table, None, partial_row)
+                        }
+                        _ => unreachable!(),
+                    };
+
                     match &query {
                         Query::Delete(Delete {
                             table: t,
                             predicate,
-                        }) if t == &table.name && predicate.test(row, table) => {
+                        }) if t == &table.name && predicate.test(&full_row, table) => {
                             // The inserted row will not be deleted.
                             None
                         }
@@ -90,7 +108,7 @@ impl Property {
                             table: t,
                             set_values: _,
                             predicate,
-                        }) if t == &table.name && predicate.test(row, table) => {
+                        }) if t == &table.name && predicate.test(&full_row, table) => {
                             // The inserted row will not be updated.
                             None
                         }
@@ -116,13 +134,14 @@ impl Property {
                     };
 
                     let table_name = create.table.name.clone();
-                    let table = ctx
-                        .tables()
-                        .iter()
-                        .find(|table| table.name == table_name)
-                        .unwrap();
-
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    // See InsertValuesSelect above — if the target table was
+                    // dropped between schedule and generation, fall back to
+                    // an unconstrained query.
+                    let Some(table) = ctx.tables().iter().find(|table| table.name == table_name)
+                    else {
+                        return Some(query);
+                    };
                     match &query {
                         Query::Create(Create { table: t }) if t.name == table.name => {
                             // There will be no errors in the middle interactions.
@@ -157,12 +176,14 @@ impl Property {
                     };
 
                     let table_name = table_name.clone();
-                    let table = ctx
-                        .tables()
-                        .iter()
-                        .find(|table| table.name == table_name)
-                        .unwrap();
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    // See InsertValuesSelect above — if the target table was
+                    // dropped between schedule and generation, fall back to
+                    // an unconstrained query.
+                    let Some(table) = ctx.tables().iter().find(|table| table.name == table_name)
+                    else {
+                        return Some(query);
+                    };
                     match &query {
                         Query::Insert(Insert::Values {
                             table: t, values, ..
@@ -172,10 +193,17 @@ impl Property {
                             // A row that holds for the predicate will not be inserted.
                             None
                         }
-                        Query::Insert(Insert::Select {
+                        Query::Insert(Insert::ValuesWithColumns {
                             table: t,
-                            select: _,
-                        }) if t == &table.name => {
+                            columns: _,
+                            values: _,
+                        }) if *t == table_name => {
+                            // A row that holds for the predicate will not be inserted. We can't
+                            // easily test partial rows (rows with unevaluated generated columns)
+                            // against the predicate, so conservatively reject all ValuesWithColumns.
+                            None
+                        }
+                        Query::Insert(Insert::Select { table: t, .. }) if t == &table.name => {
                             // A row that holds for the predicate will not be inserted.
                             None
                         }
@@ -303,18 +331,27 @@ impl Property {
                             .iter()
                             .find(|t| t.name == table)
                             .expect("table should be in enviroment");
-                        if rows.len() != sim_table.rows.len() {
-                            print_diff(&sim_table.rows, rows, "simulator", "database");
+                        let expected: Vec<Vec<SimValue>> = sim_table
+                            .rows
+                            .iter()
+                            .map(|r| strip_virtual_cols(sim_table, r))
+                            .collect();
+                        let actual: Vec<Vec<SimValue>> = rows
+                            .iter()
+                            .map(|r| strip_virtual_cols(sim_table, r))
+                            .collect();
+                        if actual.len() != expected.len() {
+                            print_diff(&expected, &actual, "simulator", "database");
                             return Ok(Err(format!(
                                 "expected {} rows but got {} for table {}",
-                                sim_table.rows.len(),
-                                rows.len(),
+                                expected.len(),
+                                actual.len(),
                                 table.clone()
                             )));
                         }
-                        for expected_row in sim_table.rows.iter() {
-                            if !rows.contains(expected_row) {
-                                print_diff(&sim_table.rows, rows, "simulator", "database");
+                        for expected_row in expected.iter() {
+                            if !actual.contains(expected_row) {
+                                print_diff(&expected, &actual, "simulator", "database");
                                 return Ok(Err(format!(
                                     "expected row {:?} not found in table {}",
                                     expected_row,
@@ -476,16 +513,13 @@ impl Property {
                 select,
                 interactive,
             } => {
-                let (table, values) = if let Insert::Values {
-                    table,
-                    values,
-                    on_conflict: None,
-                } = insert
+                let (table, values) = if let Insert::Values { table, values, .. }
+                | Insert::ValuesWithColumns { table, values, .. } = insert
                 {
                     (table, values)
                 } else {
                     unreachable!(
-                        "insert query should be Insert::Values for Insert-Values-Select property"
+                        "insert query should be Insert::Values or Insert::ValuesWithColumns for Insert-Values-Select property"
                     )
                 };
                 // Check that the insert query has at least 1 value
@@ -1263,16 +1297,17 @@ impl Property {
                         })),
                     ));
                 }
-                // Assertion: collected nextval results form expected arithmetic sequence
+                // Assertion: collected nextval results form expected sequence
                 let expected_start = create.start;
                 let expected_increment = create.increment;
                 let expected_count = *num_calls;
+                let expected_cycle = create.cycle;
+                let expected_min = create.min_value;
+                let expected_max = create.max_value;
                 let seq_name = create.name.clone();
                 let assertion = InteractionType::Assertion(Assertion::new(
-                    format!("sequence {seq_name} should return monotonic values"),
+                    format!("sequence {seq_name} should return correct values"),
                     move |stack: &Vec<ResultSet>, _env: &mut SimulatorEnv| {
-                        // The stack contains: CREATE result + N nextval results
-                        // nextval results start at index 1 (index 0 is CREATE)
                         let mut values = Vec::new();
                         for (i, result) in stack.iter().enumerate().take(expected_count + 1).skip(1)
                         {
@@ -1297,19 +1332,40 @@ impl Property {
                                 }
                             }
                         }
-                        // Verify the expected arithmetic sequence
-                        for (idx, val) in values.iter().enumerate() {
-                            let expected = expected_start + (idx as i64) * expected_increment;
-                            if *val != expected {
-                                return Ok(Err(format!(
-                                    "sequence {}: nextval call {} returned {} but expected {} (start={}, increment={})",
-                                    seq_name,
-                                    idx + 1,
-                                    val,
-                                    expected,
-                                    expected_start,
-                                    expected_increment
-                                )));
+                        if expected_cycle {
+                            let range_count =
+                                ((expected_max - expected_min) / expected_increment.abs()) + 1;
+                            for (idx, val) in values.iter().enumerate() {
+                                let expected = if expected_increment > 0 {
+                                    expected_min + ((idx as i64) % range_count) * expected_increment
+                                } else {
+                                    expected_max + ((idx as i64) % range_count) * expected_increment
+                                };
+                                if *val != expected {
+                                    return Ok(Err(format!(
+                                        "sequence {}: nextval call {} returned {} but expected {} (cycling, range_count={})",
+                                        seq_name,
+                                        idx + 1,
+                                        val,
+                                        expected,
+                                        range_count
+                                    )));
+                                }
+                            }
+                        } else {
+                            for (idx, val) in values.iter().enumerate() {
+                                let expected = expected_start + (idx as i64) * expected_increment;
+                                if *val != expected {
+                                    return Ok(Err(format!(
+                                        "sequence {}: nextval call {} returned {} but expected {} (start={}, increment={})",
+                                        seq_name,
+                                        idx + 1,
+                                        val,
+                                        expected,
+                                        expected_start,
+                                        expected_increment
+                                    )));
+                                }
                             }
                         }
                         Ok(Ok(()))
@@ -1374,18 +1430,25 @@ fn random_main_table_insert<R: rand::Rng + ?Sized>(
     const UNIQUE_BASE_OFFSET_RANGE: std::ops::Range<i64> = 3_000_000_000..4_000_000_000;
     const UNIQUE_COL_STRIDE: i64 = 10_000_000;
 
+    // Generated columns are computed and cannot be inserted into.
+    let non_generated_columns: Vec<(usize, &Column)> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_generated())
+        .collect();
+
     let num_rows = rng.random_range(1..=5);
     let base_offset: i64 = rng.random_range(UNIQUE_BASE_OFFSET_RANGE);
-    let values = (0..num_rows)
+    let values: Vec<Vec<SimValue>> = (0..num_rows)
         .map(|row_idx| {
-            table
-                .columns
+            non_generated_columns
                 .iter()
                 .enumerate()
-                .map(|(col_idx, column)| {
+                .map(|(ng_idx, (_, column))| {
                     if column.has_unique_or_pk() {
                         let offset =
-                            base_offset + (col_idx as i64 * UNIQUE_COL_STRIDE) + row_idx as i64;
+                            base_offset + (ng_idx as i64 * UNIQUE_COL_STRIDE) + row_idx as i64;
                         SimValue::unique_for_type(&column.column_type, offset)
                     } else {
                         SimValue::arbitrary_from(rng, ctx, &column.column_type)
@@ -1395,11 +1458,24 @@ fn random_main_table_insert<R: rand::Rng + ?Sized>(
         })
         .collect();
 
-    Query::Insert(Insert::Values {
-        table: table.name.clone(),
-        values,
-        on_conflict: None,
-    })
+    // lazy heuristic, could be improved
+    let has_generated_col = non_generated_columns.len() < table.columns.len();
+    if has_generated_col {
+        Query::Insert(Insert::ValuesWithColumns {
+            table: table.name.clone(),
+            columns: non_generated_columns
+                .iter()
+                .map(|(_, c)| c.name.clone())
+                .collect(),
+            values,
+        })
+    } else {
+        Query::Insert(Insert::Values {
+            table: table.name.clone(),
+            values,
+            on_conflict: None,
+        })
+    }
 }
 
 fn random_main_table_update<R: rand::Rng + ?Sized>(
@@ -1408,23 +1484,26 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
     table: &Table,
 ) -> Query {
     let update_opts = &ctx.opts().query.update;
-    let unique_columns = table
+    // Generated columns cannot be updated
+    let unique_updatable_columns = table
         .columns
         .iter()
         .enumerate()
         .filter(|(_, column)| {
-            column.has_unique_or_pk() && !matches!(column.column_type, ColumnType::Blob)
+            column.has_unique_or_pk()
+                && !column.is_generated()
+                && !matches!(column.column_type, ColumnType::Blob)
         })
         .collect::<Vec<_>>();
-    let non_unique_columns = table
+    let non_unique_updatable_columns = table
         .columns
         .iter()
-        .filter(|column| !column.has_unique_or_pk())
+        .filter(|column| !column.has_unique_or_pk() && !column.is_generated())
         .collect::<Vec<_>>();
 
     let last_row_idx = table.rows.len().saturating_sub(1);
     let conflict_capable_columns = if table.rows.len() >= 2 {
-        unique_columns
+        unique_updatable_columns
             .iter()
             .filter(|(col_idx, _)| table.rows[0][*col_idx] != table.rows[last_row_idx][*col_idx])
             .copied()
@@ -1435,10 +1514,10 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
 
     if update_opts.force_late_failure
         && !conflict_capable_columns.is_empty()
-        && !non_unique_columns.is_empty()
+        && !non_unique_updatable_columns.is_empty()
     {
         let (col_idx, unique_col) = *pick(&conflict_capable_columns, rng);
-        let marker_col = *pick(&non_unique_columns, rng);
+        let marker_col = *pick(&non_unique_updatable_columns, rng);
         let first_val = table.rows[0][col_idx].clone();
         let last_val = table.rows[last_row_idx][col_idx].clone();
         let marker_value = match update_opts.padding_size {
@@ -1469,10 +1548,12 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
         });
     }
 
-    let column = if non_unique_columns.is_empty() {
-        pick(&table.columns, rng)
+    let updatable_columns: Vec<&Column> =
+        table.columns.iter().filter(|c| !c.is_generated()).collect();
+    let column = if non_unique_updatable_columns.is_empty() {
+        *pick(&updatable_columns, rng)
     } else {
-        *pick(&non_unique_columns, rng)
+        *pick(&non_unique_updatable_columns, rng)
     };
     let value = match (update_opts.padding_size, &column.column_type) {
         (Some(size), ColumnType::Blob) => SimValue(turso_core::Value::Blob(vec![b'X'; size])),
@@ -1564,6 +1645,16 @@ fn run_integrity_check(
     }
 }
 
+fn strip_virtual_cols(table: &Table, row: &[SimValue]) -> Vec<SimValue> {
+    table
+        .columns
+        .iter()
+        .zip(row.iter())
+        .filter(|(col, _)| !col.is_generated())
+        .map(|(_, sim_val)| sim_val.clone())
+        .collect()
+}
+
 fn assert_all_table_values(
     tables: &[String],
     connection_index: usize,
@@ -1586,13 +1677,16 @@ fn assert_all_table_values(
                     let last = stack.last().unwrap();
                     match last {
                         Ok(vals) => {
+                            let expected: Vec<Vec<SimValue>> = table.rows.iter().map(|r| strip_virtual_cols(table, r)).collect();
+                            let actual: Vec<Vec<SimValue>> = vals.iter().map(|r| strip_virtual_cols(table, r)).collect();
+
                             // Check if all values in the table are present in the result set
                             // Find a value in the table that is not in the result set
-                            let model_contains_db = table.rows.iter().find(|v| {
-                                !vals.contains(v)
+                            let model_contains_db = expected.iter().find(|v| {
+                                !actual.contains(v)
                             });
-                            let db_contains_model = vals.iter().find(|v| {
-                                !table.rows.contains(v)
+                            let db_contains_model = actual.iter().find(|v| {
+                                !expected.contains(v)
                             });
 
                             if let Some(model_contains_db) = model_contains_db {
@@ -1601,7 +1695,7 @@ fn assert_all_table_values(
                                     table.name,
                                     print_row(model_contains_db)
                                 );
-                                print_diff(&table.rows, vals, "simulator", "database");
+                                print_diff(&expected, &actual, "simulator", "database");
 
                                 Ok(Err(format!("table {} does not contain the expected values, the simulator model has more rows than the database: {:?}", table.name, print_row(model_contains_db))))
                             } else if let Some(db_contains_model) = db_contains_model {
@@ -1610,7 +1704,7 @@ fn assert_all_table_values(
                                     table.name,
                                     print_row(db_contains_model)
                                 );
-                                print_diff(&table.rows, vals, "simulator", "database");
+                                print_diff(&expected, &actual, "simulator", "database");
 
                                 Ok(Err(format!("table {} does not contain the expected values, the database has more rows than the simulator model: {:?}", table.name, print_row(db_contains_model))))
                             } else {
@@ -1645,20 +1739,50 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         *pick(&non_unique_tables, rng)
     };
 
+    let non_generated_columns: Vec<Column> = table
+        .columns
+        .iter()
+        .filter(|c| !c.is_generated())
+        .cloned()
+        .collect();
+
+    assert!(
+        !non_generated_columns.is_empty(),
+        "Table {} should have at least one non-generated column",
+        table.name
+    );
+
     let rows = (0..rng.random_range(1..=5))
-        .map(|_| Vec::<SimValue>::arbitrary_from(rng, ctx, table))
+        .map(|_| {
+            non_generated_columns
+                .iter()
+                .map(|c| SimValue::arbitrary_from(rng, ctx, &c.column_type))
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
 
     // Pick a random row to select
     let row_index = pick_index(rows.len(), rng);
     let row = rows[row_index].clone();
 
-    // Insert the rows
-    let insert_query = Query::Insert(Insert::Values {
-        table: table.name.clone(),
-        values: rows,
-        on_conflict: None,
-    });
+    // lazy heuristic, could be improved
+    let has_generated = non_generated_columns.len() < table.columns.len();
+    let insert_query = if has_generated {
+        Query::Insert(Insert::ValuesWithColumns {
+            table: table.name.clone(),
+            columns: non_generated_columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+            values: rows,
+        })
+    } else {
+        Query::Insert(Insert::Values {
+            table: table.name.clone(),
+            values: rows,
+            on_conflict: None,
+        })
+    };
 
     // Choose if we want queries to be executed in an interactive transaction
     let interactive = if !mvcc && rng.random_bool(0.5) {
@@ -1692,10 +1816,31 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         });
     }
 
-    // Select the row
-    let select_query = Select::simple(
+    let predicate = if has_generated {
+        // For tables with generated columns, create a "virtual" table with only
+        // non-generated columns for predicate generation. This ensures the predicate
+        // only references columns we have values for.
+        let virtual_table = Table {
+            name: table.name.clone(),
+            columns: non_generated_columns.clone(),
+            rows: vec![row.clone()],
+            indexes: vec![],
+        };
+        Predicate::arbitrary_from(rng, ctx, (&virtual_table, &row))
+    } else {
+        Predicate::arbitrary_from(rng, ctx, (table, &row))
+    };
+
+    // Select only the non-generated columns so the assertion can compare with the inserted values
+    let select_query = Select::single(
         table.name.clone(),
-        Predicate::arbitrary_from(rng, ctx, (table, &row)),
+        non_generated_columns
+            .iter()
+            .map(|c| ResultColumn::Column(c.name.clone()))
+            .collect(),
+        predicate,
+        None,
+        Distinctness::All,
     );
 
     Property::InsertValuesSelect {
@@ -1985,17 +2130,48 @@ fn property_sequence_monotonicity<R: rand::Rng + ?Sized>(
 ) -> Property {
     use rand::seq::IndexedRandom;
 
-    let name = format!("seq_{}", rng.random_range(0..10000u32));
-    let increment = *[1i64, 2, 5, 10].choose(rng).unwrap();
-    let start = rng.random_range(1..100i64);
-    let num_calls = rng.random_range(3..8usize);
+    // Distinct namespace from `random_create_sequence` so this property's
+    // CREATE / nextval / DROP cannot collide with sequences the regular
+    // workload creates and advances on other connections — without the
+    // separation the assertion observes an engine state already moved
+    // by an interleaved nextval from another connection.
+    let name = format!("seq_mono_{}", rng.random_range(0..10000u32));
+    let increment = *[1i64, 2, 5, 10, -1, -2, -5].choose(rng).unwrap();
+
+    let arm = rng.random_range(0..3u32);
+    let (start, min_value, max_value, cycle, num_calls) = if arm == 0 && increment.abs() <= 5 {
+        // Bounded cycling: small range, enough calls to force wrap-around
+        let range_count = rng.random_range(3..6i64);
+        let num_calls = (range_count as usize) * 2 + rng.random_range(1..4usize);
+        if increment > 0 {
+            let min = 1i64;
+            let max = min + (range_count - 1) * increment;
+            (min, min, max, true, num_calls)
+        } else {
+            let max = -1i64;
+            let min = max + (range_count - 1) * increment;
+            (max, min, max, true, num_calls)
+        }
+    } else {
+        // Unbounded (original behavior, now with negative increments too)
+        let num_calls = rng.random_range(3..8usize);
+        if increment > 0 {
+            let start = rng.random_range(1..100i64);
+            (start, 1, i64::MAX, false, num_calls)
+        } else {
+            let start = rng.random_range(-100..-1i64);
+            (start, i64::MIN + 1, -1, false, num_calls)
+        }
+    };
+
+
     let create = CreateSequence {
         name: name.clone(),
         start,
         increment,
-        min_value: 1,
-        max_value: i64::MAX,
-        cycle: false,
+        min_value,
+        max_value,
+        cycle,
     };
     let drop = DropSequence { name };
     Property::SequenceMonotonicity {

@@ -325,9 +325,8 @@ impl<'a> Parser<'a> {
         fn get_token(tt: TokenType) -> TokenType {
             match tt {
                 TK_ID | TK_STRING | TK_JOIN_KW | TK_UNION | TK_EXCEPT | TK_INTERSECT
-                | TK_GENERATED | TK_WITHOUT | TK_COLUMNKW | TK_WINDOW | TK_FILTER | TK_OVER => {
-                    TK_ID
-                }
+                | TK_GENERATED | TK_WITHOUT | TK_COLUMNKW | TK_WINDOW | TK_FILTER | TK_OVER
+                | TK_WITHIN => TK_ID,
                 _ => tt.fallback_id_if_ok(),
             }
         }
@@ -454,6 +453,28 @@ impl<'a> Parser<'a> {
                     };
 
                     if !can_be_filter {
+                        tok.token_type = TK_ID;
+                    }
+                }
+                TK_WITHIN => {
+                    // WITHIN is a keyword only in `<aggregate>(...) WITHIN GROUP (...)`:
+                    // the previous token must be `)` and the next token must be GROUP.
+                    let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
+                    let can_be_within = if prev_tt == TK_RP {
+                        self.try_parse(|p| {
+                            match p.consume_lexer_without_whitespaces_or_comments() {
+                                None => Ok(false),
+                                Some(tok) => match tok?.token_type {
+                                    TK_GROUP => Ok(true),
+                                    _ => Ok(false),
+                                },
+                            }
+                        })?
+                    } else {
+                        false
+                    };
+
+                    if !can_be_within {
                         tok.token_type = TK_ID;
                     }
                 }
@@ -1053,6 +1074,67 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_reindex_fullname(&mut self) -> Result<QualifiedName> {
+        let first_name = self.parse_reindex_nm()?;
+
+        let second_name = if let Some(tok) = self.peek()? {
+            if tok.token_type == TK_DOT {
+                eat_assert!(self, TK_DOT);
+                Some(self.parse_reindex_nm()?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(second_name) = second_name {
+            Ok(QualifiedName {
+                db_name: Some(first_name),
+                name: second_name,
+                alias: None,
+            })
+        } else {
+            Ok(QualifiedName {
+                db_name: None,
+                name: first_name,
+                alias: None,
+            })
+        }
+    }
+
+    fn parse_reindex_nm(&mut self) -> Result<Name> {
+        let offset = self.offset();
+        let token = self.peek_no_eof()?;
+        if Self::is_reindex_compound_operator_name(token) {
+            let token_len = token.value.len();
+            let token_text = token.to_utf8();
+            return Err(Error::ParseUnexpectedToken {
+                parsed_offset: (offset, token_len).into(),
+                expected: &[TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW, TK_LBRACKET],
+                got: token.token_type,
+                token_text,
+                offset,
+                expected_display: crate::token::TokenType::format_expected_tokens(&[
+                    TK_ID,
+                    TK_STRING,
+                    TK_INDEXED,
+                    TK_JOIN_KW,
+                    TK_LBRACKET,
+                ]),
+            });
+        }
+        self.parse_nm()
+    }
+
+    fn is_reindex_compound_operator_name(token: &Token<'_>) -> bool {
+        matches!(token.token_type, TK_UNION | TK_EXCEPT | TK_INTERSECT)
+            || matches!(token.token_type, TK_ID)
+                && (token.as_bytes().eq_ignore_ascii_case(b"union")
+                    || token.as_bytes().eq_ignore_ascii_case(b"except")
+                    || token.as_bytes().eq_ignore_ascii_case(b"intersect"))
+    }
+
     fn parse_signed(&mut self) -> Result<Box<Expr>> {
         peek_expect!(self, TK_FLOAT, TK_INTEGER, TK_PLUS, TK_MINUS);
 
@@ -1439,6 +1521,27 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parses an optional `WITHIN GROUP (ORDER BY ...)` clause used by ordered-set
+    /// aggregates. The `ORDER BY` is mandatory once `WITHIN GROUP` is present.
+    fn parse_within_group(&mut self) -> Result<Vec<SortedColumn>> {
+        match self.peek()? {
+            Some(tok) if tok.token_type == TK_WITHIN => {
+                eat_assert!(self, TK_WITHIN);
+                eat_expect!(self, TK_GROUP);
+                eat_expect!(self, TK_LP);
+                let order_by = self.parse_order_by()?;
+                if order_by.is_empty() {
+                    return Err(Error::Custom(
+                        "WITHIN GROUP requires an ORDER BY clause".to_owned(),
+                    ));
+                }
+                eat_expect!(self, TK_RP);
+                Ok(order_by)
+            }
+            _ => Ok(vec![]),
+        }
+    }
+
     fn parse_raise_type(&mut self) -> Result<ResolveType> {
         let tok = eat_expect!(self, TK_ROLLBACK, TK_ABORT, TK_FAIL);
 
@@ -1664,6 +1767,7 @@ impl<'a> Parser<'a> {
                                 distinctness: None,
                                 args: elements,
                                 order_by: vec![],
+                                within_group: vec![],
                                 filter_over: FunctionTail {
                                     filter_clause: None,
                                     over_clause: None,
@@ -1710,12 +1814,14 @@ impl<'a> Parser<'a> {
                                 let exprs = self.parse_expr_list()?;
                                 let order_by = self.parse_order_by()?;
                                 eat_expect!(self, TK_RP);
+                                let within_group = self.parse_within_group()?;
                                 let filter_over = self.parse_filter_over()?;
                                 return Ok(Box::new(Expr::FunctionCall {
                                     name: Name::from_bytes(name),
                                     distinctness: distinct,
                                     args: exprs,
                                     order_by,
+                                    within_group,
                                     filter_over,
                                 }));
                             }
@@ -2154,6 +2260,7 @@ impl<'a> Parser<'a> {
                             distinctness: None,
                             args: vec![result, first, second],
                             order_by: vec![],
+                            within_group: vec![],
                             filter_over: FunctionTail {
                                 filter_clause: None,
                                 over_clause: None,
@@ -2167,6 +2274,7 @@ impl<'a> Parser<'a> {
                             distinctness: None,
                             args: vec![result, first],
                             order_by: vec![],
+                            within_group: vec![],
                             filter_over: FunctionTail {
                                 filter_clause: None,
                                 over_clause: None,
@@ -4029,6 +4137,7 @@ impl<'a> Parser<'a> {
                             distinctness: None,
                             args: vec![col_ref, idx_expr, val_expr],
                             order_by: vec![],
+                            within_group: vec![],
                             filter_over: FunctionTail {
                                 filter_clause: None,
                                 over_clause: None,
@@ -4691,7 +4800,6 @@ impl<'a> Parser<'a> {
         let mut increment = None;
         let mut min_value = None;
         let mut max_value = None;
-        let mut cache = None;
         let mut cycle = false;
 
         loop {
@@ -4722,10 +4830,6 @@ impl<'a> Parser<'a> {
                         "MAXVALUE" => {
                             eat_assert!(self, TK_ID);
                             max_value = Some(self.parse_sequence_i64()?);
-                        }
-                        "CACHE" => {
-                            eat_assert!(self, TK_ID);
-                            cache = Some(self.parse_sequence_i64()?);
                         }
                         "CYCLE" => {
                             eat_assert!(self, TK_ID);
@@ -4759,7 +4863,6 @@ impl<'a> Parser<'a> {
             increment,
             min_value,
             max_value,
-            cache,
             cycle,
         })
     }
@@ -4962,8 +5065,8 @@ impl<'a> Parser<'a> {
         eat_assert!(self, TK_REINDEX);
         match self.peek()? {
             Some(tok) => match tok.token_type.fallback_id_if_ok() {
-                TK_ID | TK_STRING | TK_JOIN_KW | TK_INDEXED => Ok(Stmt::Reindex {
-                    name: Some(self.parse_fullname(false)?),
+                TK_ID | TK_STRING | TK_JOIN_KW | TK_INDEXED | TK_LBRACKET => Ok(Stmt::Reindex {
+                    name: Some(self.parse_reindex_fullname()?),
                 }),
                 _ => Ok(Stmt::Reindex { name: None }),
             },
@@ -6227,6 +6330,7 @@ mod tests {
                                     distinctness: None,
                                     args: vec![],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: None,
@@ -6261,6 +6365,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: Some(Box::new(Expr::Id(Name::exact(
                                             "x".to_owned(),
@@ -6299,6 +6404,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6340,6 +6446,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6381,6 +6488,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6428,6 +6536,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6474,6 +6583,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6520,6 +6630,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6566,6 +6677,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6612,6 +6724,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6658,6 +6771,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6704,6 +6818,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6750,6 +6865,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6798,6 +6914,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6846,6 +6963,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6892,6 +7010,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6938,6 +7057,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -6984,6 +7104,7 @@ mod tests {
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
                                     ],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
@@ -9898,6 +10019,7 @@ mod tests {
                                     distinctness: None,
                                     args: vec![Box::new(Expr::Id(Name::exact("a".to_owned())))],
                                     order_by: vec![],
+                                    within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: None,
@@ -12716,7 +12838,6 @@ mod tests {
                 increment,
                 min_value,
                 max_value,
-                cache,
                 cycle,
             }) => {
                 assert!(!if_not_exists);
@@ -12725,7 +12846,6 @@ mod tests {
                 assert_eq!(increment, None);
                 assert_eq!(min_value, None);
                 assert_eq!(max_value, None);
-                assert_eq!(cache, None);
                 assert!(!cycle);
             }
             _ => panic!("expected CreateSequence"),
@@ -12734,7 +12854,7 @@ mod tests {
 
     #[test]
     fn test_parse_create_sequence_full() {
-        let sql = b"CREATE SEQUENCE foo START WITH 10 INCREMENT BY 5 MINVALUE 0 MAXVALUE 100 CACHE 20 CYCLE";
+        let sql = b"CREATE SEQUENCE foo START WITH 10 INCREMENT BY 5 MINVALUE 0 MAXVALUE 100 CYCLE";
         let cmd = Parser::new(sql).next().unwrap().unwrap();
         match cmd {
             Cmd::Stmt(Stmt::CreateSequence {
@@ -12743,7 +12863,6 @@ mod tests {
                 increment,
                 min_value,
                 max_value,
-                cache,
                 cycle,
                 ..
             }) => {
@@ -12752,7 +12871,6 @@ mod tests {
                 assert_eq!(increment, Some(5));
                 assert_eq!(min_value, Some(0));
                 assert_eq!(max_value, Some(100));
-                assert_eq!(cache, Some(20));
                 assert!(cycle);
             }
             _ => panic!("expected CreateSequence"),

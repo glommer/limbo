@@ -153,6 +153,126 @@ fn default_requires_empty_table(expr: &ast::Expr) -> bool {
     }
 }
 
+/// Rewrite the sqlite_schema row for the AUTOINCREMENT backing table when
+/// the parent table is renamed. The backing table is keyed by name
+/// `__turso_internal_seq___turso_internal_autoincrement_<table>`, so its
+/// row is not touched by the general `Func::AlterTable::RenameTable` sweep
+/// (which only matches rows whose `tbl_name` column equals the renamed
+/// user table). Without this rewrite, the persistent sqlite_schema row
+/// keeps the old backing-table name and SQL, so the next process to open
+/// the DB rebuilds the in-memory schema with the stale backing table —
+/// and an INSERT into the renamed table fails with "missing implicit
+/// sequence for AUTOINCREMENT table".
+///
+/// Mirrors the existing `emit_rename_sqlite_sequence_entry` helper for
+/// the `sqlite_sequence` row; the in-memory rename of `schema.sequences`
+/// and `schema.tables` happens in `op_rename_table`.
+fn emit_rename_autoincrement_backing_table_entry(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+    old_table_name_norm: &str,
+    new_table_name_norm: &str,
+) {
+    use crate::schema::autoincrement_sequence_name;
+    use crate::translate::sequence::{sequence_backing_table_name, sequence_backing_table_sql};
+
+    let old_backing_name =
+        sequence_backing_table_name(&autoincrement_sequence_name(old_table_name_norm));
+    let new_seq_name = autoincrement_sequence_name(new_table_name_norm);
+    let new_backing_name = sequence_backing_table_name(&new_seq_name);
+    let new_backing_sql = sequence_backing_table_sql(&new_seq_name);
+
+    let Some(sqlite_schema) =
+        resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+    else {
+        return;
+    };
+
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
+        db: database_id,
+    });
+
+    let old_backing_reg = program.emit_string8_new_reg(old_backing_name);
+    program.mark_last_insn_constant();
+    let new_backing_reg = program.emit_string8_new_reg(new_backing_name);
+    program.mark_last_insn_constant();
+    let new_sql_reg = program.emit_string8_new_reg(new_backing_sql);
+    program.mark_last_insn_constant();
+
+    program.cursor_loop(cursor_id, |program, rowid| {
+        let name_reg = program.alloc_register();
+        program.emit_column_or_rowid(cursor_id, 1, name_reg);
+
+        let continue_label = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: name_reg,
+            rhs: old_backing_reg,
+            target_pc: continue_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+
+        // Preserve type (col 0) and rootpage (col 3); overwrite name/tbl_name
+        // (cols 1, 2) and sql (col 4). The backing table is INTERNAL — its
+        // sql is regenerated from `sequence_backing_table_sql(new_seq_name)`
+        // and never altered by user DDL, so we don't need to AST-rewrite it.
+        let rec_start = program.alloc_registers(5);
+        program.emit_column_or_rowid(cursor_id, 0, rec_start); // type
+        program.emit_insn(Insn::Copy {
+            src_reg: new_backing_reg,
+            dst_reg: rec_start + 1, // name
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: new_backing_reg,
+            dst_reg: rec_start + 2, // tbl_name
+            extra_amount: 0,
+        });
+        program.emit_column_or_rowid(cursor_id, 3, rec_start + 3); // rootpage
+        program.emit_insn(Insn::Copy {
+            src_reg: new_sql_reg,
+            dst_reg: rec_start + 4, // sql
+            extra_amount: 0,
+        });
+
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(rec_start),
+            count: to_u16(5),
+            dest_reg: to_u16(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+
+        // MVCC: end the old version before writing the new one
+        // (Hekaton-style UPDATE = DELETE + INSERT), mirroring the
+        // pattern used by `emit_rename_sqlite_sequence_entry` and the
+        // main-table rewrite cursor_loop.
+        if database_uses_mvcc(connection, database_id) {
+            program.emit_insn(Insn::Delete {
+                cursor_id,
+                table_name: SQLITE_TABLEID.to_string(),
+                is_part_of_update: true,
+            });
+        }
+
+        program.emit_insn(Insn::Insert {
+            cursor: cursor_id,
+            key_reg: rowid,
+            record_reg,
+            flag: crate::vdbe::insn::InsertFlags(0),
+            table_name: SQLITE_TABLEID.to_string(),
+        });
+
+        program.preassign_label_to_next_insn(continue_label);
+    });
+}
+
 fn emit_rename_sqlite_sequence_entry(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -244,7 +364,52 @@ fn emit_rename_sqlite_sequence_entry(
     });
 }
 
-fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
+fn emit_delete_sqlite_sequence_entry(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    table_name_norm: &str,
+) {
+    let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+    }) else {
+        return;
+    };
+
+    let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_sequence.clone()));
+    let sequence_name_reg = program.alloc_register();
+    let row_name_to_delete_reg = program.emit_string8_new_reg(table_name_norm.to_string());
+    program.mark_last_insn_constant();
+
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: seq_cursor_id,
+        root_page: RegisterOrLiteral::Literal(sqlite_sequence.root_page),
+        db: database_id,
+    });
+
+    program.cursor_loop(seq_cursor_id, |program, _rowid| {
+        program.emit_column_or_rowid(seq_cursor_id, 0, sequence_name_reg);
+
+        let continue_loop_label = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: sequence_name_reg,
+            rhs: row_name_to_delete_reg,
+            target_pc: continue_loop_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+
+        program.emit_insn(Insn::Delete {
+            cursor_id: seq_cursor_id,
+            table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            is_part_of_update: false,
+        });
+
+        program.preassign_label_to_next_insn(continue_loop_label);
+    });
+}
+
+pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
     match literal {
         ast::Literal::Numeric(val) => parse_numeric_literal(val),
         ast::Literal::String(s) => Ok(Value::from_text(crate::translate::expr::sanitize_string(s))),
@@ -678,8 +843,8 @@ pub fn translate_alter_table(
     } = alter;
     let database_id = resolver.resolve_existing_table_database_id_qualified(&qualified_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
-    program.begin_write_operation();
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    program.begin_write_operation()?;
     let table_name = qualified_name.name.as_str();
     // For attached databases, qualify sqlite_schema with the database name
     // so that the UPDATE targets the correct database's schema table.
@@ -1238,8 +1403,8 @@ pub fn translate_alter_table(
             // added column. Without this, columns typed with a domain would
             // silently skip domain-level enforcement after ALTER TABLE.
             resolver.with_schema(database_id, |schema| {
-                btree.propagate_domain_constraints(schema);
-            });
+                btree.propagate_domain_constraints(schema)
+            })?;
             // Refresh local `column` from btree so that domain NOT NULL is
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
@@ -1419,7 +1584,7 @@ pub fn translate_alter_table(
 
             let temp_schema_version = if !temp_triggers_to_rewrite.is_empty() {
                 let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
-                program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie);
+                program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie)?;
                 Some(schema_cookie)
             } else {
                 None
@@ -1504,6 +1669,30 @@ pub fn translate_alter_table(
                 &normalized_old_name,
                 &normalized_new_name,
             );
+
+            // For AUTOINCREMENT tables, also rewrite the persistent
+            // sqlite_schema row for the hidden backing table. The in-memory
+            // rename happens in `op_rename_table`; without this bytecode the
+            // schema state on disk and in memory would diverge across a
+            // reopen. Cheap no-op for non-AUTOINCREMENT tables: we look up
+            // the implicit sequence via `autoincrement_sequence_name` and
+            // only emit the sweep when the descriptor is present.
+            let has_implicit_seq = resolver.with_schema(database_id, |s| {
+                s.get_sequence(&crate::schema::autoincrement_sequence_name(
+                    &normalized_old_name,
+                ))
+                .is_some()
+            });
+            if has_implicit_seq {
+                emit_rename_autoincrement_backing_table_entry(
+                    program,
+                    resolver,
+                    connection,
+                    database_id,
+                    &normalized_old_name,
+                    &normalized_new_name,
+                );
+            }
 
             for (trigger_name, new_sql) in temp_triggers_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
@@ -1651,6 +1840,12 @@ pub fn translate_alter_table(
                     (rewrites_physical_layout, Some(replacement_column))
                 }
             };
+            let clears_autoincrement_sequence = !rename
+                && btree.has_autoincrement
+                && btree.columns()[column_index].is_rowid_alias()
+                && replacement_column
+                    .as_ref()
+                    .is_some_and(|column| !column.is_rowid_alias());
 
             let is_making_column_generated = definition
                 .constraints
@@ -1828,7 +2023,7 @@ pub fn translate_alter_table(
                     .any(|(db, _, _)| *db == crate::TEMP_DB_ID);
             let temp_schema_version = if has_temp_rewrites {
                 let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
-                program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie);
+                program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie)?;
                 Some(schema_cookie)
             } else {
                 None
@@ -2039,6 +2234,11 @@ pub fn translate_alter_table(
                 );
             }
 
+            if clears_autoincrement_sequence {
+                let table_name_norm = normalize_ident(table_name);
+                emit_delete_sqlite_sequence_entry(program, resolver, database_id, &table_name_norm);
+            }
+
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
                 cookie: Cookie::SchemaVersion,
@@ -2152,7 +2352,7 @@ fn translate_rename_virtual_table(
     database_id: usize,
 ) -> Result<()> {
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_operation();
+    program.begin_write_operation()?;
     let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab));
     program.emit_insn(Insn::VOpen {
         cursor_id: vtab_cur,

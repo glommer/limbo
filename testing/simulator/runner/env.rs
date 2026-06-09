@@ -11,10 +11,12 @@ use garde::Validate;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::GenerationContext;
+use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
 use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::{SimValue, Table};
 use tracing::trace;
 use turso_core::Database;
+use turso_parser::ast::ColumnConstraint;
 
 use crate::generation::Shadow;
 use crate::model::Query;
@@ -34,7 +36,9 @@ fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Ite
             io.clone(),
             aux_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new().with_attach(true),
+            turso_core::DatabaseOpts::new()
+                .with_attach(true)
+                .with_generated_columns(true),
             None,
         )
         .unwrap_or_else(|e| panic!("Failed to open aux DB {aux_path:?}: {e}"));
@@ -466,8 +470,14 @@ where
         max_value: i64,
         cycle: bool,
     ) -> anyhow::Result<Vec<Vec<SimValue>>> {
+        // The generator may pick the same `seq_<n>` twice (small name
+        // space) and `CreateSequence`'s SQL emission uses
+        // `CREATE SEQUENCE IF NOT EXISTS`, so the engine treats a
+        // duplicate as a no-op rather than an error. Match that here:
+        // a second create on the same name is a no-op (params from
+        // the original creation stay authoritative).
         if self.sequences.iter().any(|s| s.name == name) {
-            return Err(anyhow::anyhow!("sequence \"{}\" already exists", name));
+            return Ok(vec![]);
         }
         self.sequences.push(ShadowSequence {
             name,
@@ -640,8 +650,13 @@ where
                             snapshot.set_transaction_mode(transaction_mode)
                         }
                         (TransactionMode::Concurrent, TransactionMode::Write) => {
-                            if query.is_ddl() {
-                                // Only upgrade on DDL for MVCC as MVCC requires exclusive TX for DDL statements
+                            if query.requires_exclusive_tx() {
+                                // MVCC requires an exclusive write tx for DDL
+                                // (see Query::requires_exclusive_tx). The plan
+                                // generator forces a commit before these
+                                // statements, so this upgrade rarely fires —
+                                // kept for defensive correctness if a snapshot
+                                // is built directly.
                                 snapshot.set_transaction_mode(transaction_mode)
                             }
                         }
@@ -850,6 +865,14 @@ where
                             .find(|c| &c.name == old_name)
                             .expect("Column should exist");
                         col.name.clone_from(new_name);
+                        // Update generated column expressions that reference the old column name
+                        for col in &mut committed.columns {
+                            for constraint in &mut col.constraints {
+                                if let ColumnConstraint::Generated { expr, .. } = constraint {
+                                    rename_column_refs_in_expr(expr, old_name, new_name);
+                                }
+                            }
+                        }
                         // Update index column names
                         for index in &mut committed.indexes {
                             for (col_name, _) in &mut index.columns {
@@ -1146,7 +1169,8 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_autovacuum(true)
-                .with_attach(true),
+                .with_attach(true)
+                .with_generated_columns(true),
             None,
         ) {
             Ok(db) => db,
@@ -1202,8 +1226,19 @@ impl SimulatorEnv {
         env
     }
 
-    pub fn sequence_names(&self) -> Vec<String> {
-        self.sequences.iter().map(|s| s.name.clone()).collect()
+    pub fn sequence_info(&self) -> Vec<(String, i64, i64)> {
+        // Filter out sequences reserved by the SequenceMonotonicity
+        // property — that property's assertion expects a fresh seq
+        // returning `start` on the first nextval. If the regular
+        // workload picks the same name and emits nextval / setval /
+        // drop on it between the property's CREATE SEQUENCE and its
+        // first nextval, the assertion observes engine state already
+        // moved by another connection and bails.
+        self.sequences
+            .iter()
+            .filter(|s| !s.name.starts_with("seq_mono_"))
+            .map(|s| (s.name.clone(), s.min_value, s.max_value))
+            .collect()
     }
 
     pub fn choose_conn(&self, rng: &mut impl Rng) -> usize {
@@ -1311,6 +1346,16 @@ impl SimulatorEnv {
 
             // There is no `ALTER COLUMN` in SQLite
             profile.query.gen_opts.query.alter_table.alter_column = false;
+
+            // SQLite has no CREATE SEQUENCE / nextval / setval. Disable the
+            // sequence-related query generators and the SequenceMonotonicity
+            // property when running differentially against rusqlite —
+            // otherwise the differential run aborts on the first emitted
+            // `CREATE SEQUENCE` with `syntax error near "SEQUENCE"`.
+            profile.query.create_sequence_weight = 0;
+            profile.query.drop_sequence_weight = 0;
+            profile.query.nextval_weight = 0;
+            profile.query.setval_weight = 0;
         }
 
         profile.validate().unwrap();
@@ -1345,7 +1390,8 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_autovacuum(true)
-                .with_attach(true),
+                .with_attach(true)
+                .with_generated_columns(true),
             None,
         ) {
             Ok(db) => db,

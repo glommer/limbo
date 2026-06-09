@@ -6,7 +6,7 @@ use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
         self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table,
-        SQLITE_SEQUENCE_TABLE_NAME,
+        EXPR_INDEX_SENTINEL, SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
     translate::{
@@ -330,7 +330,7 @@ pub fn translate_insert(
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), table.get_name())?;
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
+    program.begin_write_on_database(database_id, schema_cookie)?;
 
     let mut table_references = TableReferences::new(
         vec![JoinedTable {
@@ -657,7 +657,7 @@ pub fn translate_insert(
                 ctx.table,
                 resolver.schema(),
                 None,
-            ),
+            )?,
         });
 
         // Encode values for columns with custom types.
@@ -679,14 +679,27 @@ pub fn translate_insert(
     // INSERT OR IGNORE skips the row due to a CHECK failure.
     if has_user_provided_rowid {
         if is_mvcc && ctx.table.has_autoincrement {
-            // MVCC mode: use AdvanceSequence to update the implicit sequence
-            let seq_name = format!("_autoincrement_{}", ctx.table.name);
-            let seq_name_reg = program.emit_string8_new_reg(seq_name);
-            program.emit_insn(Insn::AdvanceSequence {
-                db: ctx.database_id,
-                seq_name_reg,
-                value_reg: insertion.key_register(),
-            });
+            // MVCC mode: advance the implicit sequence's disk watermark past
+            // the user-supplied rowid so the next auto-generated rowid is
+            // strictly greater. The helper is a no-op when the explicit
+            // rowid is already <= current watermark.
+            let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
+            let seq = resolver
+                .with_schema(ctx.database_id, |s| s.get_sequence(&seq_name).cloned())
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError(format!(
+                        "missing implicit sequence for AUTOINCREMENT table \"{}\"",
+                        ctx.table.name
+                    ))
+                })?;
+            crate::translate::sequence::emit_disk_advance_past(
+                program,
+                resolver,
+                ctx.database_id,
+                &seq_name,
+                &seq,
+                insertion.key_register(),
+            )?;
         } else if let Some(AutoincMeta {
             seq_cursor_id,
             r_seq,
@@ -733,10 +746,15 @@ pub fn translate_insert(
             program.emit_insn(Insn::Goto {
                 target_pc: explicit_done_label,
             });
-            program.preassign_label_to_next_insn(skip_seq_update_label);
 
-            // Missing sqlite_sequence row: materialize it once with max(existing_seq, explicit_key).
-            // For first explicit negative insert this yields seq=0, matching SQLite.
+            // SQLite leaves sqlite_sequence unchanged when the explicit key
+            // does not advance seq.
+            program.preassign_label_to_next_insn(skip_seq_update_label);
+            program.emit_insn(Insn::Goto {
+                target_pc: explicit_done_label,
+            });
+
+            // If sqlite_sequence has no row yet, write max(0, explicit_key).
             program.preassign_label_to_next_insn(missing_row_label);
             let seq_to_write_reg = program.alloc_register();
             program.emit_insn(Insn::Copy {
@@ -1208,6 +1226,7 @@ fn emit_check_for_user_provided_rowid(
     program.preassign_label_to_next_insn(must_be_int_label);
     program.emit_insn(Insn::MustBeInt {
         reg: insertion.key_register(),
+        target_pc: None,
     });
 
     program.emit_insn(Insn::Goto {
@@ -1448,62 +1467,24 @@ fn emit_rowid_generation(
     is_mvcc: bool,
 ) -> Result<()> {
     if ctx.table.has_autoincrement && is_mvcc {
-        // MVCC mode: use the implicit sequence for conflict-free rowid allocation.
-        let seq_name = format!("_autoincrement_{}", ctx.table.name);
-        let seq_name_reg = program.emit_string8_new_reg(seq_name);
-
-        // Call nextval to get the next rowid from the atomic sequence
-        program.emit_insn(Insn::Function {
-            constant_mask: 0,
-            start_reg: seq_name_reg,
-            dest: insertion.key_register(),
-            func: FuncCtx {
-                func: Func::Scalar(ScalarFunc::NextVal),
-                arg_count: 1,
-            },
-        });
-
-        // Also factor in the btree max so we don't reuse existing rowids
-        let r_max = program.alloc_register();
-        let dummy_reg = program.alloc_register();
-        program.emit_insn(Insn::NewRowid {
-            cursor: ctx.cursor_id,
-            rowid_reg: dummy_reg,
-            prev_largest_reg: r_max,
-        });
-        program.emit_insn(Insn::MemMax {
-            dest_reg: insertion.key_register(),
-            src_reg: r_max,
-        });
-
-        // Overflow check
-        let no_overflow_label = program.allocate_label();
-        let max_i64_reg = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            dest: max_i64_reg,
-            value: i64::MAX,
-        });
-        program.emit_insn(Insn::Ne {
-            lhs: insertion.key_register(),
-            rhs: max_i64_reg,
-            target_pc: no_overflow_label,
-            flags: Default::default(),
-            collation: None,
-        });
-        program.emit_insn(Insn::Halt {
-            err_code: crate::error::SQLITE_FULL,
-            description: "database or disk is full".to_string(),
-            on_error: None,
-            description_reg: None,
-        });
-        program.preassign_label_to_next_insn(no_overflow_label);
-
-        // Advance the sequence past the chosen key so subsequent calls skip it
-        program.emit_insn(Insn::AdvanceSequence {
-            db: ctx.database_id,
-            seq_name_reg,
-            value_reg: insertion.key_register(),
-        });
+        let seq_name = crate::schema::autoincrement_sequence_name(&ctx.table.name);
+        let seq = resolver
+            .with_schema(ctx.database_id, |s| s.get_sequence(&seq_name).cloned())
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "missing implicit sequence for AUTOINCREMENT table \"{}\"",
+                    ctx.table.name
+                ))
+            })?;
+        crate::translate::sequence::emit_disk_read_nextval(
+            program,
+            resolver,
+            ctx.database_id,
+            &seq_name,
+            &seq,
+            insertion.key_register(),
+            None,
+        )?;
     } else if let Some(AutoincMeta {
         r_seq,
         seq_cursor_id,
@@ -1752,6 +1733,11 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
     });
 
     program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
+    // SQLite emits AddImm r[seq], 0 here. OP_AddImm always leaves an integer.
+    program.emit_insn(Insn::AddImm {
+        register: r_seq,
+        value: 0,
+    });
     program.emit_insn(Insn::RowId {
         cursor_id: seq_cursor_id,
         dest: r_seq_rowid,
@@ -3553,6 +3539,14 @@ fn emit_index_column_value_for_insert(
             table,
             dest_reg,
         )?;
+        // For virtual generated column references, apply the column's
+        // declared affinity to the computed expression result.
+        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+            let column = &table.columns()[idx_col.pos_in_table];
+            if column.is_virtual_generated() {
+                program.emit_column_affinity(dest_reg, column.affinity());
+            }
+        }
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(
@@ -3967,7 +3961,11 @@ pub fn emit_fk_child_insert_checks(
                 dst_reg: tmp,
                 extra_amount: 0,
             });
-            program.emit_insn(Insn::MustBeInt { reg: tmp });
+            let violation = program.allocate_label();
+            program.emit_insn(Insn::MustBeInt {
+                reg: tmp,
+                target_pc: Some(violation),
+            });
 
             // If this is a self-reference *and* the child FK equals NEW rowid,
             // the constraint will be satisfied once this row is inserted
@@ -3981,7 +3979,6 @@ pub fn emit_fk_child_insert_checks(
                 });
             }
 
-            let violation = program.allocate_label();
             program.emit_insn(Insn::NotExists {
                 cursor: pcur,
                 rowid_reg: tmp,
@@ -4004,8 +4001,61 @@ pub fn emit_fk_child_insert_checks(
                 .parent_unique_index
                 .as_ref()
                 .expect("parent unique index required");
-            let icur = open_read_index(program, idx, database_id);
             let ncols = fk_ref.fk.child_columns.len();
+
+            if is_self_ref {
+                // A self-referential INSERT is checked before the new row has
+                // been written to the parent index. Without a shortcut, even
+                // an exact self-reference would look like a missing parent.
+                // SQLite handles that by comparing the pending INSERT registers
+                // directly before it builds the affinity-coerced index probe.
+                //
+                //   CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER UNIQUE,
+                //                  pk TEXT REFERENCES t(k));
+                //   INSERT INTO t(id, k, pk) VALUES (1, 1, '1');
+                //
+                // In that INSERT image, the child key is pk=TEXT '1' and this
+                // row's parent key is k=INTEGER 1. Those stored values are not
+                // the same, so the same-row shortcut must not fire.
+                //
+                // The normal parent-index probe asks a different question:
+                // "after applying the parent key affinity, does this child key
+                // match some parent row that is already in the index?" That is
+                // why cross-row checks may coerce TEXT '1' to INTEGER 1 before
+                // seeking t(k). For this same-row case there is no parent index
+                // entry yet, so reusing the coerced probe would invent a match
+                // that SQLite rejects.
+                let mismatch = program.allocate_label();
+                for (i, &child_pos) in fk_ref.child_pos.iter().enumerate() {
+                    let child_reg = if child_tbl.columns()[child_pos].is_rowid_alias() {
+                        new_rowid_reg
+                    } else {
+                        layout.to_register(new_start_reg, child_pos)
+                    };
+                    let parent_pos = fk_ref.parent_pos[i];
+                    let parent_reg = if child_tbl.columns()[parent_pos].is_rowid_alias() {
+                        new_rowid_reg
+                    } else {
+                        layout.to_register(new_start_reg, parent_pos)
+                    };
+                    program.emit_insn(Insn::Ne {
+                        lhs: child_reg,
+                        rhs: parent_reg,
+                        target_pc: mismatch,
+                        flags: CmpInsFlags::default().jump_if_null(),
+                        // Keep this as BINARY. Even with
+                        // `k TEXT COLLATE NOCASE UNIQUE, pk TEXT REFERENCES t(k)`,
+                        // SQLite rejects same-row INSERT `(k, pk)=('A', 'a')`;
+                        // NOCASE applies to the later parent-index lookup only.
+                        collation: Some(super::collate::CollationSeq::Binary),
+                    });
+                }
+                // All equal: same-row OK
+                program.emit_insn(Insn::Goto { target_pc: fk_ok });
+                program.preassign_label_to_next_insn(mismatch);
+            }
+
+            let icur = open_read_index(program, idx, database_id);
 
             // Build NEW child probe from child NEW values, apply parent-index affinities.
             let probe = {
@@ -4031,53 +4081,6 @@ pub fn emit_fk_child_insert_checks(
                 }
                 start
             };
-            if is_self_ref {
-                // Determine the parent column order to compare against:
-                let parent_cols: Vec<&str> =
-                    idx.columns.iter().map(|ic| ic.name.as_str()).collect();
-
-                // Build new parent-key image from this same row’s new values, in the index order.
-                let parent_new = program.alloc_registers(ncols);
-                for (i, pname) in parent_cols.iter().enumerate() {
-                    let (pos, col) = child_tbl.get_column(pname).unwrap();
-                    program.emit_insn(Insn::Copy {
-                        src_reg: if col.is_rowid_alias() {
-                            new_rowid_reg
-                        } else {
-                            new_start_reg + pos
-                        },
-                        dst_reg: parent_new + i,
-                        extra_amount: 0,
-                    });
-                }
-                if let Some(cnt) = NonZeroUsize::new(ncols) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: parent_new,
-                        count: cnt,
-                        affinities: build_index_affinity_string(idx, &parent_tbl),
-                    });
-                }
-
-                // Compare child probe to NEW parent image column-by-column.
-                let mismatch = program.allocate_label();
-                for i in 0..ncols {
-                    let cont = program.allocate_label();
-                    program.emit_insn(Insn::Eq {
-                        lhs: probe + i,
-                        rhs: parent_new + i,
-                        target_pc: cont,
-                        flags: CmpInsFlags::default().jump_if_null(),
-                        collation: Some(super::collate::CollationSeq::Binary),
-                    });
-                    program.emit_insn(Insn::Goto {
-                        target_pc: mismatch,
-                    });
-                    program.preassign_label_to_next_insn(cont);
-                }
-                // All equal: same-row OK
-                program.emit_insn(Insn::Goto { target_pc: fk_ok });
-                program.preassign_label_to_next_insn(mismatch);
-            }
             index_probe(
                 program,
                 icur,

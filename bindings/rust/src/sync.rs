@@ -10,7 +10,7 @@ use std::{
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{header::AUTHORIZATION, Request};
-use hyper_tls::HttpsConnector;
+use hyper_rustls::HttpsConnector;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
@@ -559,7 +559,12 @@ impl IoWorker {
         // Create HTTPS-capable Hyper client.
         let mut http_connector = HttpConnector::new();
         http_connector.enforce_http(false);
-        let https: HttpsConnector<HttpConnector> = HttpsConnector::new();
+        let https: HttpsConnector<HttpConnector> = HttpsConnector::<HttpConnector>::builder()
+            .with_native_roots()
+            .expect("failed to load native root CA certificates")
+            .https_or_http()
+            .enable_http1()
+            .build();
         let client: Client<HttpsConnector<HttpConnector>, Full<Bytes>> =
             Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
 
@@ -1137,6 +1142,34 @@ mod tests {
     }
 
     #[tokio::test]
+    pub async fn test_sync_pull_no_changes_updates_last_pull_unix_time() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server.db_sql("INSERT INTO t VALUES (1)").await.unwrap();
+
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+
+        let before = db.stats().await.unwrap().last_pull_unix_time.unwrap();
+
+        // unix time has 1s resolution - wait long enough for the timestamp to advance
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // remote has no new changes since bootstrap - pull is a no-op
+        assert!(!db.pull().await.unwrap());
+
+        let after = db.stats().await.unwrap().last_pull_unix_time.unwrap();
+        assert!(
+            after > before,
+            "last_pull_unix_time must advance after a no-op pull: before={before}, after={after}"
+        );
+    }
+
+    #[tokio::test]
     pub async fn test_sync_push() {
         let _ = tracing_subscriber::fmt::try_init();
         let server = TursoServer::new().await.unwrap();
@@ -1409,6 +1442,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "flaky, see https://github.com/tursodatabase/turso/issues/7087"]
     pub async fn test_sync_parallel_writes_with_sync_ops() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;

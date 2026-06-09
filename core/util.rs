@@ -120,8 +120,8 @@ const QUOTE_PAIRS: &[(char, char)] = &[
 
 pub fn normalize_ident(identifier: &str) -> String {
     // quotes normalization already happened in the parser layer (see Name ast node implementation)
-    // so, we only need to convert identifier string to lowercase
-    identifier.to_lowercase()
+    // so, we only need to apply SQLite's ASCII-only identifier case folding.
+    identifier.to_ascii_lowercase()
 }
 
 /// Escape a SQL string literal payload for safe interpolation inside single quotes.
@@ -350,6 +350,8 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
         (Literal::Blob(b1), Literal::Blob(b2)) => b1 == b2,
         (Literal::Keyword(k1), Literal::Keyword(k2)) => check_ident_equivalency(k1, k2),
         (Literal::Null, Literal::Null) => true,
+        (Literal::True, Literal::True) => true,
+        (Literal::False, Literal::False) => true,
         (Literal::CurrentDate, Literal::CurrentDate) => true,
         (Literal::CurrentTime, Literal::CurrentTime) => true,
         (Literal::CurrentTimestamp, Literal::CurrentTimestamp) => true,
@@ -449,6 +451,7 @@ pub fn try_substitute_parameters(
             distinctness,
             args,
             order_by,
+            within_group,
             filter_over,
         } => {
             let mut substituted = Vec::new();
@@ -460,6 +463,7 @@ pub fn try_substitute_parameters(
                 distinctness: *distinctness,
                 name: name.clone(),
                 order_by: order_by.clone(),
+                within_group: within_group.clone(),
                 filter_over: filter_over.clone(),
             }))
         }
@@ -485,6 +489,7 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
                 distinctness: distinct1,
                 args: args1,
                 order_by: order1,
+                within_group: within1,
                 filter_over: filter1,
             },
             Expr::FunctionCall {
@@ -492,6 +497,7 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
                 distinctness: distinct2,
                 args: args2,
                 order_by: order2,
+                within_group: within2,
                 filter_over: filter2,
             },
         ) => {
@@ -502,6 +508,9 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
                 return None;
             }
             if !order1.is_empty() || !order2.is_empty() {
+                return None;
+            }
+            if !within1.is_empty() || !within2.is_empty() {
                 return None;
             }
             if filter1.filter_clause.is_some() || filter1.over_clause.is_some() {
@@ -586,6 +595,7 @@ pub fn try_capture_parameters_column_agnostic(
             distinctness: pattern_distinct,
             args: pattern_args,
             order_by: pattern_order,
+            within_group: pattern_within,
             filter_over: pattern_filter,
         },
         Expr::FunctionCall {
@@ -593,6 +603,7 @@ pub fn try_capture_parameters_column_agnostic(
             distinctness: query_distinct,
             args: query_args,
             order_by: query_order,
+            within_group: query_within,
             filter_over: query_filter,
         },
     ) = (pattern, query)
@@ -617,6 +628,10 @@ pub fn try_capture_parameters_column_agnostic(
     }
     // ORDER BY within function not supported
     if !pattern_order.is_empty() || !query_order.is_empty() {
+        return None;
+    }
+    // WITHIN GROUP not supported
+    if !pattern_within.is_empty() || !query_within.is_empty() {
         return None;
     }
 
@@ -647,7 +662,7 @@ pub fn try_capture_parameters_column_agnostic(
                 continue;
             }
             if exprs_are_equivalent(pattern_col, query_col) {
-                matched_pattern_indices.set(i);
+                matched_pattern_indices.set(i).expect("TODO: alloc error");
                 found_match = true;
                 break;
             }
@@ -748,6 +763,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 distinctness: distinct1,
                 args: args1,
                 order_by: order1,
+                within_group: within1,
                 filter_over: filter1,
             },
             Expr::FunctionCall {
@@ -755,6 +771,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 distinctness: distinct2,
                 args: args2,
                 order_by: order2,
+                within_group: within2,
                 filter_over: filter2,
             },
         ) => {
@@ -762,6 +779,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 && distinct1 == distinct2
                 && args1 == args2
                 && order1 == order2
+                && within1 == within2
                 && filter1 == filter2
         }
         (
@@ -4763,7 +4781,9 @@ pub mod tests {
     fn test_normalize_ident() {
         assert_eq!(normalize_ident("foo"), "foo");
         assert_eq!(normalize_ident("FOO"), "foo");
-        assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὀδυσσεύς");
+        // SQLite folds only ASCII; non-ASCII bytes pass through untouched.
+        assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὈΔΥΣΣΕΎΣ");
+        assert_eq!(normalize_ident("Foo_ΔΥΣ"), "foo_ΔΥΣ");
     }
 
     fn schema_with_tables(create_table_sqls: &[&str]) -> Schema {
@@ -4978,8 +4998,7 @@ pub mod tests {
 
     #[test]
     fn test_rewrite_trigger_cmd_table_refs_expr_subquery_branch() {
-        let sql =
-            "CREATE TEMP TRIGGER trg AFTER INSERT ON temp.old BEGIN SELECT EXISTS(SELECT 1 FROM temp.old); END";
+        let sql = "CREATE TEMP TRIGGER trg AFTER INSERT ON temp.old BEGIN SELECT EXISTS(SELECT 1 FROM temp.old); END";
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser
             .next_cmd()
@@ -5246,6 +5265,7 @@ pub mod tests {
             distinctness: None,
             args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
+            within_group: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -5256,6 +5276,7 @@ pub mod tests {
             distinctness: None,
             args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
+            within_group: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -5268,6 +5289,7 @@ pub mod tests {
             distinctness: Some(ast::Distinctness::Distinct),
             args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
+            within_group: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -5283,6 +5305,7 @@ pub mod tests {
             distinctness: None,
             args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
+            within_group: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -5293,6 +5316,7 @@ pub mod tests {
             distinctness: Some(ast::Distinctness::Distinct),
             args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
+            within_group: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
                 over_clause: None,

@@ -40,6 +40,7 @@ use crate::storage::sqlite3_ondisk::{
     write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
 use crate::types::{IOCompletions, IOResult};
+use crate::util::IOExt as _;
 use crate::{
     bail_corrupt_error, io_yield_one, Buffer, Completion, CompletionError, IOContext, LimboError,
     Result,
@@ -2690,6 +2691,23 @@ pub struct WalSharedRuntime {
     pub overflow_fallback_coverage: Arc<SpinLock<OverflowFallbackCoverage>>,
 }
 
+/// Drivable result of [`WalFileShared::open_shared_if_exists_begin`]. Either an
+/// immediate no-op WAL (readonly, file absent) or an in-progress recovery scan
+/// to be pumped via [`OpenSharedWal::poll`] until it returns `Done`.
+pub enum OpenSharedWal {
+    Noop(Arc<RwLock<WalFileShared>>),
+    Build(sqlite3_ondisk::BuildSharedWal),
+}
+
+impl OpenSharedWal {
+    pub fn poll(&mut self) -> Result<IOResult<Arc<RwLock<WalFileShared>>>> {
+        match self {
+            OpenSharedWal::Noop(wal) => Ok(IOResult::Done(wal.clone())),
+            OpenSharedWal::Build(driver) => driver.poll(),
+        }
+    }
+}
+
 /// WalFileShared holds process-wide WAL metadata plus process-local coordination state.
 pub struct WalFileShared {
     pub metadata: WalSharedMetadata,
@@ -3156,7 +3174,7 @@ impl Wal for WalFile {
                 // Return BusySnapshot instead of Busy so the caller knows it must
                 // restart the read transaction to get a fresh snapshot.
                 // Retrying with busy_timeout will NEVER HELP.
-                tracing::info!(
+                tracing::debug!(
                     "unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}",
                     self.max_frame.load(Ordering::Acquire),
                     self.load_coordination_snapshot().max_frame
@@ -3699,7 +3717,7 @@ impl Wal for WalFile {
     ) -> Result<IOResult<CheckpointResult>> {
         self.checkpoint_inner(pager, mode, CheckpointLockSource::Acquire)
             .inspect_err(|e| {
-                tracing::info!("Wal Checkpoint failed: {e}");
+                tracing::debug!("WAL checkpoint failed: {e}");
                 let _ = self.checkpoint_guard.write().take();
                 self.ongoing_checkpoint.write().state = CheckpointState::Start;
             })
@@ -3717,7 +3735,7 @@ impl Wal for WalFile {
             CheckpointLockSource::HeldByCaller,
         )
         .inspect_err(|e| {
-            tracing::info!("Wal Checkpoint failed: {e}");
+            tracing::debug!("WAL checkpoint failed: {e}");
             let _ = self.checkpoint_guard.write().take();
             self.ongoing_checkpoint.write().state = CheckpointState::Start;
         })
@@ -3749,7 +3767,7 @@ impl Wal for WalFile {
         let completion = Completion::new_sync(move |result| {
             tracing::debug!("wal_sync finish");
             if let Err(err) = result {
-                tracing::info!("wal_sync failed: {err}");
+                tracing::debug!("wal_sync failed: {err}");
             }
             syncing.store(false, Ordering::Release);
         });
@@ -3986,8 +4004,14 @@ impl Wal for WalFile {
         let file = self.coordination.wal_file()?;
         let coordination = self.coordination.clone();
         let c = file.sync(
-            Completion::new_sync(move |_| {
-                coordination.mark_initialized();
+            Completion::new_sync(move |res| {
+                // Only mark the WAL header durable once its sync has actually
+                // succeeded. A failed sync must leave the WAL uninitialized so
+                // the header is re-issued before the next append, keeping the
+                // in-memory initialized state consistent with what is on disk.
+                if res.is_ok() {
+                    coordination.mark_initialized();
+                }
             }),
             sync_type,
         )?;
@@ -4412,7 +4436,7 @@ impl WalFile {
 
     fn increment_checkpoint_epoch(&self) {
         let prev = self.coordination.bump_checkpoint_epoch();
-        tracing::info!("increment checkpoint epoch: prev={}", prev);
+        tracing::debug!("increment checkpoint epoch: prev={}", prev);
     }
 
     fn complete_append_frame(&self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
@@ -4456,7 +4480,7 @@ impl WalFile {
                     let snapshot = self.load_coordination_snapshot();
                     let max_frame = snapshot.max_frame;
                     let nbackfills = snapshot.nbackfills;
-                    tracing::info!("shared_wal: max_frame={max_frame}, nbackfills={nbackfills}");
+                    tracing::debug!("shared_wal: max_frame={max_frame}, nbackfills={nbackfills}");
                     let needs_backfill = max_frame > nbackfills;
                     if matches!(lock_source, CheckpointLockSource::HeldByCaller) {
                         turso_assert!(
@@ -4481,7 +4505,7 @@ impl WalFile {
                     } = mode
                     {
                         if max_frame > upper_bound {
-                            tracing::info!(
+                            tracing::debug!(
                                 "abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}"
                             );
                             return Err(LimboError::Busy);
@@ -4510,7 +4534,7 @@ impl WalFile {
                             ..self.load_coordination_snapshot()
                         },
                     )?;
-                    tracing::info!(
+                    tracing::debug!(
                         "checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}"
                     );
                     let mut to_checkpoint = self
@@ -4667,7 +4691,7 @@ impl WalFile {
                         wal_total_backfilled,
                         wal_checkpoint_backfilled,
                     );
-                    tracing::info!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
+                    tracing::debug!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
                         return Err(LimboError::Busy);
                     }
@@ -4709,7 +4733,7 @@ impl WalFile {
                     // increment wal epoch to ensure no stale pages are used for backfilling
                     self.increment_checkpoint_epoch();
 
-                    tracing::info!("checkpoint_result={:?}", checkpoint_result);
+                    tracing::debug!("checkpoint_result={:?}", checkpoint_result);
                     // we cannot truncate the db file here because we are currently inside a
                     // mut borrow of pager.wal, and accessing the header will attempt a borrow
                     // during 'read_page', so the caller will use the result to determine if:
@@ -4823,7 +4847,7 @@ impl WalFile {
     }
 
     fn restart_log(&self) -> Result<()> {
-        tracing::info!("restart_log");
+        tracing::debug!("restart_log");
         let snapshot = self.coordination.begin_restart(self.io.as_ref())?;
         self.apply_restart_snapshot(snapshot);
         Ok(())
@@ -4841,7 +4865,7 @@ impl WalFile {
             let c = Completion::new_trunc({
                 move |res| {
                     if let Err(err) = res {
-                        tracing::info!("WAL truncate failed: {err}")
+                        tracing::debug!("WAL truncate failed: {err}")
                     } else {
                         tracing::trace!("WAL file truncated to 0 B");
                     }
@@ -4857,7 +4881,7 @@ impl WalFile {
             let c = file.sync(
                 Completion::new_sync(move |res| {
                     if let Err(err) = res {
-                        tracing::info!("WAL sync failed: {err}")
+                        tracing::debug!("WAL sync failed: {err}")
                     } else {
                         tracing::trace!("WAL file synced after truncation");
                     }
@@ -5370,6 +5394,18 @@ impl WalFileShared {
         path: &str,
         flags: crate::OpenFlags,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
+        let mut driver = Self::open_shared_if_exists_begin(io, path, flags)?;
+        io.block(|| driver.poll())
+    }
+
+    /// Non-blocking entry point for [`WalFileShared::open_shared_if_exists`].
+    /// Performs only the synchronous file open (and readonly/NotFound noop
+    /// handling); the WAL recovery scan is driven via [`OpenSharedWal::poll`].
+    pub fn open_shared_if_exists_begin(
+        io: &Arc<dyn IO>,
+        path: &str,
+        flags: crate::OpenFlags,
+    ) -> Result<OpenSharedWal> {
         let file = match io.open_file(path, flags, false) {
             Ok(file) => file,
             Err(LimboError::CompletionError(CompletionError::IOError(
@@ -5378,18 +5414,13 @@ impl WalFileShared {
             ))) if flags.contains(crate::OpenFlags::ReadOnly) => {
                 // In readonly mode, if the WAL file doesn't exist, we just return a noop WAL
                 // since there's nothing to read from.
-                return Ok(WalFileShared::new_noop());
+                return Ok(OpenSharedWal::Noop(WalFileShared::new_noop()));
             }
             Err(e) => return Err(e),
         };
-        let wal_file_shared = sqlite3_ondisk::build_shared_wal(&file, io)?;
-        turso_assert!(
-            wal_file_shared
-                .try_read()
-                .is_some_and(|wfs| wfs.metadata.loaded.load(Ordering::Acquire)),
-            "Unable to read WAL shared state"
-        );
-        Ok(wal_file_shared)
+        Ok(OpenSharedWal::Build(sqlite3_ondisk::BuildSharedWal::begin(
+            &file,
+        )?))
     }
 
     pub fn is_initialized(&self) -> Result<bool> {
@@ -5702,7 +5733,7 @@ pub mod test {
 
         assert_eq!(pager.wal_state().unwrap().max_frame, 0);
 
-        tracing::info!("wal filepath: {walpath:?}, size: {}", stat.len());
+        tracing::debug!("wal filepath: {walpath:?}, size: {}", stat.len());
         let meta_after = std::fs::metadata(&walpath).unwrap();
         let bytes_after = meta_after.len();
         assert_ne!(

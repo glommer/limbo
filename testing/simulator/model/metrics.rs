@@ -26,7 +26,7 @@ pub struct Remaining {
     pub drop_sequence: u32,
     pub nextval: u32,
     pub setval: u32,
-    pub sequence_names: Vec<String>,
+    pub sequence_info: Vec<(String, i64, i64)>,
 }
 
 impl Remaining {
@@ -36,7 +36,7 @@ impl Remaining {
         stats: &InteractionStats,
         mvcc: bool,
         context: &impl GenerationContext,
-        sequence_names: Vec<String>,
+        sequence_info: Vec<(String, i64, i64)>,
     ) -> Remaining {
         let total_weight = opts.total_weight();
 
@@ -83,7 +83,20 @@ impl Remaining {
             .unwrap_or_default();
 
         let mut remaining_drop_index = total_drop_index
-            .checked_sub(stats.alter_table_count)
+            .checked_sub(stats.drop_index_count)
+            .unwrap_or_default();
+
+        let remaining_create_sequence = total_create_sequence
+            .checked_sub(stats.create_sequence_count)
+            .unwrap_or_default();
+        let mut remaining_nextval = total_nextval
+            .checked_sub(stats.nextval_count)
+            .unwrap_or_default();
+        let mut remaining_setval = total_setval
+            .checked_sub(stats.setval_count)
+            .unwrap_or_default();
+        let mut remaining_drop_sequence = total_drop_sequence
+            .checked_sub(stats.drop_sequence_count)
             .unwrap_or_default();
 
         let remaining_create_sequence = total_create_sequence
@@ -115,7 +128,7 @@ impl Remaining {
         }
 
         // Sequence operations that require existing sequences get weight 0 when none exist
-        if sequence_names.is_empty() {
+        if sequence_info.is_empty() {
             remaining_nextval = 0;
             remaining_setval = 0;
             remaining_drop_sequence = 0;
@@ -136,7 +149,7 @@ impl Remaining {
             drop_sequence: remaining_drop_sequence,
             nextval: remaining_nextval,
             setval: remaining_setval,
-            sequence_names,
+            sequence_info,
         }
     }
 }

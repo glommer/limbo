@@ -541,6 +541,20 @@ impl Database {
         Ok(self.conn()?.total_changes())
     }
 
+    /// Returns whether the connection is currently inside a transaction.
+    ///
+    /// This is the inverse of `sqlite3_get_autocommit()`: a connection in
+    /// autocommit mode is not in a transaction. It reflects the connection's
+    /// real state, including transactions opened with a raw `BEGIN`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if a transaction is open, `false` if in autocommit mode.
+    #[napi]
+    pub fn in_transaction(&self) -> napi::Result<bool> {
+        Ok(!self.conn()?.get_auto_commit())
+    }
+
     /// Closes the database connection.
     ///
     /// # Returns
@@ -604,8 +618,7 @@ impl Database {
                     Stmt::Select(..)
                     | Stmt::Pragma { .. }
                     | Stmt::Attach { .. }
-                    | Stmt::Detach { .. }
-                    | Stmt::Reindex { .. } => "read",
+                    | Stmt::Detach { .. } => "read",
                     Stmt::Begin { .. } | Stmt::Savepoint { .. } => "begin",
                     Stmt::Commit { .. } | Stmt::Release { .. } => "commit",
                     Stmt::Rollback { .. } => "rollback",
@@ -802,7 +815,8 @@ impl Statement {
             .borrow_mut()
             .as_mut()
             .ok_or_else(|| create_generic_error("statement has been finalized"))?
-            .bind_at(non_zero_idx, turso_value);
+            .bind_at(non_zero_idx, turso_value)
+            .map_err(|err| create_generic_error(&err.to_string()))?;
         Ok(())
     }
 
@@ -842,22 +856,32 @@ impl Statement {
                 to_js_value(env, value, safe_integers)?
             }
             PresentationMode::Expanded => {
-                let row = Object::new(env)?;
+                let mut row = Object::new(env)?;
                 let raw_row = row.raw();
                 let raw_env = env.raw();
+                let mut positional_properties = Vec::with_capacity(row_data.len());
                 for idx in 0..row_data.len() {
                     let value = row_data.get_value(idx);
                     let column_name = &self.column_names[idx];
                     let js_value = to_js_value(env, value, safe_integers)?;
-                    unsafe {
+                    check_status!(unsafe {
                         napi::sys::napi_set_named_property(
                             raw_env,
                             raw_row,
                             column_name.as_ptr(),
                             js_value.raw(),
-                        );
-                    }
+                        )
+                    })?;
+                    positional_properties.push(
+                        Property::new()
+                            .with_utf8_name(&idx.to_string())?
+                            .with_value(&js_value)
+                            .with_property_attributes(
+                                PropertyAttributes::Writable | PropertyAttributes::Configurable,
+                            ),
+                    );
                 }
+                row.define_properties(&positional_properties)?;
                 row.to_unknown()
             }
         };

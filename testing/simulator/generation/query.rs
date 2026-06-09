@@ -126,15 +126,19 @@ fn random_drop_index<R: rand::Rng + ?Sized>(
 
 fn random_create_sequence<R: rand::Rng + ?Sized>(rng: &mut R) -> Query {
     let name = format!("seq_{}", rng.random_range(0..10000u32));
-    let increment = *[1, 2, 5, 10].choose(rng).unwrap();
-    let start = rng.random_range(1..100i64);
+    let increment = *[1i64, 2, 5, 10, -1, -2, -5].choose(rng).unwrap();
     let cycle = rng.random_bool(0.1);
+    let (start, min_value, max_value) = if increment > 0 {
+        (rng.random_range(1..100i64), 1, i64::MAX)
+    } else {
+        (rng.random_range(-100..-1i64), i64::MIN + 1, -1)
+    };
     Query::CreateSequence(CreateSequence {
         name,
         start,
         increment,
-        min_value: 1,
-        max_value: i64::MAX,
+        min_value,
+        max_value,
         cycle,
     })
 }
@@ -151,13 +155,16 @@ fn random_drop_sequence<R: rand::Rng + ?Sized>(rng: &mut R, sequence_names: &[St
     Query::DropSequence(DropSequence { name })
 }
 
-fn random_setval<R: rand::Rng + ?Sized>(rng: &mut R, sequence_names: &[String]) -> Query {
-    assert!(!sequence_names.is_empty());
-    let name = sequence_names.choose(rng).unwrap().clone();
-    let value = rng.random_range(1..1000i64);
+fn random_setval<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    sequence_info: &[(String, i64, i64)],
+) -> Query {
+    assert!(!sequence_info.is_empty());
+    let (name, min_value, max_value) = sequence_info.choose(rng).unwrap();
+    let value = rng.random_range(*min_value..=*max_value);
     let is_called = rng.random_bool(0.8);
     Query::Setval(Setval {
-        name,
+        name: name.clone(),
         value,
         is_called,
     })
@@ -254,7 +261,7 @@ pub(super) struct QueryDistribution {
     queries: &'static [QueryDiscriminants],
     query_weights: Vec<u32>,
     weights: WeightedIndex<u32>,
-    sequence_names: Vec<String>,
+    sequence_info: Vec<(String, i64, i64)>,
 }
 
 impl QueryDistribution {
@@ -268,7 +275,7 @@ impl QueryDistribution {
             queries,
             query_weights,
             weights,
-            sequence_names: remaining.sequence_names.clone(),
+            sequence_info: remaining.sequence_info.clone(),
         }
     }
 
@@ -301,12 +308,26 @@ impl WeightedDistribution for QueryDistribution {
         let idx = self.weights.sample(rng);
         let discriminant = self.queries[idx];
 
-        // Sequence queries are handled specially since they need sequence_names
+        // Sequence queries are handled specially since they need sequence info
         match discriminant {
             QueryDiscriminants::CreateSequence => random_create_sequence(rng),
-            QueryDiscriminants::Nextval => random_nextval(rng, &self.sequence_names),
-            QueryDiscriminants::DropSequence => random_drop_sequence(rng, &self.sequence_names),
-            QueryDiscriminants::Setval => random_setval(rng, &self.sequence_names),
+            QueryDiscriminants::Nextval => {
+                let names: Vec<String> = self
+                    .sequence_info
+                    .iter()
+                    .map(|(n, _, _)| n.clone())
+                    .collect();
+                random_nextval(rng, &names)
+            }
+            QueryDiscriminants::DropSequence => {
+                let names: Vec<String> = self
+                    .sequence_info
+                    .iter()
+                    .map(|(n, _, _)| n.clone())
+                    .collect();
+                random_drop_sequence(rng, &names)
+            }
+            QueryDiscriminants::Setval => random_setval(rng, &self.sequence_info),
             _ => {
                 let query_fn = discriminant
                     .gen_function()

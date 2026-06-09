@@ -57,7 +57,7 @@ use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
-use index::{translate_create_index, translate_drop_index, translate_optimize};
+use index::{translate_create_index, translate_drop_index, translate_optimize, translate_reindex};
 use insert::translate_insert;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
@@ -156,7 +156,6 @@ pub fn translate_inner(
             | ast::Stmt::DropType { .. }
             | ast::Stmt::DropDomain { .. }
             | ast::Stmt::DropView { .. }
-            | ast::Stmt::Reindex { .. }
             | ast::Stmt::Optimize { .. }
             | ast::Stmt::Update { .. }
             | ast::Stmt::Insert { .. }
@@ -360,7 +359,7 @@ pub fn translate_inner(
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
-        ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
+        ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection)?,
         ast::Stmt::Optimize { idx_name } => {
             translate_optimize(idx_name, resolver, program, connection)?
         }
@@ -415,7 +414,6 @@ pub fn translate_inner(
             increment,
             min_value,
             max_value,
-            cache,
             cycle,
         } => {
             sequence::translate_create_sequence(
@@ -425,7 +423,6 @@ pub fn translate_inner(
                 &increment,
                 &min_value,
                 &max_value,
-                &cache,
                 cycle,
                 resolver,
                 program,
@@ -444,12 +441,12 @@ pub fn translate_inner(
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction
     if is_write {
-        program.begin_write_operation();
+        program.begin_write_operation()?;
     }
 
     // Indicate read operations so that in the epilogue we can emit the correct type of transaction
     if is_select && !program.table_references.is_empty() {
-        program.begin_read_operation();
+        program.begin_read_operation()?;
     }
 
     Ok(())

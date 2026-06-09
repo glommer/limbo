@@ -1,9 +1,7 @@
 use crate::common::{ExecRows, TempDatabase};
 use std::path::Path;
 use std::sync::Arc;
-use turso_core::{
-    Database, DatabaseOpts, EncryptionKey, EncryptionOpts, LimboError, OpenFlags, StepResult,
-};
+use turso_core::{Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, StepResult};
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
 /// This is needed because ATTACH requires the attached DB's journal mode
@@ -45,9 +43,27 @@ impl RecordingDurableStorage {
 }
 
 impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableStorage {
+    fn serialize_row_version(
+        &self,
+        log_record: &mut turso_core::mvcc::database::LogRecord,
+        row_version: &turso_core::mvcc::database::RowVersion,
+        portable_extension: Option<&[u8]>,
+    ) -> turso_core::Result<()> {
+        self.inner
+            .serialize_row_version(log_record, row_version, portable_extension)
+    }
+
+    fn serialize_database_header(
+        &self,
+        log_record: &mut turso_core::mvcc::database::LogRecord,
+        header: &turso_core::storage::sqlite3_ondisk::DatabaseHeader,
+    ) -> turso_core::Result<()> {
+        self.inner.serialize_database_header(log_record, header)
+    }
+
     fn log_tx(
         &self,
-        m: &turso_core::mvcc::database::LogRecord,
+        m: turso_core::mvcc::database::LogRecord,
         on_serialization_complete: Option<&dyn Fn(&[u8], u32) -> turso_core::Result<()>>,
     ) -> turso_core::Result<(turso_core::Completion, u64)> {
         self.used_log_tx
@@ -70,8 +86,16 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.truncate()
     }
 
+    fn reset_to_fresh_header(&self) -> turso_core::Result<turso_core::Completion> {
+        self.inner.reset_to_fresh_header()
+    }
+
     fn get_logical_log_file(&self) -> Arc<dyn turso_core::File> {
         self.inner.get_logical_log_file()
+    }
+
+    fn logical_log_offset(&self) -> u64 {
+        self.inner.logical_log_offset()
     }
 
     fn should_checkpoint(&self) -> bool {
@@ -86,8 +110,19 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.checkpoint_threshold()
     }
 
-    fn advance_logical_log_offset_after_success(&self, bytes: u64) {
+    fn upgrade_header_for_log_tx(
+        &self,
+        m: &turso_core::mvcc::database::LogRecord,
+    ) -> turso_core::Result<Option<turso_core::Completion>> {
+        self.inner.upgrade_header_for_log_tx(m)
+    }
+
+    fn advance_logical_log_offset_after_success(&self, bytes: u64) -> turso_core::Result<()> {
         self.inner.advance_logical_log_offset_after_success(bytes)
+    }
+
+    fn discard_pending_log_write(&self) -> turso_core::Result<()> {
+        self.inner.discard_pending_log_write()
     }
 
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {
@@ -171,48 +206,6 @@ fn test_mvcc_custom_durable_storage_injected(tmp_db: TempDatabase) -> anyhow::Re
     );
 
     conn.close()?;
-    Ok(())
-}
-
-#[turso_macros::test]
-fn test_mvcc_custom_durable_storage_rejects_encrypted_mode(
-    tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
-    let db_path = tmp_db
-        .path
-        .with_extension("custom_durable_storage_encrypted.db");
-    let log_path = db_path.with_extension("db-log");
-    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-
-    let file = tmp_db
-        .io
-        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)?;
-    let default_storage: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage> = Arc::new(
-        turso_core::mvcc::persistent_storage::Storage::new(file, tmp_db.io.clone(), None),
-    );
-    let recording = Arc::new(RecordingDurableStorage::new(default_storage));
-
-    let db = Database::open_file_with_flags_and_durable_storage(
-        tmp_db.io.clone(),
-        db_path.to_str().unwrap(),
-        OpenFlags::default(),
-        DatabaseOpts::new().with_encryption(true),
-        Some(EncryptionOpts {
-            cipher: "aes256gcm".to_string(),
-            hexkey: hex_key.to_string(),
-        }),
-        Some(recording),
-    )?;
-    let key = EncryptionKey::from_hex_string(hex_key)?;
-    let conn = db.connect_with_encryption(Some(key))?;
-
-    let err = conn.pragma_update("journal_mode", "'mvcc'").unwrap_err();
-    assert!(matches!(
-        err,
-        LimboError::InvalidArgument(message)
-            if message == "encrypted MVCC is not supported with custom DurableStorage"
-    ));
-
     Ok(())
 }
 
@@ -1002,6 +995,217 @@ fn test_create_drop_index_same_tx_recover(db: TempDatabase) -> anyhow::Result<()
     drop(db);
 
     Database::open_file(io, path.to_str().unwrap())?;
+
+    Ok(())
+}
+
+/// CREATE TABLE followed by RENAME in the same transaction creates and deletes
+/// a schema row for a B-tree id that still survives under a new schema row.
+/// Rows for the surviving table must remain durable after recovery.
+#[turso_macros::test]
+fn test_create_rename_insert_same_tx_recover_then_checkpoint(
+    db: TempDatabase,
+) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.execute("pragma journal_mode = 'mvcc'")?;
+
+        conn.execute("begin")?;
+        conn.execute("create table t(id integer primary key, v text)")?;
+        conn.execute("alter table t rename to t2")?;
+        conn.execute("insert into t2 values (1, 'one'), (2, 'two')")?;
+        conn.execute("commit")?;
+    }
+    drop(db);
+
+    {
+        let db = Database::open_file(io.clone(), path.to_str().unwrap())?;
+        let conn = db.connect()?;
+        let rows: Vec<(i64, String)> = conn.exec_rows("select id, v from t2 order by id");
+        assert_eq!(rows, vec![(1, "one".to_string()), (2, "two".to_string())]);
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    }
+
+    let db = Database::open_file(io, path.to_str().unwrap())?;
+    let conn = db.connect()?;
+    let rows: Vec<(i64, String)> = conn.exec_rows("select id, v from t2 order by id");
+    assert_eq!(rows, vec![(1, "one".to_string()), (2, "two".to_string())]);
+
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum TransientIndexTiming {
+    None,
+    BeforeRowChanges,
+    AfterTransientInserts,
+    AfterDeletes,
+}
+
+impl TransientIndexTiming {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::None => "no_idx",
+            Self::BeforeRowChanges => "idx_before",
+            Self::AfterTransientInserts => "idx_after_inserts",
+            Self::AfterDeletes => "idx_after_deletes",
+        }
+    }
+}
+
+/// Deterministic matrix for same-transaction row and transient-index effects.
+/// Each case is recovered and then checkpointed so logical-log replay and
+/// B-tree persistence both see the same net state.
+#[turso_macros::test]
+fn test_mvcc_same_tx_row_and_index_lifecycle_matrix(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.pragma_update("journal_mode", "'mvcc'")?;
+    }
+    drop(db);
+
+    let index_timings = [
+        TransientIndexTiming::None,
+        TransientIndexTiming::BeforeRowChanges,
+        TransientIndexTiming::AfterTransientInserts,
+        TransientIndexTiming::AfterDeletes,
+    ];
+    let mut case_id = 0;
+
+    for transient_rows in [false, true] {
+        for update_delete_existing in [false, true] {
+            for index_timing in index_timings {
+                case_id += 1;
+                let table = format!(
+                    "mvcc_same_tx_{}_{}_{}",
+                    if transient_rows {
+                        "transient"
+                    } else {
+                        "stable"
+                    },
+                    if update_delete_existing {
+                        "delete_existing"
+                    } else {
+                        "keep_existing"
+                    },
+                    index_timing.suffix()
+                );
+                let base_index = format!("{table}_base_idx");
+                let transient_index = format!("{table}_tmp_idx");
+                let label = format!(
+                    "case {case_id}: transient_rows={transient_rows}, update_delete_existing={update_delete_existing}, index_timing={}",
+                    index_timing.suffix()
+                );
+
+                {
+                    let db = Database::open_file(io.clone(), path.to_str().unwrap())?;
+                    let conn = db.connect()?;
+                    conn.pragma_update("journal_mode", "'mvcc'")?;
+                    conn.execute(format!(
+                        "CREATE TABLE {table}(id INTEGER PRIMARY KEY, v TEXT)"
+                    ))?;
+                    conn.execute(format!(
+                        "INSERT INTO {table} VALUES (1, 'original'), (2, 'keep')"
+                    ))?;
+                    conn.execute(format!("CREATE INDEX {base_index} ON {table}(v)"))?;
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                }
+
+                {
+                    let db = Database::open_file(io.clone(), path.to_str().unwrap())?;
+                    let conn = db.connect()?;
+                    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+                    let create_drop_transient_index = || -> anyhow::Result<()> {
+                        conn.execute(format!("CREATE INDEX {transient_index} ON {table}(v)"))?;
+                        conn.execute(format!("DROP INDEX {transient_index}"))?;
+                        Ok(())
+                    };
+
+                    conn.execute("BEGIN")?;
+                    if matches!(index_timing, TransientIndexTiming::BeforeRowChanges) {
+                        create_drop_transient_index()?;
+                    }
+                    if transient_rows {
+                        conn.execute(format!(
+                            "INSERT INTO {table} VALUES (10, 'temp_10'), (11, 'temp_11')"
+                        ))?;
+                    }
+                    if matches!(index_timing, TransientIndexTiming::AfterTransientInserts) {
+                        create_drop_transient_index()?;
+                    }
+                    if update_delete_existing {
+                        conn.execute(format!("UPDATE {table} SET v = 'updated' WHERE id = 1"))?;
+                        conn.execute(format!("DELETE FROM {table} WHERE id = 1"))?;
+                    }
+                    if transient_rows {
+                        conn.execute(format!("DELETE FROM {table} WHERE id IN (10, 11)"))?;
+                    }
+                    if matches!(index_timing, TransientIndexTiming::AfterDeletes) {
+                        create_drop_transient_index()?;
+                    }
+                    conn.execute("COMMIT")?;
+                }
+
+                for checkpoint_after_recovery in [true, false] {
+                    let db = Database::open_file(io.clone(), path.to_str().unwrap())?;
+                    let conn = db.connect()?;
+
+                    let rows_sql = format!("SELECT id, v FROM {table} ORDER BY id");
+                    let rows: Vec<(i64, String)> = conn.exec_rows(&rows_sql);
+                    let expected_rows = if update_delete_existing {
+                        vec![(2, "keep".to_string())]
+                    } else {
+                        vec![(1, "original".to_string()), (2, "keep".to_string())]
+                    };
+                    assert_eq!(rows, expected_rows, "{label}");
+
+                    let index_names_sql = format!(
+                        "SELECT name FROM sqlite_schema \
+                         WHERE type = 'index' AND tbl_name = '{table}' ORDER BY name"
+                    );
+                    let index_names: Vec<(String,)> = conn.exec_rows(&index_names_sql);
+                    assert_eq!(index_names, vec![(base_index.clone(),)], "{label}");
+
+                    let original_ids_sql = format!(
+                        "SELECT id FROM {table} INDEXED BY {base_index} \
+                         WHERE v = 'original' ORDER BY id"
+                    );
+                    let original_ids: Vec<(i64,)> = conn.exec_rows(&original_ids_sql);
+                    let expected_original_ids = if update_delete_existing {
+                        Vec::new()
+                    } else {
+                        vec![(1,)]
+                    };
+                    assert_eq!(original_ids, expected_original_ids, "{label}");
+
+                    let updated_ids_sql = format!(
+                        "SELECT id FROM {table} INDEXED BY {base_index} \
+                         WHERE v = 'updated' ORDER BY id"
+                    );
+                    let updated_ids: Vec<(i64,)> = conn.exec_rows(&updated_ids_sql);
+                    assert_eq!(updated_ids, Vec::<(i64,)>::new(), "{label}");
+
+                    let transient_ids_sql = format!(
+                        "SELECT id FROM {table} INDEXED BY {base_index} \
+                         WHERE v IN ('temp_10', 'temp_11') ORDER BY id"
+                    );
+                    let transient_ids: Vec<(i64,)> = conn.exec_rows(&transient_ids_sql);
+                    assert_eq!(transient_ids, Vec::<(i64,)>::new(), "{label}");
+
+                    if checkpoint_after_recovery {
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                    }
+                }
+            }
+        }
+    }
 
     Ok(())
 }

@@ -9,6 +9,7 @@ This document is a quick helper to get you going.
   - [Getting Started](#getting-started)
     - [Configuring `mold` Linker](#configuring-mold-linker)
     - [Running Tests On Linux](#running-tests-on-linux)
+  - [Developing with AI coding agents](#developing-with-ai-coding-agents)
   - [Debugging bugs](#debugging-bugs)
     - [Query execution debugging](#query-execution-debugging)
     - [Stress testing with sanitizers](#stress-testing-with-sanitizers)
@@ -141,6 +142,21 @@ echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 cargo bench --profile bench-profile --bench benchmark -- --profile-time=5
 ```
 
+## Developing with AI coding agents
+
+You're welcome to develop Turso with AI coding agents such as Claude Code, Codex, or OpenCode. Used well, they can help you explore the codebase, draft tests, and polish your contributions. To make the most of them — and to get your PRs merged — keep the following in mind.
+
+We expect you to understand the code you submit. The best AI-assisted contributions come from people who treat the agent as a collaborator, not a substitute: you direct the work, review it critically, and own the result. A PR you can explain and defend is far more valuable than a large one you can't.
+
+To give your PR the best chance of being merged:
+
+* **Keep it small and focused.** Describe the change in your own words, or heavily edit any AI-generated summary so it reads naturally and accurately.
+* **Include regression tests.** Verify that your tests actually FAIL without your changes — this is especially important when the tests are AI-generated.
+* **Contribute in areas you understand.** If you spot a bug in something like the MVCC or b-tree layer but aren't familiar with it, the most helpful thing you can do is file a clear bug report rather than submit an AI-generated fix.
+* **Do a self-review.** LLMs tend to make the same mistakes repeatedly: removing existing comments, adding verbose new ones, writing overly elaborate tests instead of using existing test helpers, etc. Always self-review your code before submitting - make sure it's correct and follows the existing code standards in this repo.
+
+Finally, a well-written bug report with a solid reproducer is often more valuable to maintainers than a sloppy PR. If you're not sure your change is ready, opening an issue is always a great contribution.
+
 ## Debugging bugs
 
 ### Query execution debugging
@@ -184,6 +200,14 @@ cargo run -Zbuild-std --target x86_64-unknown-linux-gnu -p turso_stress -- --vfs
 The issue tracker has issues tagged with [good first issue](https://github.com/tursodatabase/limbo/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22),
 which are considered to be things to work on to get going. If you're interested in working on one of them, comment on the issue tracker, and we're happy to help you get going.
 
+You don't need to ask "can I work on this?" The answer is always yes. Pick something, work on it, and open a pull request. A few things to keep in mind:
+
+* You don't need permission to start. Anyone can work on any open issue at any time.
+* Commenting that you're working on something doesn't reserve it. Someone else may work on the same issue in parallel, so don't assume an issue is yours just because you claimed it.
+* Claiming an issue does not obligate a maintainer to merge your work, and asking to work on something is not a commitment from us to review or accept it. Work gets merged on its merits.
+
+If you want to coordinate or ask for guidance on an approach, that's welcome. Just don't wait for a permission slip before getting started.
+
 ## Submitting your work
 
 Fork the repository and open a pull request to submit your work.
@@ -215,7 +239,7 @@ The purpose of these tests is to verify behavior matches with SQLite and Turso.
 
 1. [Cargo-c](https://github.com/lu-zero/cargo-c) is needed for building C-ABI compatible library. You can get it via:
 ```console
-cargo install cargo-c
+cargo install cargo-c --version 0.10.16 --locked
 ```
 2. [SQLite](https://www.sqlite.org/index.html) is needed for compatibility checking. You can install it using `brew` on macOS/Linux:
 ```console
