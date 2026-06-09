@@ -2350,11 +2350,19 @@ impl Schema {
     }
 
     /// Remove a sequence and its backing table from the in-memory schema.
+    ///
+    /// The backing table lives in `self.tables` under the
+    /// `__turso_internal_seq_<name>` prefix, NOT the bare sequence name —
+    /// using the bare name here was a merge regression that left stale
+    /// entries on DROP SEQUENCE, breaking any subsequent CREATE SEQUENCE
+    /// with the same name (covered by
+    /// `tests/integration/postgres/sequence.rs::test_drop_sequence_reuse_name`
+    /// and the `drop-create-sequence-uses-new-descriptor` sqltest).
     pub fn remove_sequence(&mut self, name: &str) {
         let normalized = normalize_ident(name);
         self.sequences.remove(&normalized);
-        // Also remove the backing table
-        self.tables.remove(&normalized);
+        let backing_table = crate::translate::sequence::sequence_backing_table_name(&normalized);
+        self.tables.remove(&backing_table);
     }
 
     /// Compute all resolved FKs *referencing* `table_name` (arg: `table_name` is the parent).

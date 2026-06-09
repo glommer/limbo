@@ -3641,7 +3641,26 @@ impl PostgreSQLTranslator {
                         // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
                         cycle = extract_def_elem_bool(elem);
                     }
-                    _ => {} // ignore unknown options (including "cache", which Turso doesn't support)
+                    "cache" => {
+                        // Turso's disk-only sequence implementation never
+                        // caches values, so a `CACHE n` clause is otherwise
+                        // a no-op. We still validate the value against the
+                        // PostgreSQL contract (`CACHE` must be >= 1) so
+                        // that `CACHE 0` errors with the same message a
+                        // real PG server would produce. Surfacing the
+                        // requested value through to the runtime would
+                        // require resurrecting per-sequence in-memory
+                        // descriptor state we have intentionally removed
+                        // (see feedback-sequences-disk-only memory).
+                        if let Some(cache) = extract_def_elem_int(elem) {
+                            if cache < 1 {
+                                return Err(ParseError::ParseError(format!(
+                                    "CACHE ({cache}) must be greater than zero"
+                                )));
+                            }
+                        }
+                    }
+                    _ => {} // ignore other unknown options
                 }
             }
         }

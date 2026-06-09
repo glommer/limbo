@@ -8,29 +8,58 @@ fn pg_execute(conn: &Arc<Connection>, sql: &str) {
     conn.execute(sql).unwrap();
 }
 
-/// Helper: query a single integer value from a SELECT
+/// Helper: query a single integer value from a SELECT.
+///
+/// **Must drive the Statement all the way to `Done`** after reading the
+/// row, not just call `step()` once. With Turso's disk-only sequence
+/// design, `nextval`/`setval` execute their backing-table write inline
+/// with the result-row emission; the autocommit transaction only commits
+/// when the program reaches `Halt`. Dropping the Statement after a single
+/// `step()` triggers `reset_internal`'s rollback path (the change counter
+/// isn't set for SELECT-shaped reads), undoing the write — every
+/// subsequent `nextval` then re-emits the same value.
 fn pg_query_int(conn: &Arc<Connection>, sql: &str) -> i64 {
     let mut rows = conn.query(sql).unwrap().unwrap();
     let StepResult::Row = rows.step().unwrap() else {
         panic!("expected row for: {sql}");
     };
-    let row = rows.row().unwrap();
-    match row.get_value(0) {
+    let value = match rows.row().unwrap().get_value(0) {
         Value::Numeric(Numeric::Integer(v)) => *v,
         other => panic!("expected integer, got {other:?} for: {sql}"),
-    }
+    };
+    drain_to_done(&mut rows, sql);
+    value
 }
 
-/// Helper: query a single text value
+/// Helper: query a single text value. Same draining contract as
+/// [`pg_query_int`] — see its docstring for why we must run to `Done`.
 fn pg_query_text(conn: &Arc<Connection>, sql: &str) -> String {
     let mut rows = conn.query(sql).unwrap().unwrap();
     let StepResult::Row = rows.step().unwrap() else {
         panic!("expected row for: {sql}");
     };
-    let row = rows.row().unwrap();
-    match row.get_value(0) {
+    let value = match rows.row().unwrap().get_value(0) {
         Value::Text(t) => t.as_str().to_string(),
         other => panic!("expected text, got {other:?} for: {sql}"),
+    };
+    drain_to_done(&mut rows, sql);
+    value
+}
+
+/// Step a Statement until it returns `Done`, panicking on extra rows or
+/// non-Done terminal states. Used after reading a single expected row to
+/// make sure the program reaches `Halt` and any sequence side-effects
+/// commit.
+fn drain_to_done(rows: &mut turso_core::Statement, sql: &str) {
+    loop {
+        match rows.step().unwrap() {
+            StepResult::Done => return,
+            // The driver may yield IO mid-program (e.g. backing-table cursor
+            // page reads). Loop back and keep stepping.
+            StepResult::IO => continue,
+            StepResult::Row => panic!("expected single-row result for: {sql}"),
+            other => panic!("unexpected step result while draining: {other:?} for: {sql}"),
+        }
     }
 }
 
@@ -730,11 +759,18 @@ fn test_pg_sequences_columns(db: TempDatabase) {
     );
     assert_eq!(max, 1000);
 
+    // pg_sequences.cache_size reports the value the engine actually uses for
+    // allocation, not the value requested in CREATE SEQUENCE. Turso's
+    // disk-only sequence design never caches values (every nextval reads and
+    // writes the backing-table watermark inline with the executing
+    // transaction), so cache_size is always 1 regardless of the requested
+    // `CACHE n`. PG's behavior on a server that physically can't cache is
+    // the same — it reports the actual cache size, not the requested one.
     let cache = pg_query_int(
         &conn,
         "SELECT cache_size FROM pg_sequences WHERE sequencename = 'cat_full'",
     );
-    assert_eq!(cache, 10);
+    assert_eq!(cache, 1);
 
     pg_execute(&conn, "DROP SEQUENCE cat_full");
 }
