@@ -299,58 +299,43 @@ fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldI
 
 /// Decide the PG wire type for a result column.
 ///
-/// Prefers `get_column_type_info` (table-column ref) because it carries the
-/// declared name, array depth, and a `kind` that distinguishes STRUCT/UNION
-/// from raw BLOB. Falls back to `get_column_inferred_type` for expressions
-/// (`SELECT 1+1`, function calls in subqueries, etc.), and finally to TEXT
-/// when neither path produces anything — TEXT is the safe wire default since
+/// `get_column_type_info` is the single source of truth: it handles direct
+/// table-column references (declared name, array depth, custom-type kind,
+/// resolved primitive), bare literals (`SELECT 42` -> INTEGER), and typed
+/// expressions like CAST. When it returns `Ok(None)` (no determined primitive)
+/// or `Err` (custom types not enabled — won't happen in PG mode, but the wire
+/// layer shouldn't panic if it does), the safe default is TEXT;
 /// `encode_value` already handles per-value type mismatches.
 fn resolve_pg_type_for_column(stmt: &turso_core::Statement, idx: usize) -> Type {
     use turso_core::ColumnTypeKind;
 
-    if let Some(info) = stmt.get_column_type_info(idx) {
-        // STRUCT and UNION columns live as BLOBs on disk, but exposing them
-        // as BYTEA would force clients to deal with raw bytes. Map them to
-        // JSONB so libpq/psql/JDBC see structured data they can introspect.
-        let mut base = match info.kind {
-            ColumnTypeKind::Struct | ColumnTypeKind::Union => Type::JSONB,
-            _ => {
-                // Prefer the declared name (the user-visible type), then
-                // fall back to the resolved base for custom/domain types
-                // whose declared name isn't in the lookup table.
-                let mapped = sqlite_type_to_pg_type(&info.declared_name);
-                if mapped == Type::TEXT {
-                    info.base_type
-                        .as_deref()
-                        .map(sqlite_type_to_pg_type)
-                        .unwrap_or(Type::TEXT)
-                } else {
-                    mapped
-                }
-            }
-        };
-        if info.array_dimensions > 0 {
-            base = scalar_pg_type_to_array_type(&base);
-        }
-        return base;
-    }
-
-    // No table-column ref behind this result column: try to infer the
-    // affinity of the expression. SQLite reports BLOB for expressions with no
-    // affinity (e.g. function calls in subqueries); mapping that straight to
-    // BYTEA would make PG clients return raw Buffer objects, so we coerce
-    // inferred-BLOB to TEXT here (explicit BYTEA columns flow through the
-    // `get_column_type_info` branch above).
-    stmt.get_column_inferred_type(idx)
-        .map(|t| {
-            let mapped = sqlite_type_to_pg_type(&t);
-            if mapped == Type::BYTEA && t.eq_ignore_ascii_case("BLOB") {
-                Type::TEXT
+    let Some(info) = stmt.get_column_type_info(idx).ok().flatten() else {
+        return Type::TEXT;
+    };
+    // STRUCT and UNION columns live as BLOBs on disk, but exposing them as
+    // BYTEA would force clients to deal with raw bytes. Map them to JSONB so
+    // libpq/psql/JDBC see structured data they can introspect.
+    let mut base = match info.kind {
+        ColumnTypeKind::Struct | ColumnTypeKind::Union => Type::JSONB,
+        _ => {
+            // Prefer the declared name (the user-visible type), then fall
+            // back to the resolved base for custom/domain types whose
+            // declared name isn't in the lookup table.
+            let mapped = sqlite_type_to_pg_type(&info.declared_name);
+            if mapped == Type::TEXT {
+                info.base_type
+                    .as_deref()
+                    .map(sqlite_type_to_pg_type)
+                    .unwrap_or(Type::TEXT)
             } else {
                 mapped
             }
-        })
-        .unwrap_or(Type::TEXT)
+        }
+    };
+    if info.array_dimensions > 0 {
+        base = scalar_pg_type_to_array_type(&base);
+    }
+    base
 }
 
 /// Map a scalar PG type to its array counterpart.

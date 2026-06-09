@@ -144,6 +144,102 @@ pub enum ColumnTypeKind {
     Union,
 }
 
+/// Recursively infer the result primitive of a non-table-column expression
+/// and return its uppercase name (`"INTEGER"`, `"REAL"`, `"TEXT"`,
+/// `"NUMERIC"`) or `None` when no determination can be made.
+///
+/// Used by [`Statement::get_column_type_info`] to give wire-protocol layers
+/// a usable type for `SELECT 1+1`-style result columns. Goes beyond SQLite's
+/// `get_expr_affinity` (which deliberately stops at binary operators because
+/// SQLite's affinity model is about *column* coercion, not expression
+/// inference) by walking through arithmetic, bitwise, comparison, logical,
+/// and concat operators — letting `SELECT 42 + 1` report INT4 to a
+/// PostgreSQL client the way PG itself does.
+fn infer_expression_primitive(
+    expr: &turso_parser::ast::Expr,
+    referenced_tables: Option<&translate::plan::TableReferences>,
+) -> Option<&'static str> {
+    use turso_parser::ast::{Expr, Operator};
+
+    match expr {
+        Expr::Literal(lit) => match translate::alter::literal_default_value(lit)
+            .ok()?
+            .value_type()
+        {
+            crate::types::ValueType::Integer => Some("INTEGER"),
+            crate::types::ValueType::Float => Some("REAL"),
+            crate::types::ValueType::Text => Some("TEXT"),
+            _ => None,
+        },
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            infer_expression_primitive(exprs.first().unwrap(), referenced_tables)
+        }
+        Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables),
+        Expr::Unary(_, inner) => infer_expression_primitive(inner, referenced_tables),
+        Expr::Binary(left, op, right) => match op {
+            Operator::Add
+            | Operator::Subtract
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::Modulus => {
+                let l = infer_expression_primitive(left, referenced_tables);
+                let r = infer_expression_primitive(right, referenced_tables);
+                Some(combine_arithmetic_primitive(l, r))
+            }
+            Operator::BitwiseAnd
+            | Operator::BitwiseOr
+            | Operator::BitwiseNot
+            | Operator::LeftShift
+            | Operator::RightShift => Some("INTEGER"),
+            Operator::Equals
+            | Operator::NotEquals
+            | Operator::Less
+            | Operator::LessEquals
+            | Operator::Greater
+            | Operator::GreaterEquals
+            | Operator::Is
+            | Operator::IsNot
+            | Operator::And
+            | Operator::Or
+            | Operator::ArrayContains
+            | Operator::ArrayOverlap => Some("INTEGER"),
+            Operator::Concat => Some("TEXT"),
+            Operator::ArrowRight | Operator::ArrowRightShift => affinity_to_primitive(
+                translate::expr::get_expr_affinity(expr, referenced_tables, None),
+            ),
+        },
+        Expr::RowId { .. } => Some("INTEGER"),
+        _ => affinity_to_primitive(translate::expr::get_expr_affinity(
+            expr,
+            referenced_tables,
+            None,
+        )),
+    }
+}
+
+fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
+    match affinity {
+        crate::vdbe::affinity::Affinity::Integer => Some("INTEGER"),
+        crate::vdbe::affinity::Affinity::Real => Some("REAL"),
+        crate::vdbe::affinity::Affinity::Text => Some("TEXT"),
+        crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC"),
+        crate::vdbe::affinity::Affinity::Blob => None,
+    }
+}
+
+fn combine_arithmetic_primitive(
+    left: Option<&'static str>,
+    right: Option<&'static str>,
+) -> &'static str {
+    match (left, right) {
+        (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
+        (Some("INTEGER"), Some("REAL"))
+        | (Some("REAL"), Some("INTEGER"))
+        | (Some("REAL"), Some("REAL")) => "REAL",
+        _ => "NUMERIC",
+    }
+}
+
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -868,73 +964,89 @@ impl Statement {
     ///
     /// Provides the structured pieces of Turso's type system that
     /// [`get_column_decltype`] does not surface — array depth and the resolved
-    /// primitive of a custom (`CREATE TYPE`) or domain (`CREATE DOMAIN`) type.
-    /// Returns `None` for computed expressions, subquery columns, and anything
-    /// else without a direct schema column behind it (matching the inspection
-    /// contract of [`get_column_decltype`]), and also when the statement is in
-    /// EXPLAIN mode.
+    /// primitive of a custom (`CREATE TYPE`) or domain (`CREATE DOMAIN`) type
+    /// for table columns, plus the inferred primitive for typed expressions
+    /// and bare literals so wire-protocol layers can report a usable type for
+    /// non-table-column SELECTs (`SELECT 42` -> INTEGER, etc.).
     ///
-    /// This is a Turso-specific API; it has no `sqlite3_*` counterpart. The
-    /// returned struct is `#[non_exhaustive]` so additional metadata can be
-    /// added over time without breaking callers.
-    pub fn get_column_type_info(&self, idx: usize) -> Option<ColumnTypeInfo> {
-        if self.query_mode != QueryMode::Normal {
-            return None;
+    /// Returns `Err` when the connection does not have the experimental
+    /// custom-types feature enabled. Returns `Ok(None)` in EXPLAIN mode, on
+    /// out-of-bounds indices, and when neither the schema nor the affinity
+    /// machinery produces a usable primitive (binary arithmetic, function
+    /// calls with no declared return affinity, BLOB and NULL literals).
+    pub fn get_column_type_info(&self, idx: usize) -> Result<Option<ColumnTypeInfo>> {
+        if !self.program.connection.experimental_custom_types_enabled() {
+            return Err(LimboError::ParseError(
+                "get_column_type_info requires --experimental-custom-types".to_string(),
+            ));
         }
-        let column = &self.program.result_columns.get(idx)?;
-        let (table, column_idx) = match &column.expr {
-            turso_parser::ast::Expr::Column {
-                table,
-                column: column_idx,
-                ..
-            } => (*table, *column_idx),
-            _ => return None,
+        if self.query_mode != QueryMode::Normal {
+            return Ok(None);
+        }
+        let Some(column) = self.program.result_columns.get(idx) else {
+            return Ok(None);
         };
-        let (_, table_ref) = self
-            .program
-            .table_references
-            .find_table_by_internal_id(table)?;
-        let table_column = table_ref.get_column_at(column_idx)?;
-        let declared_name = table_column.ty_str.clone();
-        let array_dimensions = table_column.array_dimensions();
-        // Resolve to the underlying primitive when the declared type is a
-        // registered custom type (CREATE TYPE) or domain (CREATE DOMAIN).
-        // Built-in types resolve to `None` so callers can distinguish
-        // "this is an INTEGER column" from "this is a custom type whose base
-        // happens to be INTEGER".
-        let schema = self.program.connection.schema.read();
-        let resolved = schema
-            .resolve_type(&declared_name, table_ref.is_strict())
-            .ok()
-            .flatten();
-        // `kind` is computed from the leaf TypeDef in the resolution chain:
-        // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
-        // separately on `TypeDef.is_domain`, and anything else registered
-        // through CREATE TYPE is a Custom. A column whose declared name does
-        // not appear in the type registry is a Builtin.
-        let (base_type, kind) = match resolved {
-            Some(resolved) => {
-                let leaf = resolved.leaf();
-                let kind = if leaf.is_struct() {
-                    ColumnTypeKind::Struct
-                } else if leaf.is_union() {
-                    ColumnTypeKind::Union
-                } else if leaf.is_domain {
-                    ColumnTypeKind::Domain
-                } else {
-                    ColumnTypeKind::Custom
-                };
-                (Some(resolved.primitive.to_uppercase()), kind)
-            }
-            None => (None, ColumnTypeKind::Builtin),
+        if let turso_parser::ast::Expr::Column {
+            table,
+            column: column_idx,
+            ..
+        } = &column.expr
+        {
+            let Some((_, table_ref)) = self
+                .program
+                .table_references
+                .find_table_by_internal_id(*table)
+            else {
+                return Ok(None);
+            };
+            let Some(table_column) = table_ref.get_column_at(*column_idx) else {
+                return Ok(None);
+            };
+            let declared_name = table_column.ty_str.clone();
+            let array_dimensions = table_column.array_dimensions();
+            let schema = self.program.connection.schema.read();
+            let resolved = schema
+                .resolve_type(&declared_name, table_ref.is_strict())
+                .ok()
+                .flatten();
+            let (base_type, kind) = match resolved {
+                Some(resolved) => {
+                    let leaf = resolved.leaf();
+                    let kind = if leaf.is_struct() {
+                        ColumnTypeKind::Struct
+                    } else if leaf.is_union() {
+                        ColumnTypeKind::Union
+                    } else if leaf.is_domain {
+                        ColumnTypeKind::Domain
+                    } else {
+                        ColumnTypeKind::Custom
+                    };
+                    (Some(resolved.primitive.to_uppercase()), kind)
+                }
+                None => (None, ColumnTypeKind::Builtin),
+            };
+            drop(schema);
+            return Ok(Some(ColumnTypeInfo {
+                declared_name,
+                array_dimensions,
+                base_type,
+                kind,
+            }));
+        }
+        // Not a table column: infer the result primitive from the
+        // expression's shape (literal value type, binary operand types,
+        // CAST target, etc.).
+        let Some(name) =
+            infer_expression_primitive(&column.expr, Some(&self.program.table_references))
+        else {
+            return Ok(None);
         };
-        drop(schema);
-        Some(ColumnTypeInfo {
-            declared_name,
-            array_dimensions,
-            base_type,
-            kind,
-        })
+        Ok(Some(ColumnTypeInfo {
+            declared_name: name.to_string(),
+            array_dimensions: 0,
+            base_type: None,
+            kind: ColumnTypeKind::Builtin,
+        }))
     }
 
     /// Returns the type affinity name of a result column (e.g., "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC").

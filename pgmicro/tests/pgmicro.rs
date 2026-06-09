@@ -967,7 +967,74 @@ impl PgTestClient {
         let response = self.read_until_ready();
         extract_command_tags(&response)
     }
+
+    /// Send query and return the column type OIDs from the first
+    /// `RowDescription` (`'T'`) message in the response. Used to assert what
+    /// the PG wire protocol reports for each result column — separate from
+    /// the runtime value, which the existing column-value tests cover.
+    fn query_column_oids(&mut self, sql: &str) -> Vec<u32> {
+        self.send_query(sql);
+        let response = self.read_until_ready();
+        extract_row_description_oids(&response)
+    }
 }
+
+/// Walk raw PG wire bytes, find the first `RowDescription` (`'T'`), and
+/// return the data type OID of each described column. RowDescription body
+/// layout per the PG protocol docs: `int16` column count, then for each
+/// column: cstring name, `int32` tableOID, `int16` columnAttrNum,
+/// `int32` dataTypeOID, `int16` dataTypeSize, `int32` typeModifier,
+/// `int16` formatCode.
+fn extract_row_description_oids(data: &[u8]) -> Vec<u32> {
+    let mut pos = 0;
+    while pos < data.len() {
+        let tag = data[pos];
+        pos += 1;
+        if pos + 4 > data.len() {
+            break;
+        }
+        let len =
+            i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        let body_len = len - 4;
+        let body_end = pos + body_len;
+        if body_end > data.len() {
+            break;
+        }
+        if tag == b'T' {
+            let body = &data[pos..body_end];
+            let ncols = u16::from_be_bytes([body[0], body[1]]) as usize;
+            let mut p = 2;
+            let mut oids = Vec::with_capacity(ncols);
+            for _ in 0..ncols {
+                // cstring name
+                let name_end = body[p..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .expect("RowDescription column name missing nul terminator")
+                    + p;
+                p = name_end + 1;
+                // tableOID(4) + columnAttrNum(2)
+                p += 6;
+                let oid = u32::from_be_bytes([body[p], body[p + 1], body[p + 2], body[p + 3]]);
+                oids.push(oid);
+                // dataTypeOID(4) + dataTypeSize(2) + typeModifier(4) + formatCode(2)
+                p += 4 + 2 + 4 + 2;
+            }
+            return oids;
+        }
+        pos = body_end;
+    }
+    Vec::new()
+}
+
+// PG type OIDs we assert against. Values from `pg_type.h` — stable across
+// PostgreSQL versions, so test expectations stay valid. Only the OIDs the
+// current wire tests assert against are declared; add more here as new
+// tests need them.
+const OID_INT4: u32 = 23;
+const OID_TEXT: u32 = 25;
+const OID_FLOAT8: u32 = 701;
 
 /// Extract CommandComplete ('C') tag strings from raw PG wire bytes.
 fn extract_command_tags(data: &[u8]) -> Vec<String> {
@@ -1033,4 +1100,171 @@ fn wire_copy_from_returns_copy_n() {
     std::fs::remove_file(&path).ok();
     server.kill().ok();
     server.wait().ok();
+}
+
+/// Wire-protocol fixture: spin up pgmicro, hand the caller a connected
+/// client, run their assertions, then shut the server down. Each test
+/// gets its own port so they can run in parallel without TCP collisions.
+fn with_pg_client<F: FnOnce(&mut PgTestClient)>(port_seed: u16, f: F) {
+    // Compose a port from the test-supplied seed and the test process id so
+    // multiple test files don't collide on a shared port range either.
+    let port = 16000 + port_seed + (std::process::id() % 100) as u16;
+    let mut server = start_pgmicro_server(port);
+    let mut client = PgTestClient::connect(port);
+    f(&mut client);
+    server.kill().ok();
+    server.wait().ok();
+}
+
+/// `SELECT 42` MUST report INT4 over the wire. PostgreSQL itself does, and
+/// PG clients (libpq, JDBC, psycopg2, node-postgres) drive value decoding
+/// off the column OID — reporting TEXT here would silently turn integer
+/// literals into strings at the client. Verified against the API change
+/// where integer literals previously fell through to TEXT.
+#[test]
+fn wire_integer_literal_reports_int4() {
+    with_pg_client(1, |c| {
+        assert_eq!(c.query_column_oids("SELECT 42"), vec![OID_INT4]);
+    });
+}
+
+/// `SELECT 3.14` reports FLOAT8. PG normally returns NUMERIC for unannotated
+/// numeric literals; FLOAT8 is the pgmicro choice because Turso stores
+/// reals as 64-bit floats and the client decodes the wire bytes directly.
+#[test]
+fn wire_real_literal_reports_float8() {
+    with_pg_client(2, |c| {
+        assert_eq!(c.query_column_oids("SELECT 3.14"), vec![OID_FLOAT8]);
+    });
+}
+
+/// `SELECT 'hello'` reports TEXT. Already correct before the API change;
+/// asserting here to lock in the contract.
+#[test]
+fn wire_text_literal_reports_text() {
+    with_pg_client(3, |c| {
+        assert_eq!(c.query_column_oids("SELECT 'hello'"), vec![OID_TEXT]);
+    });
+}
+
+/// Arithmetic over integer operands MUST report INT4, matching PostgreSQL.
+/// SQLite's own affinity machinery deliberately stops at binary operators
+/// (column-affinity model), so we explicitly walk arithmetic to propagate
+/// the operand type — this test pins that walker down.
+#[test]
+fn wire_integer_arithmetic_reports_int4() {
+    with_pg_client(4, |c| {
+        assert_eq!(c.query_column_oids("SELECT 42 + 1"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 1 + 1 + 1"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 100 - 7"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 6 * 7"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 13 % 5"), vec![OID_INT4]);
+    });
+}
+
+/// Mixed numeric arithmetic widens INTEGER+REAL → REAL → wire FLOAT8.
+#[test]
+fn wire_mixed_arithmetic_widens_to_float8() {
+    with_pg_client(5, |c| {
+        assert_eq!(c.query_column_oids("SELECT 42 + 1.5"), vec![OID_FLOAT8]);
+        assert_eq!(c.query_column_oids("SELECT 3.14 * 2"), vec![OID_FLOAT8]);
+    });
+}
+
+/// Bitwise ops always report INT4 — matches PostgreSQL.
+#[test]
+fn wire_bitwise_ops_report_int4() {
+    with_pg_client(6, |c| {
+        assert_eq!(c.query_column_oids("SELECT 1 << 4"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 256 >> 2"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 12 & 10"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 1 | 2"), vec![OID_INT4]);
+    });
+}
+
+/// Comparison and logical ops return INT4 — SQLite returns 0/1 as INTEGER
+/// at runtime; pgmicro's wire layer reports INT4 here. A future change
+/// could map these to BOOL OID, but for now stable + assertable.
+#[test]
+fn wire_comparison_and_logical_report_int4() {
+    with_pg_client(7, |c| {
+        assert_eq!(c.query_column_oids("SELECT 1 = 1"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 2 < 3"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 5 > 4"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 1 AND 0"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 1 OR 0"), vec![OID_INT4]);
+        // Nested: arithmetic feeding a comparison still propagates correctly.
+        assert_eq!(c.query_column_oids("SELECT 42 + 1 = 43"), vec![OID_INT4]);
+    });
+}
+
+/// Concat (`||`) always reports TEXT.
+#[test]
+fn wire_concat_reports_text() {
+    with_pg_client(8, |c| {
+        assert_eq!(c.query_column_oids("SELECT 'a' || 'b'"), vec![OID_TEXT]);
+        assert_eq!(
+            c.query_column_oids("SELECT 'x' || 'y' || 'z'"),
+            vec![OID_TEXT]
+        );
+    });
+}
+
+/// Unary +/- preserves operand affinity. Parenthesised expressions
+/// (`(1+2)*3`) still propagate types — the walker recurses through.
+#[test]
+fn wire_unary_and_parens_propagate() {
+    with_pg_client(9, |c| {
+        assert_eq!(c.query_column_oids("SELECT -42"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT +5"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT (1 + 2) * 3"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT NOT 1"), vec![OID_INT4]);
+    });
+}
+
+/// `CAST(... AS type)` lands the inferred primitive in declared_name and
+/// the wire layer picks the matching PG OID.
+#[test]
+fn wire_cast_reports_target_type() {
+    with_pg_client(10, |c| {
+        assert_eq!(
+            c.query_column_oids("SELECT CAST('42' AS INTEGER)"),
+            vec![OID_INT4]
+        );
+        assert_eq!(
+            c.query_column_oids("SELECT CAST(42 AS TEXT)"),
+            vec![OID_TEXT]
+        );
+        assert_eq!(
+            c.query_column_oids("SELECT CAST(1 AS REAL)"),
+            vec![OID_FLOAT8]
+        );
+    });
+}
+
+/// Direct table-column references take the schema-tagged path: a column
+/// declared INTEGER reports INT4, TEXT reports TEXT, and so on. The wire
+/// layer must not regress to TEXT here.
+#[test]
+fn wire_table_columns_report_declared_type() {
+    with_pg_client(11, |c| {
+        c.query_command_tags("CREATE TABLE t(id INTEGER, label TEXT, score REAL)");
+        assert_eq!(
+            c.query_column_oids("SELECT id, label, score FROM t"),
+            vec![OID_INT4, OID_TEXT, OID_FLOAT8]
+        );
+    });
+}
+
+/// Multi-column SELECT mixing literals and arithmetic — each column is
+/// classified independently, and the wire layer surfaces all of them with
+/// the correct OID rather than collapsing the row to a single type.
+#[test]
+fn wire_multi_column_select_classifies_each() {
+    with_pg_client(12, |c| {
+        assert_eq!(
+            c.query_column_oids("SELECT 1, 'two', 3.0, 1 + 1, 'a' || 'b'"),
+            vec![OID_INT4, OID_TEXT, OID_FLOAT8, OID_INT4, OID_TEXT]
+        );
+    });
 }

@@ -1358,7 +1358,7 @@ impl TursoStatement {
         if index >= stmt.num_columns() {
             return None;
         }
-        stmt.get_column_type_info(index)
+        stmt.get_column_type_info(index).ok().flatten()
     }
     /// finalize statement execution
     /// this method must be called in the end of statement execution (either successfull or not)
