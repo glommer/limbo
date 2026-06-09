@@ -2546,18 +2546,6 @@ impl Schema {
         Ok(())
     }
 
-    pub fn get_sequence(&self, name: &str) -> Option<&Arc<Sequence>> {
-        self.sequences.get(&normalize_ident(name))
-    }
-
-    /// Remove a sequence and its backing table from the in-memory schema.
-    pub fn remove_sequence(&mut self, name: &str) {
-        let normalized = normalize_ident(name);
-        self.sequences.remove(&normalized);
-        let backing_table = crate::translate::sequence::sequence_backing_table_name(&normalized);
-        self.tables.remove(&backing_table);
-    }
-
     /// Returns the type of schema object with the given name, if one exists.
     /// Checks tables, views, and indexes.
     pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {

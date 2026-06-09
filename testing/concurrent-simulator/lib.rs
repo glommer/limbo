@@ -1482,7 +1482,6 @@ fn parse_sequence_params(sql: &str) -> Option<SequenceParams> {
     let mut increment = None;
     let mut min_value = None;
     let mut max_value = None;
-    let mut cache = None;
     let mut cycle = false;
 
     while i < tokens.len() {
@@ -1507,11 +1506,6 @@ fn parse_sequence_params(sql: &str) -> Option<SequenceParams> {
                 max_value = tokens.get(i).and_then(|t| t.parse().ok());
                 i += 1;
             }
-            "CACHE" => {
-                i += 1;
-                cache = tokens.get(i).and_then(|t| t.parse().ok());
-                i += 1;
-            }
             "CYCLE" => {
                 cycle = true;
                 i += 1;
@@ -1526,7 +1520,6 @@ fn parse_sequence_params(sql: &str) -> Option<SequenceParams> {
         increment,
         min_value,
         max_value,
-        cache,
         cycle,
     )
     .ok()?;

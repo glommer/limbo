@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail};
 use turso_core::{LimboError, Value};
 
-use crate::SequenceParams;
 use crate::elle::{ElleEventType, ElleOp};
 use crate::operations::{OpResult, Operation};
 use crate::{AUTOINC_TABLE_NAME, PersistedSequenceState, SequenceParams};

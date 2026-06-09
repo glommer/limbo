@@ -1571,34 +1571,6 @@ impl Database {
                         mv_store.bootstrap(mvcc_bootstrap_conn)?;
                     }
 
-                    // Initialize sequence values from sqlite_sequence.
-                    // This restores high-water marks for both user sequences
-                    // and autoincrement implicit sequences after restart.
-                    // Must run after BootstrapMvStore so MVCC root page mappings
-                    // are populated before we query sqlite_sequence.
-                    {
-                        let conn = state
-                            .conn
-                            .as_ref()
-                            .expect("conn must be initialized in Init phase");
-                        conn.maybe_update_schema();
-                        if let Err(e) = conn.initialize_sequences_from_sqlite_sequence() {
-                            tracing::warn!(
-                                "Failed to initialize sequences from sqlite_sequence: {}",
-                                e
-                            );
-                        }
-                        // Propagate sequences back to db.schema so that newly
-                        // created connections inherit them (sequences are only
-                        // stored in-memory, not in sqlite_schema metadata).
-                        let db = state
-                            .db
-                            .as_ref()
-                            .expect("db must be initialized in Init phase");
-                        let updated = conn.schema.read().clone();
-                        *db.schema.lock() = updated;
-                    }
-
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
                         state
