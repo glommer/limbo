@@ -283,9 +283,7 @@ impl Connection {
                 for (i, val) in row.iter().enumerate() {
                     let index = NonZero::new(i + 1).unwrap();
                     match val {
-                        Some(s) => {
-                            insert_stmt.bind_at(index, Value::Text(Text::new(s.clone())))?
-                        }
+                        Some(s) => insert_stmt.bind_at(index, Value::Text(Text::new(s.clone())))?,
                         None => insert_stmt.bind_at(index, Value::Null)?,
                     }
                 }

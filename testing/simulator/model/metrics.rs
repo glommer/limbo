@@ -99,19 +99,6 @@ impl Remaining {
             .checked_sub(stats.drop_sequence_count)
             .unwrap_or_default();
 
-        let remaining_create_sequence = total_create_sequence
-            .checked_sub(stats.create_sequence_count)
-            .unwrap_or_default();
-        let mut remaining_nextval = total_nextval
-            .checked_sub(stats.nextval_count)
-            .unwrap_or_default();
-        let mut remaining_setval = total_setval
-            .checked_sub(stats.setval_count)
-            .unwrap_or_default();
-        let mut remaining_drop_sequence = total_drop_sequence
-            .checked_sub(stats.drop_sequence_count)
-            .unwrap_or_default();
-
         if mvcc {
             // TODO: index not supported yet for mvcc
             remaining_create_index = 0;

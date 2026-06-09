@@ -2726,8 +2726,8 @@ impl PgSequencesCursor {
                     Value::from_i64(seq.max_value),        // max_value
                     Value::from_i64(seq.increment_by),     // increment_by
                     Value::from_i64(i64::from(seq.cycle)), // cycle
-                    Value::from_i64(1),                    // cache_size (PG default; Turso doesn't cache)
-                    Value::from_i64(last_val),             // last_value
+                    Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
+                    Value::from_i64(last_val), // last_value
                 ]);
             }
         }

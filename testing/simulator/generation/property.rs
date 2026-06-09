@@ -2164,7 +2164,6 @@ fn property_sequence_monotonicity<R: rand::Rng + ?Sized>(
         }
     };
 
-
     let create = CreateSequence {
         name: name.clone(),
         start,

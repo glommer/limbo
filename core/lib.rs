@@ -53,10 +53,10 @@ mod json;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod numeric;
 mod parameters;
-mod pg_catalog;
-mod pg_dispatch;
 #[cfg(feature = "percentile")]
 mod percentile;
+mod pg_catalog;
+mod pg_dispatch;
 mod pragma;
 mod progress;
 mod pseudo;
@@ -149,7 +149,7 @@ pub use io::{
     WriteCompletion, IO,
 };
 pub use numeric::{nonnan::NonNan, Numeric};
-pub use statement::{Statement, StatementStatusCounter};
+pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},

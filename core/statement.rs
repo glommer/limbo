@@ -74,6 +74,76 @@ impl StatementOrigin {
     }
 }
 
+/// Structured type information for a result column.
+///
+/// Returned by [`Statement::get_column_type_info`]. Surfaces the array depth
+/// and custom-type resolution that the SQLite-compat `get_column_decltype`
+/// API does not expose. New fields may be added over time; the struct is
+/// marked `#[non_exhaustive]` so consumers must use struct-update or accessor
+/// patterns rather than exhaustive matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ColumnTypeInfo {
+    /// The declared type name as written in CREATE TABLE — e.g. `"INTEGER"`,
+    /// `"VARCHAR"`, or the name of a `CREATE TYPE` / `CREATE DOMAIN` such as
+    /// `"cents"`. This is the same string `get_column_decltype` returns.
+    pub declared_name: String,
+    /// Array dimensionality: `0` for scalar columns, `1` for `INTEGER[]`,
+    /// `2` for `TEXT[][]`, etc.
+    pub array_dimensions: u32,
+    /// For columns whose declared type resolves to a `CREATE TYPE` or
+    /// `CREATE DOMAIN` definition, this is the underlying primitive type name
+    /// (`"INTEGER"`, `"TEXT"`, `"REAL"`, `"BLOB"`, or `"NUMERIC"`). `None`
+    /// when the declared name is a built-in primitive directly.
+    ///
+    /// Use this to distinguish "the user wrote `INTEGER`" (base_type: `None`)
+    /// from "the user wrote `cents`, which happens to be INTEGER underneath"
+    /// (base_type: `Some("INTEGER")`).
+    pub base_type: Option<String>,
+    /// Classification of the declared type. Distinguishes `BUILTIN` (the
+    /// declared name is a primitive) from the four `CREATE TYPE`/`CREATE
+    /// DOMAIN` flavours.
+    ///
+    /// This matters for callers like wire-protocol layers that need to map
+    /// a column to its native type code: a column declared as a `STRUCT`
+    /// type stores a BLOB on disk (`base_type` is `Some("BLOB")`), but the
+    /// caller usually wants to expose it as a composite/JSON type rather
+    /// than raw bytes. The `kind` field carries that distinction directly
+    /// without forcing the caller to re-query the schema.
+    pub kind: ColumnTypeKind,
+}
+
+/// Classification of a result column's declared type.
+///
+/// Returned as part of [`ColumnTypeInfo`]. `#[non_exhaustive]` so that new
+/// kinds (e.g. for future enum or table-row types) can be added without a
+/// breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ColumnTypeKind {
+    /// A SQLite-style primitive type: `INTEGER`, `TEXT`, `REAL`, `BLOB`,
+    /// `NUMERIC`, `ANY`. The declared name is itself the primitive.
+    Builtin,
+    /// A user- or built-in custom type defined with
+    /// `CREATE TYPE name BASE primitive ENCODE ... DECODE ...`. Has an
+    /// underlying primitive (see `base_type`) and an encode/decode pipeline.
+    /// Built-in types like `uuid`, `boolean`, `numeric` register through
+    /// this path too.
+    Custom,
+    /// A domain defined with `CREATE DOMAIN name AS base [CHECK ...]`.
+    /// Shares an underlying primitive with its base type but adds CHECK
+    /// constraints; values are otherwise identical to the base.
+    Domain,
+    /// A composite type defined with `CREATE TYPE name AS STRUCT(...)`.
+    /// Values are stored as BLOBs containing the packed record; the
+    /// declared name carries the field schema.
+    Struct,
+    /// A tagged union defined with `CREATE TYPE name AS UNION(...)`.
+    /// Values are stored as BLOBs containing a tag and a payload; the
+    /// declared name carries the variant schema.
+    Union,
+}
+
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -793,28 +863,78 @@ impl Statement {
         }
     }
 
-    /// Returns the number of array dimensions for a result column.
-    /// Returns `None` if the column is not a table column, or `Some(0)` for scalar columns.
-    pub fn get_column_array_dimensions(&self, idx: usize) -> Option<u32> {
+    /// Returns rich type information for a result column when the column refers
+    /// directly to a table column.
+    ///
+    /// Provides the structured pieces of Turso's type system that
+    /// [`get_column_decltype`] does not surface — array depth and the resolved
+    /// primitive of a custom (`CREATE TYPE`) or domain (`CREATE DOMAIN`) type.
+    /// Returns `None` for computed expressions, subquery columns, and anything
+    /// else without a direct schema column behind it (matching the inspection
+    /// contract of [`get_column_decltype`]), and also when the statement is in
+    /// EXPLAIN mode.
+    ///
+    /// This is a Turso-specific API; it has no `sqlite3_*` counterpart. The
+    /// returned struct is `#[non_exhaustive]` so additional metadata can be
+    /// added over time without breaking callers.
+    pub fn get_column_type_info(&self, idx: usize) -> Option<ColumnTypeInfo> {
         if self.query_mode != QueryMode::Normal {
             return None;
         }
         let column = &self.program.result_columns.get(idx)?;
-        match &column.expr {
+        let (table, column_idx) = match &column.expr {
             turso_parser::ast::Expr::Column {
                 table,
                 column: column_idx,
                 ..
-            } => {
-                let (_, table_ref) = self
-                    .program
-                    .table_references
-                    .find_table_by_internal_id(*table)?;
-                let table_column = table_ref.get_column_at(*column_idx)?;
-                Some(table_column.array_dimensions())
+            } => (*table, *column_idx),
+            _ => return None,
+        };
+        let (_, table_ref) = self
+            .program
+            .table_references
+            .find_table_by_internal_id(table)?;
+        let table_column = table_ref.get_column_at(column_idx)?;
+        let declared_name = table_column.ty_str.clone();
+        let array_dimensions = table_column.array_dimensions();
+        // Resolve to the underlying primitive when the declared type is a
+        // registered custom type (CREATE TYPE) or domain (CREATE DOMAIN).
+        // Built-in types resolve to `None` so callers can distinguish
+        // "this is an INTEGER column" from "this is a custom type whose base
+        // happens to be INTEGER".
+        let schema = self.program.connection.schema.read();
+        let resolved = schema
+            .resolve_type(&declared_name, table_ref.is_strict())
+            .ok()
+            .flatten();
+        // `kind` is computed from the leaf TypeDef in the resolution chain:
+        // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
+        // separately on `TypeDef.is_domain`, and anything else registered
+        // through CREATE TYPE is a Custom. A column whose declared name does
+        // not appear in the type registry is a Builtin.
+        let (base_type, kind) = match resolved {
+            Some(resolved) => {
+                let leaf = resolved.leaf();
+                let kind = if leaf.is_struct() {
+                    ColumnTypeKind::Struct
+                } else if leaf.is_union() {
+                    ColumnTypeKind::Union
+                } else if leaf.is_domain {
+                    ColumnTypeKind::Domain
+                } else {
+                    ColumnTypeKind::Custom
+                };
+                (Some(resolved.primitive.to_uppercase()), kind)
             }
-            _ => None,
-        }
+            None => (None, ColumnTypeKind::Builtin),
+        };
+        drop(schema);
+        Some(ColumnTypeInfo {
+            declared_name,
+            array_dimensions,
+            base_type,
+            kind,
+        })
     }
 
     /// Returns the type affinity name of a result column (e.g., "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC").

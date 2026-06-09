@@ -1,4 +1,3 @@
-use crate::function::{Func, FuncCtx, ScalarFunc};
 use crate::schema::ColumnLayout;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
 use crate::turso_debug_assert;

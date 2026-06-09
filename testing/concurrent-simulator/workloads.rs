@@ -484,7 +484,6 @@ impl Workload for CurrValWorkload {
     }
 }
 
-
 /// Call nextval() on a random existing sequence.
 pub struct NextValWorkload;
 

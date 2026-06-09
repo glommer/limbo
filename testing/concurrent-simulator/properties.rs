@@ -1035,7 +1035,6 @@ fn revert_pre_txn_watermarks(
     });
 }
 
-
 impl SequenceCorrectnessProperty {
     pub fn new() -> Self {
         Self {
@@ -1397,7 +1396,6 @@ impl Property for SequenceCorrectnessProperty {
                 let Some(params) = self.params.get(seq_name) else {
                     return Ok(());
                 };
-
 
                 if value < params.min_value || value > params.max_value {
                     bail!(

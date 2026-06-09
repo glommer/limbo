@@ -451,7 +451,6 @@ pub struct PersistedSequenceState {
     pub watermark: i64,
 }
 
-
 /// Statistics collected during simulation.
 #[derive(Default, Debug, Clone)]
 pub struct Stats {
@@ -1466,70 +1465,6 @@ impl Whopper {
 
         Ok(())
     }
-}
-
-/// Parse sequence parameters from a CREATE SEQUENCE SQL statement.
-/// Returns None if the SQL cannot be parsed.
-fn parse_sequence_params(sql: &str) -> Option<SequenceParams> {
-    let tokens: Vec<&str> = sql.split_whitespace().collect();
-    let mut i = 2; // skip "CREATE SEQUENCE"
-    if tokens.get(i).is_some_and(|t| t.eq_ignore_ascii_case("IF")) {
-        i += 3; // skip "IF NOT EXISTS"
-    }
-    i += 1; // skip the sequence name
-
-    let mut start = None;
-    let mut increment = None;
-    let mut min_value = None;
-    let mut max_value = None;
-    let mut cycle = false;
-
-    while i < tokens.len() {
-        match tokens[i].to_uppercase().as_str() {
-            "START" => {
-                i += 2; // skip "WITH"
-                start = tokens.get(i).and_then(|t| t.parse().ok());
-                i += 1;
-            }
-            "INCREMENT" => {
-                i += 2; // skip "BY"
-                increment = tokens.get(i).and_then(|t| t.parse().ok());
-                i += 1;
-            }
-            "MINVALUE" => {
-                i += 1;
-                min_value = tokens.get(i).and_then(|t| t.parse().ok());
-                i += 1;
-            }
-            "MAXVALUE" => {
-                i += 1;
-                max_value = tokens.get(i).and_then(|t| t.parse().ok());
-                i += 1;
-            }
-            "CYCLE" => {
-                cycle = true;
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-
-    let seq = turso_core::schema::Sequence::new(
-        String::new(),
-        start,
-        increment,
-        min_value,
-        max_value,
-        cycle,
-    )
-    .ok()?;
-    Some(SequenceParams {
-        start: seq.start_value,
-        increment: seq.increment_by,
-        min_value: seq.min_value,
-        max_value: seq.max_value,
-        cycle: seq.cycle,
-    })
 }
 
 fn may_be_set_encryption(
