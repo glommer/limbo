@@ -1703,7 +1703,7 @@ impl Func {
             "glob" => Ok(Some(Self::Scalar(ScalarFunc::Glob))),
             "ifnull" => Ok(Some(Self::Scalar(ScalarFunc::IfNull))),
             "if" | "iif" => Ok(Some(Self::Scalar(ScalarFunc::Iif))),
-            "instr" | "strpos" | "position" => Ok(Some(Self::Scalar(ScalarFunc::Instr))),
+            "instr" | "strpos" => Ok(Some(Self::Scalar(ScalarFunc::Instr))),
             "like" => Ok(Some(Self::Scalar(ScalarFunc::Like))),
             "pg_get_userbyid" => Ok(Some(Self::Scalar(ScalarFunc::PgGetUserById))),
             "pg_table_is_visible" => Ok(Some(Self::Scalar(ScalarFunc::PgTableIsVisible))),

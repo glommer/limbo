@@ -26,6 +26,32 @@ fn stdout(output: &Output) -> String {
 // DDL execution
 // ---------------------------------------------------------------------------
 
+/// The SQL standard `POSITION(needle IN haystack)` is parsed by libpg_query
+/// into a regular function call with operands swapped to `(haystack, needle)`.
+/// pgmicro's PG translator rewrites the function name from `position` to
+/// `strpos` (which Turso core already implements as an alias of `instr`) so
+/// the alias does not need to live in core. This test pins the end-to-end
+/// behavior: needle found → 1-based index, needle not found → 0, empty
+/// needle → 1 (matches PostgreSQL).
+#[test]
+fn position_in_form_returns_index() {
+    let output = run_pgmicro(b"SELECT POSITION('world' IN 'hello world') AS a, POSITION('xyz' IN 'hello') AS b, POSITION('' IN 'hello') AS c;\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains('7'),
+        "expected position=7 for 'world' in 'hello world': {out}"
+    );
+    assert!(
+        out.contains('0'),
+        "expected position=0 for not-found needle: {out}"
+    );
+    assert!(
+        out.contains('1'),
+        "expected position=1 for empty needle: {out}"
+    );
+}
+
 #[test]
 fn create_table_then_select() {
     let output = run_pgmicro(

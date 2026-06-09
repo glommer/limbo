@@ -2862,6 +2862,21 @@ impl PostgreSQLTranslator {
             .unwrap_or(&func_name)
             .to_string();
 
+        // Rewrite PG-specific function-name spellings to their core-native
+        // equivalents so the core resolver doesn't need to carry aliases
+        // that only matter when a query came through the PG parser. This
+        // keeps core's resolve_function focused on functions Turso itself
+        // implements; PG-name routing lives here in the translator.
+        //
+        // `position(needle IN haystack)` is parsed by libpg_query into a
+        // regular function call with operands already in `(haystack, needle)`
+        // order — the same shape SQLite's `instr` and PostgreSQL's `strpos`
+        // take — so the rewrite is purely a name change.
+        let func_name = match func_name.as_str() {
+            "position" => "strpos".to_string(),
+            _ => func_name,
+        };
+
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" | "FLOAT4" => Some("REAL"),
