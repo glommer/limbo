@@ -135,7 +135,13 @@ impl Connection {
             )));
         }
         let path = self.schema_file_path(&name);
-        self.attach_database(&path, &name)
+        let mut state = crate::connection::AttachDatabaseState::default();
+        loop {
+            match self.attach_database(&path, &name, &mut state)? {
+                crate::types::IOResult::Done(()) => return Ok(()),
+                crate::types::IOResult::IO(io) => io.wait(self.db.io.as_ref())?,
+            }
+        }
     }
 
     /// Compute the file path for a schema database.

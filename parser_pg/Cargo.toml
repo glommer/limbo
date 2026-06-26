@@ -14,7 +14,7 @@ name = "turso_parser_pg"
 pg_query = "6.1"
 miette = { workspace = true }
 thiserror = { workspace = true }
-turso_parser = { path = "../parser" }
+turso_parser = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

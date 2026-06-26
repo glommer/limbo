@@ -64,7 +64,7 @@ cargo test
 
 ### Configuring `mold` Linker
 
-The `mold` linker can reduce your build time from a minute to just few seconds.
+The `mold` linker (Linux only) can reduce your build time from a minute to just few seconds.
 
 First, install `mold`:
 
@@ -197,7 +197,7 @@ cargo run -Zbuild-std --target x86_64-unknown-linux-gnu -p turso_stress -- --vfs
 
 ## Finding things to work on
 
-The issue tracker has issues tagged with [good first issue](https://github.com/tursodatabase/limbo/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22),
+The issue tracker has issues tagged with [good first issue](https://github.com/tursodatabase/turso/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22),
 which are considered to be things to work on to get going. If you're interested in working on one of them, comment on the issue tracker, and we're happy to help you get going.
 
 You don't need to ask "can I work on this?" The answer is always yes. Pick something, work on it, and open a pull request. A few things to keep in mind:
@@ -435,7 +435,7 @@ included in the project.
 
 ## Making Releases
 
-Releases are made using the `scripts/update-version.py` script, which updates version numbers across all `Cargo.toml`, `package.json`, `package-lock.json`, and `gradle.properties` files in the workspace, creates a git commit, and adds a version tag.
+Releases are made using the `scripts/update-version.py` script, which updates version numbers across all `Cargo.toml`, `package.json`, `package-lock.json`, `gradle.properties`, and `Directory.Build.props` files in the workspace, creates a git commit, and adds a version tag.
 
 The process is:
 
@@ -475,4 +475,3 @@ Use the `scripts/pypi-cleanup` script to manage this:
 ```
 
 Always run the dry run first to review what will be deleted before executing.
-

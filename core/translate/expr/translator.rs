@@ -1235,7 +1235,8 @@ pub fn translate_expr(
                         | ScalarFunc::RandomBlob
                         | ScalarFunc::Sign
                         | ScalarFunc::Soundex
-                        | ScalarFunc::ZeroBlob => {
+                        | ScalarFunc::ZeroBlob
+                        | ScalarFunc::SequenceWatermark => {
                             let args = expect_arguments_exact!(args, 1, srf);
                             let start_reg = program.alloc_register();
                             translate_expr(
@@ -1821,6 +1822,11 @@ pub fn translate_expr(
                         | ScalarFunc::TestUintLt
                         | ScalarFunc::TestUintEq
                         | ScalarFunc::StringReverse
+                        | ScalarFunc::Gcd
+                        | ScalarFunc::Lcm
+                        | ScalarFunc::Repeat
+                        | ScalarFunc::Lpad
+                        | ScalarFunc::Rpad
                         | ScalarFunc::BooleanToInt
                         | ScalarFunc::IntToBoolean
                         | ScalarFunc::ValidateIpAddr

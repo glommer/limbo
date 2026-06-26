@@ -78,8 +78,29 @@ impl StatementOrigin {
 ///
 /// Returned by [`Statement::get_column_type_info`]. Surfaces the array depth
 /// and custom-type resolution that the SQLite-compat `get_column_decltype`
-/// API does not expose. New fields may be added over time; the struct is
-/// marked `#[non_exhaustive]` so consumers must use struct-update or accessor
+/// API does not expose, and also carries the inferred-affinity result for
+/// computed expressions (`SELECT 1+1`, function calls in subqueries, etc.)
+/// — the consumer asks one question, the API decides which path applies.
+///
+/// For a direct table-column reference, `declared_name` is the literal
+/// string the user wrote in CREATE TABLE (`"INTEGER"`, `"cents"`,
+/// `"VARCHAR"`), `array_dimensions` is the bracket depth, and `base_type` /
+/// `kind` carry any CREATE TYPE / CREATE DOMAIN resolution.
+///
+/// For a literal (`SELECT 42`, `SELECT 'x'`, `SELECT 3.14`), `declared_name`
+/// is the primitive that matches the literal's parsed value type
+/// (`"INTEGER"`, `"TEXT"`, `"REAL"`). For a typed expression — CAST, rowid,
+/// or anything else SQLite's affinity rules can pin down — it's the
+/// inferred primitive. In both cases `array_dimensions` is `0`, `base_type`
+/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. When neither path
+/// produces a usable primitive (binary arithmetic that SQLite refuses to
+/// propagate through, BLOB literals, NULL literals, function calls without
+/// declared return affinity), `get_column_type_info` returns `Ok(None)`
+/// rather than fabricating a name — callers can fall through to their own
+/// default.
+///
+/// New fields may be added over time; the struct is marked
+/// `#[non_exhaustive]` so consumers must use struct-update or accessor
 /// patterns rather than exhaustive matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -146,7 +167,7 @@ pub enum ColumnTypeKind {
 
 /// Recursively infer the result primitive of a non-table-column expression
 /// and return its uppercase name (`"INTEGER"`, `"REAL"`, `"TEXT"`,
-/// `"NUMERIC"`) or `None` when no determination can be made.
+/// `"NUMERIC"`, `"BLOB"`) or `None` when no determination can be made.
 ///
 /// Used by [`Statement::get_column_type_info`] to give wire-protocol layers
 /// a usable type for `SELECT 1+1`-style result columns. Goes beyond SQLite's
@@ -162,6 +183,7 @@ fn infer_expression_primitive(
     use turso_parser::ast::{Expr, Operator};
 
     match expr {
+        // Bare literal: read the parsed concrete value type.
         Expr::Literal(lit) => match translate::alter::literal_default_value(lit)
             .ok()?
             .value_type()
@@ -175,8 +197,14 @@ fn infer_expression_primitive(
             infer_expression_primitive(exprs.first().unwrap(), referenced_tables)
         }
         Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables),
-        Expr::Unary(_, inner) => infer_expression_primitive(inner, referenced_tables),
+        Expr::Unary(_, inner) => {
+            // Unary +/-/NOT preserve the operand's primitive (NOT on INTEGER
+            // is still INTEGER in SQLite).
+            infer_expression_primitive(inner, referenced_tables)
+        }
         Expr::Binary(left, op, right) => match op {
+            // Arithmetic: widen INTEGER × INTEGER to INTEGER, anything mixed
+            // with REAL becomes REAL, fall through to NUMERIC otherwise.
             Operator::Add
             | Operator::Subtract
             | Operator::Multiply
@@ -186,11 +214,15 @@ fn infer_expression_primitive(
                 let r = infer_expression_primitive(right, referenced_tables);
                 Some(combine_arithmetic_primitive(l, r))
             }
+            // Bitwise: result is always INTEGER in both SQLite and PG.
             Operator::BitwiseAnd
             | Operator::BitwiseOr
             | Operator::BitwiseNot
             | Operator::LeftShift
             | Operator::RightShift => Some("INTEGER"),
+            // Comparison and logical: SQLite returns 0/1 INTEGER; pgmicro
+            // maps INTEGER to BOOL at the wire layer for boolean columns,
+            // but the type the wire layer reports is still INTEGER here.
             Operator::Equals
             | Operator::NotEquals
             | Operator::Less
@@ -203,12 +235,18 @@ fn infer_expression_primitive(
             | Operator::Or
             | Operator::ArrayContains
             | Operator::ArrayOverlap => Some("INTEGER"),
+            // Concat is always TEXT.
             Operator::Concat => Some("TEXT"),
+            // JSON ops fall through to the affinity machinery — `->` returns
+            // JSON / blob, `->>` returns TEXT; the existing affinity rules
+            // give the correct answer.
             Operator::ArrowRight | Operator::ArrowRightShift => affinity_to_primitive(
                 translate::expr::get_expr_affinity(expr, referenced_tables, None),
             ),
         },
         Expr::RowId { .. } => Some("INTEGER"),
+        // CAST, column references, and anything else: defer to the affinity
+        // machinery, which handles these shapes correctly.
         _ => affinity_to_primitive(translate::expr::get_expr_affinity(
             expr,
             referenced_tables,
@@ -217,6 +255,9 @@ fn infer_expression_primitive(
     }
 }
 
+/// Map [`crate::vdbe::affinity::Affinity`] to the uppercase primitive name
+/// `infer_expression_primitive` returns. `Blob` collapses to `None` because
+/// SQLite's "no determined affinity" sentinel isn't a usable wire type.
 fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
     match affinity {
         crate::vdbe::affinity::Affinity::Integer => Some("INTEGER"),
@@ -227,6 +268,10 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
     }
 }
 
+/// Pick the widening primitive for an arithmetic binary op given each
+/// operand's inferred primitive. `INTEGER + INTEGER -> INTEGER`,
+/// `INTEGER + REAL -> REAL`, everything else collapses to `NUMERIC` (the
+/// safe wire default for a mixed-affinity numeric result).
 fn combine_arithmetic_primitive(
     left: Option<&'static str>,
     right: Option<&'static str>,
@@ -631,7 +676,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
                     return Err(LimboError::Busy)
@@ -645,7 +690,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
@@ -665,7 +710,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
                 }
@@ -674,6 +719,65 @@ impl Statement {
             }
         }
         Ok(())
+    }
+
+    /// Non-blocking counterpart of [`Self::run_ignore_rows`]: drives the
+    /// statement to completion, ignoring rows, but instead of pumping IO
+    /// synchronously it yields the pending completion to the caller. Re-invoke
+    /// after the yielded completion finishes; the program resumes at the same
+    /// pc. Rows are discarded.
+    ///
+    /// Used by engine-internal callers that must stay non-blocking (MVCC
+    /// bootstrap/recovery) so they don't call `io.step()` on backends that have
+    /// no synchronous IO pump (e.g. WASM).
+    pub fn run_ignore_rows_nonblock(&mut self) -> Result<crate::IOResult<()>> {
+        loop {
+            match self.step()? {
+                vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
+                vdbe::StepResult::Row => continue,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
+                    let io = self.take_io_completions().unwrap_or_else(|| {
+                        crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
+                    });
+                    return Ok(crate::IOResult::IO(io));
+                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+            }
+        }
+    }
+
+    /// Non-blocking counterpart of [`Self::run_with_row_callback`]: drives the
+    /// statement to completion, invoking `func` once per emitted row, but
+    /// yields the pending completion to the caller instead of pumping IO
+    /// synchronously.
+    ///
+    /// Re-entrancy: on an IO yield the program is paused mid-opcode (never
+    /// between emitting a row and this loop observing it), so on re-invocation
+    /// stepping resumes without replaying the last row — every row's `func`
+    /// runs exactly once. Because the runner restarts from the top on each
+    /// re-entry, `func` must append to caller-owned state that persists across
+    /// yields (e.g. a field in the driving state machine), not to a local.
+    pub fn run_with_row_callback_nonblock(
+        &mut self,
+        mut func: impl FnMut(&Row) -> Result<()>,
+    ) -> Result<crate::IOResult<()>> {
+        loop {
+            match self.step()? {
+                vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
+                vdbe::StepResult::Row => {
+                    func(self.row().expect("row should be present"))?;
+                }
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
+                    let io = self.take_io_completions().unwrap_or_else(|| {
+                        crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
+                    });
+                    return Ok(crate::IOResult::IO(io));
+                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+            }
+        }
     }
 
     /// Blocks execution, advances IO, and stops at any StepResult except IO
@@ -686,7 +790,7 @@ impl Statement {
         let result = loop {
             match self.step()? {
                 vdbe::StepResult::Done => break None,
-                vdbe::StepResult::IO => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     pre_io_func()?;
                     self.pager.io.step()?;
                     post_io_func()?;
@@ -959,21 +1063,34 @@ impl Statement {
         }
     }
 
-    /// Returns rich type information for a result column when the column refers
-    /// directly to a table column.
+    /// Returns rich type information for a result column.
     ///
-    /// Provides the structured pieces of Turso's type system that
-    /// [`get_column_decltype`] does not surface — array depth and the resolved
-    /// primitive of a custom (`CREATE TYPE`) or domain (`CREATE DOMAIN`) type
-    /// for table columns, plus the inferred primitive for typed expressions
-    /// and bare literals so wire-protocol layers can report a usable type for
-    /// non-table-column SELECTs (`SELECT 42` -> INTEGER, etc.).
+    /// This is Turso's single entry point for "what is the type of this
+    /// column?" — covering both **direct table-column references** (where the
+    /// schema carries declared name, array depth, custom-type kind, and the
+    /// resolved primitive) and **computed expressions** (where the SQLite-
+    /// style affinity machinery infers a primitive type from the expression
+    /// shape). One call, one shape, regardless of which path applies.
     ///
-    /// Returns `Err` when the connection does not have the experimental
-    /// custom-types feature enabled. Returns `Ok(None)` in EXPLAIN mode, on
-    /// out-of-bounds indices, and when neither the schema nor the affinity
-    /// machinery produces a usable primitive (binary arithmetic, function
-    /// calls with no declared return affinity, BLOB and NULL literals).
+    /// ### Return value
+    ///
+    /// - `Err(_)` when this connection does not have the experimental
+    ///   custom-types feature enabled. This API is the public surface of the
+    ///   custom-types system; callers must opt in by enabling
+    ///   `--experimental-custom-types` (or `DatabaseOpts::with_custom_types`)
+    ///   before they can rely on it.
+    /// - `Ok(None)` when the statement is in EXPLAIN mode, when `idx` is out
+    ///   of bounds, when the result column has no schema column behind it
+    ///   AND the affinity machinery returns `BLOB` (i.e. "no determined
+    ///   affinity"), or when a join/CTE reference can't be resolved.
+    /// - `Ok(Some(info))` otherwise. For a table-column reference, `info`
+    ///   carries the declared name verbatim; for an expression, `declared_name`
+    ///   is the inferred-affinity primitive (`"INTEGER"`, `"TEXT"`, `"REAL"`,
+    ///   or `"NUMERIC"`) and `kind` is `Builtin`.
+    ///
+    /// This is a Turso-specific API; it has no `sqlite3_*` counterpart. The
+    /// returned struct is `#[non_exhaustive]` so additional metadata can be
+    /// added over time without breaking callers.
     pub fn get_column_type_info(&self, idx: usize) -> Result<Option<ColumnTypeInfo>> {
         if !self.program.connection.experimental_custom_types_enabled() {
             return Err(LimboError::ParseError(
@@ -986,6 +1103,10 @@ impl Statement {
         let Some(column) = self.program.result_columns.get(idx) else {
             return Ok(None);
         };
+        // Direct table-column reference: pull declared name, array depth, and
+        // any registered CREATE TYPE / CREATE DOMAIN resolution out of the
+        // schema. Anything else falls through to the expression-affinity
+        // inference path below.
         if let turso_parser::ast::Expr::Column {
             table,
             column: column_idx,
@@ -1009,6 +1130,11 @@ impl Statement {
                 .resolve_type(&declared_name, table_ref.is_strict())
                 .ok()
                 .flatten();
+            // `kind` is computed from the leaf TypeDef in the resolution chain:
+            // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
+            // separately on `TypeDef.is_domain`, and anything else registered
+            // through CREATE TYPE is a Custom. A column whose declared name
+            // does not appear in the type registry is a Builtin.
             let (base_type, kind) = match resolved {
                 Some(resolved) => {
                     let leaf = resolved.leaf();
@@ -1034,8 +1160,8 @@ impl Statement {
             }));
         }
         // Not a table column: infer the result primitive from the
-        // expression's shape (literal value type, binary operand types,
-        // CAST target, etc.).
+        // expression's shape (literal value type, operand types of a binary
+        // op, the CAST target, etc.).
         let Some(name) =
             infer_expression_primitive(&column.expr, Some(&self.program.table_references))
         else {
@@ -1420,6 +1546,51 @@ mod tests {
 
         stmt.reset_metrics();
         assert_eq!(stmt.metrics().rows_written, 0);
+    }
+
+    #[test]
+    fn test_run_with_row_callback_nonblock_collects_all_rows() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+            .unwrap();
+
+        let io = conn.db.io.clone();
+        let mut stmt = conn.prepare("SELECT x FROM t ORDER BY x").unwrap();
+
+        // Drive the non-blocking runner via the IOResult loop, exactly as a
+        // state-machine caller would: collect into an accumulator that persists
+        // across yields and wait on each yielded completion.
+        let mut collected: Vec<i64> = Vec::new();
+        loop {
+            let res = stmt
+                .run_with_row_callback_nonblock(|row| {
+                    collected.push(row.get::<i64>(0)?);
+                    Ok(())
+                })
+                .unwrap();
+            match res {
+                crate::IOResult::Done(()) => break,
+                crate::IOResult::IO(c) => c.wait(io.as_ref()).unwrap(),
+            }
+        }
+        assert_eq!(collected, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_run_ignore_rows_nonblock_completes() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+
+        let io = conn.db.io.clone();
+        let mut stmt = conn.prepare("INSERT INTO t VALUES (1), (2)").unwrap();
+        loop {
+            match stmt.run_ignore_rows_nonblock().unwrap() {
+                crate::IOResult::Done(()) => break,
+                crate::IOResult::IO(c) => c.wait(io.as_ref()).unwrap(),
+            }
+        }
+        assert_eq!(stmt.metrics().rows_written, 2);
     }
 
     #[test]

@@ -4086,9 +4086,13 @@ mod tests {
         );
     }
 
+    /// User-created tables are visible through both the SQLite-side catalog
+    /// (`sqlite_master`) on a SQLite-mode connection and the PG-side catalog
+    /// (`pg_class`) on a PostgreSQL-mode connection. Each direction uses its
+    /// own connection — dialect is fixed per connection and we don't
+    /// hot-swap at runtime.
     #[test]
-
-    fn test_dialect_switching() {
+    fn user_table_is_listed_in_dialect_specific_catalog() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let io = Arc::new(PlatformIO::new().unwrap());
@@ -4100,22 +4104,20 @@ mod tests {
             None,
         )
         .unwrap();
-        let conn = db.connect().unwrap();
 
-        // Create a test table
-        conn.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+        // SQLite-mode connection: sqlite_master sees the user table.
+        let sqlite_conn = db.connect().unwrap();
+        sqlite_conn
+            .execute("CREATE TABLE users (id INTEGER, name TEXT)")
             .unwrap();
-
-        // In SQLite mode, check sqlite_master
-        let mut stmt = conn
+        let mut stmt = sqlite_conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
             .unwrap();
         let mut found = false;
         loop {
             match stmt.step().unwrap() {
                 StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    if let Value::Text(name) = row.get_value(0) {
+                    if let Value::Text(name) = stmt.row().unwrap().get_value(0) {
                         if name.value == "users" {
                             found = true;
                         }
@@ -4127,19 +4129,17 @@ mod tests {
         }
         assert!(found, "users table not found in sqlite_master");
 
-        // Switch to PostgreSQL mode
-        conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
-
-        // In PostgreSQL mode, check pg_class
-        let mut stmt = conn
+        // PostgreSQL-mode connection: pg_class sees the user table.
+        let pg_conn = db.connect().unwrap();
+        pg_conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+        let mut stmt = pg_conn
             .prepare("SELECT relname FROM pg_class WHERE relkind = 'r'")
             .unwrap();
         let mut found = false;
         loop {
             match stmt.step().unwrap() {
                 StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    if let Value::Text(name) = row.get_value(0) {
+                    if let Value::Text(name) = stmt.row().unwrap().get_value(0) {
                         if name.value == "users" {
                             found = true;
                         }
@@ -4150,16 +4150,6 @@ mod tests {
             }
         }
         assert!(found, "users table not found in pg_class");
-
-        // Switch back to SQLite mode using SET (PG-compatible way)
-        conn.execute("SET sql_dialect = 'sqlite'").unwrap();
-
-        // sqlite_master should work again
-        let result = conn.prepare("SELECT * FROM sqlite_master");
-        assert!(
-            result.is_ok(),
-            "sqlite_master should be accessible after switching back to SQLite mode"
-        );
     }
 
     #[test]

@@ -117,76 +117,6 @@ pub fn exec_pg_format_type(type_oid: i64, typemod: i64) -> Value {
     Value::build_text(type_name)
 }
 
-pub fn exec_lpad(input: &Value, length: usize, fill: &str) -> Value {
-    let s = match input {
-        Value::Text(t) => t.to_string(),
-        Value::Null => return Value::Null,
-        v => v.to_string(),
-    };
-    let char_count = s.chars().count();
-    if char_count >= length {
-        Value::build_text(s.chars().take(length).collect::<String>())
-    } else {
-        let fill_chars: Vec<char> = fill.chars().collect();
-        if fill_chars.is_empty() {
-            Value::build_text(s)
-        } else {
-            let pad: String = fill_chars
-                .iter()
-                .cycle()
-                .take(length - char_count)
-                .collect();
-            Value::build_text(format!("{pad}{s}"))
-        }
-    }
-}
-
-fn gcd_inner(mut a: i64, mut b: i64) -> i64 {
-    while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
-    }
-    a.wrapping_abs()
-}
-
-/// Greatest common divisor.
-pub fn exec_gcd(a: i64, b: i64) -> Value {
-    // PG raises ERROR on overflow (gcd(INT_MIN, 0)), we match that
-    if (a == i64::MIN && b == 0) || (b == i64::MIN && a == 0) {
-        return Value::build_text("ERROR: integer out of range");
-    }
-    if a == i64::MIN && b == i64::MIN {
-        return Value::build_text("ERROR: integer out of range");
-    }
-    Value::from_i64(gcd_inner(a, b))
-}
-
-/// Least common multiple.
-pub fn exec_lcm(a: i64, b: i64) -> Value {
-    if a == 0 || b == 0 {
-        return Value::from_i64(0);
-    }
-    let g = gcd_inner(a, b);
-    match (a / g).checked_mul(b.wrapping_abs()) {
-        Some(v) => Value::from_i64(v.wrapping_abs()),
-        None => Value::build_text("ERROR: integer out of range"),
-    }
-}
-
-/// Repeat a string n times.
-pub fn exec_repeat(input: &Value, count: i64) -> Value {
-    let s = match input {
-        Value::Text(t) => t.as_str(),
-        Value::Null => return Value::Null,
-        _ => return Value::Null,
-    };
-    if count <= 0 {
-        return Value::build_text(String::new());
-    }
-    Value::build_text(s.repeat(count as usize))
-}
-
 /// Simplified to_char: formats a number with the given format pattern.
 /// Supports basic PG numeric format patterns (9, 0, S, MI, FM, D, G, PR, TH, L).
 pub fn exec_to_char(value: &Value, format: &str) -> Value {
@@ -323,26 +253,3 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
     result
 }
 
-pub fn exec_rpad(input: &Value, length: usize, fill: &str) -> Value {
-    let s = match input {
-        Value::Text(t) => t.to_string(),
-        Value::Null => return Value::Null,
-        v => v.to_string(),
-    };
-    let char_count = s.chars().count();
-    if char_count >= length {
-        Value::build_text(s.chars().take(length).collect::<String>())
-    } else {
-        let fill_chars: Vec<char> = fill.chars().collect();
-        if fill_chars.is_empty() {
-            Value::build_text(s)
-        } else {
-            let pad: String = fill_chars
-                .iter()
-                .cycle()
-                .take(length - char_count)
-                .collect();
-            Value::build_text(format!("{s}{pad}"))
-        }
-    }
-}

@@ -1,6 +1,6 @@
+use crate::alloc::TryReserveError;
+use crate::skiplist::map::Entry;
 use crate::turso_assert;
-use crossbeam_skiplist::map::Entry;
-use crossbeam_skiplist::SkipMap;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
@@ -301,14 +301,17 @@ pub enum MvccCursorType {
     Index(Arc<IndexInfo>),
 }
 
-pub(crate) type MvccIterator<'l, T> =
-    Box<dyn Iterator<Item = Entry<'l, T, RowVersions>> + Send + Sync>;
+pub(crate) type MvccIterator<'l, T, A = crate::alloc::TursoAllocator> = Box<
+    dyn Iterator<Item = Entry<'l, T, RowVersions, crate::skiplist::comparator::BasicComparator, A>>
+        + Send
+        + Sync,
+>;
 
 /// Extends the lifetime of a SkipMap iterator to `'static`.
 ///
 /// # Why a macro instead of a function?
 ///
-/// Rust's `crossbeam_skiplist::map::Entry<'a, K, V>` is *invariant* over `K`, meaning
+/// Rust's `crate::skiplist::map::Entry<'a, K, V>` is *invariant* over `K`, meaning
 /// the lifetime `'a` cannot be coerced through a function boundary. When we try to pass
 /// `Box<dyn Iterator<Item = Entry<'_, K, V>>>` to a function expecting a generic lifetime,
 /// the compiler cannot unify the lifetimes across the function call.
@@ -326,17 +329,150 @@ pub(crate) type MvccIterator<'l, T> =
 ///   that outlives the cursor.
 macro_rules! static_iterator_hack {
     ($iter:expr, $key_type:ty) => {
+        static_iterator_hack!($iter, $key_type, crate::alloc::TursoAllocator)
+    };
+    ($iter:expr, $key_type:ty, $alloc:ty) => {
         // SAFETY: See macro documentation above.
         unsafe {
             std::mem::transmute::<
-                Box<dyn Iterator<Item = Entry<'_, $key_type, RowVersions>> + Send + Sync>,
-                Box<dyn Iterator<Item = Entry<'static, $key_type, RowVersions>> + Send + Sync>,
+                Box<
+                    dyn Iterator<
+                            Item = Entry<
+                                '_,
+                                $key_type,
+                                RowVersions,
+                                crate::skiplist::comparator::BasicComparator,
+                                $alloc,
+                            >,
+                        > + Send
+                        + Sync,
+                >,
+                Box<
+                    dyn Iterator<
+                            Item = Entry<
+                                'static,
+                                $key_type,
+                                RowVersions,
+                                crate::skiplist::comparator::BasicComparator,
+                                $alloc,
+                            >,
+                        > + Send
+                        + Sync,
+                >,
             >($iter)
         }
     };
 }
 
 pub(crate) use static_iterator_hack;
+
+/// Forward-scan finger over `index_rows`, co-advanced with the B-tree cursor so
+/// the per-row "is this B-tree row shadowed by MVCC?" check is an amortized-O(1)
+/// merge step instead of an `index_rows.get()` (O(log N)) per scanned row.
+/// Forward index cursors only; [`reset`](Self::reset) on any reposition, since
+/// the finger is monotonic.
+#[derive(Default)]
+pub(crate) enum IndexShadowFinger {
+    /// Not yet created; built lazily on the next shadow check.
+    #[default]
+    Uninitialized,
+    /// Positioned at `key`, holding its version chain. The shadow bit is resolved
+    /// lazily (only when a B-tree row matches this key exactly)
+    Peeked {
+        iter: MvccIterator<'static, Arc<SortableIndexKey>>,
+        key: Arc<SortableIndexKey>,
+        versions: RowVersions,
+    },
+    /// Ran past the last version; every remaining B-tree row is visible.
+    Exhausted,
+}
+
+impl IndexShadowFinger {
+    /// Reset so the next shadow check rebuilds the finger. Required on any B-tree
+    /// reposition (seek/rewind): a finger left ahead of the new position would
+    /// report a shadowed row as valid.
+    fn reset(&mut self) {
+        *self = Self::Uninitialized;
+    }
+
+    /// Advance `iter` to its next entry, cloning the key and version-chain `Arc`
+    /// (both cheap) so no borrowed skiplist `Entry` is held afterward. The shadow
+    /// bit is deliberately not resolved here — see [`Self::Peeked`].
+    fn advance(mut iter: MvccIterator<'static, Arc<SortableIndexKey>>) -> Self {
+        match iter.next() {
+            Some(entry) => Self::Peeked {
+                key: entry.key().clone(),
+                versions: entry.value().clone(),
+                iter,
+            },
+            None => Self::Exhausted,
+        }
+    }
+
+    /// Whether the B-tree row `key` is visible (not shadowed by an MVCC version),
+    /// served from the co-positioned finger. Forward equivalent of
+    /// [`MvStore::query_btree_version_is_valid`] for index keys.
+    pub(crate) fn btree_row_is_valid<Clock: LogicalClock>(
+        &mut self,
+        db: &MvStore<Clock>,
+        table_id: MVTableId,
+        tx_id: u64,
+        key: &Arc<SortableIndexKey>,
+    ) -> bool {
+        if matches!(self, Self::Uninitialized) {
+            // Scoped so the skiplist guard drops before `step` re-borrows `db`.
+            let iter = {
+                // Avoid allocating skiplist here with `try_get_or_insert_with`
+                let index_rows = db.index_rows.get(&table_id);
+                // Seed the finger at the first index key >= the B-tree key rather
+                // than at the start of `index_rows`, so a seek-initiated scan does
+                // not re-walk every preceding version on its first row check.
+                let iter_box: Box<
+                    dyn Iterator<Item = Entry<'_, Arc<SortableIndexKey>, RowVersions>>
+                        + Send
+                        + Sync,
+                > = match index_rows {
+                    Some(index_rows) => {
+                        Box::new(index_rows.value().range::<SortableIndexKey, _>((
+                            std::ops::Bound::Included(key.as_ref()),
+                            std::ops::Bound::Unbounded,
+                        )))
+                    }
+                    None => Box::new(std::iter::empty()),
+                };
+                static_iterator_hack!(iter_box, Arc<SortableIndexKey>)
+            };
+            *self = Self::advance(iter);
+        }
+        loop {
+            match self {
+                // No version at or after this key -> B-tree row is visible.
+                Self::Exhausted => return true,
+                Self::Uninitialized => unreachable!("created just above"),
+                Self::Peeked {
+                    key: finger_key,
+                    versions,
+                    ..
+                } => match finger_key.as_ref().cmp(key.as_ref()) {
+                    // No version exactly at this key -> visible.
+                    std::cmp::Ordering::Greater => return true,
+                    // Version present at this key -> resolve the shadow bit now,
+                    // on the one key that actually matches a B-tree row.
+                    std::cmp::Ordering::Equal => {
+                        return !db.index_chain_invalidates_btree(versions, tx_id)
+                    }
+                    // Finger behind the B-tree (a version-only key); catch up below.
+                    std::cmp::Ordering::Less => {}
+                },
+            }
+            // Step the finger forward; only the `Less` arm above falls through here.
+            let Self::Peeked { iter, .. } = std::mem::replace(self, Self::Uninitialized) else {
+                unreachable!("Less arm matched Peeked")
+            };
+            *self = Self::advance(iter);
+        }
+    }
+}
 
 pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     pub db: Arc<MvStore<Clock>>,
@@ -363,6 +499,8 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static> {
     btree_advance_state: Option<AdvanceBtreeState>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek,
+    /// Forward-scan finger over `index_rows`; see [`IndexShadowFinger`].
+    index_finger: IndexShadowFinger,
 }
 
 pub enum NextRowidResult {
@@ -413,7 +551,32 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             count_state: None,
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
+            index_finger: IndexShadowFinger::default(),
         })
+    }
+
+    /// Forward-direction shadow check: finger fast-path for index cursors, the
+    /// authoritative per-row lookup for table cursors.
+    fn btree_row_is_valid_forward(&mut self, key: &RowKey) -> bool {
+        let RowKey::Record(rec) = key else {
+            return self.query_btree_version_is_valid(key);
+        };
+        let valid = self
+            .index_finger
+            .btree_row_is_valid(&self.db, self.table_id, self.tx_id, rec);
+        // Debug-only cross-check: any finger divergence (e.g. a missed reset)
+        // fails the test suite instead of shipping.
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            valid,
+            self.db.query_btree_version_is_valid(
+                self.table_id,
+                &RowKey::Record(rec.clone()),
+                self.tx_id
+            ),
+            "index finger diverged from query_btree_version_is_valid"
+        );
+        valid
     }
 
     /// Returns the current row as an immutable record.
@@ -421,31 +584,61 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
-        let current_pos = &self.current_pos;
-        tracing::trace!("current_row({:?})", current_pos);
-        match current_pos {
+        tracing::trace!("current_row({:?})", self.current_pos);
+        match &self.current_pos {
+            CursorPosition::Loaded { in_btree: true, .. } => self.btree_cursor.record(),
             CursorPosition::Loaded {
-                row_id: _,
-                in_btree,
-                ..
+                in_btree: false, ..
             } => {
-                if *in_btree {
-                    self.btree_cursor.record()
-                } else {
-                    let Some(row) = self.read_mvcc_current_row()? else {
-                        return Ok(IOResult::Done(None));
-                    };
-                    {
-                        let record = self.get_immutable_record_or_create()?;
-                        record.invalidate();
-                        record.start_serialization(row.payload())?;
-                    }
+                // Lightweight handle clone (refcount bump) so we can drop the
+                // borrow of `current_pos` and mutably borrow the reusable record.
+                let versions = match &self.current_pos {
+                    CursorPosition::Loaded { versions, .. } => versions.clone(),
+                    _ => unreachable!("matched Loaded above"),
+                };
 
-                    let record_ref = self.reusable_immutable_record.as_ref().ok_or_else(|| {
-                        LimboError::InternalError("immutable record not initialized".to_string())
-                    })?;
-                    Ok(IOResult::Done(Some(record_ref)))
+                let found = if let Some(versions) = &versions {
+                    // Fast path: serialize the visible version straight into our
+                    // reusable record — like the btree cursor does with a cell —
+                    // instead of cloning a `Row` first.
+                    if self.reusable_immutable_record.is_none() {
+                        self.reusable_immutable_record = Some(ImmutableRecord::new(1024)?);
+                    }
+                    let record = self.reusable_immutable_record.as_mut().unwrap();
+                    self.db
+                        .read_visible_into_record(self.tx_id, versions, record)?
+                } else {
+                    // Cold fallback (seek-positioned, no cached chain): point
+                    // lookup, then serialize.
+                    let row_id = match &self.current_pos {
+                        CursorPosition::Loaded { row_id, .. } => row_id.clone(),
+                        _ => unreachable!("matched Loaded above"),
+                    };
+                    let maybe_index_id = match &self.mv_cursor_type {
+                        MvccCursorType::Index(_) => Some(self.table_id),
+                        MvccCursorType::Table => None,
+                    };
+                    match self
+                        .db
+                        .read_from_table_or_index(self.tx_id, &row_id, maybe_index_id)?
+                    {
+                        Some(row) => {
+                            let record = self.get_immutable_record_or_create()?;
+                            record.invalidate();
+                            record.start_serialization(row.payload())?;
+                            true
+                        }
+                        None => false,
+                    }
+                };
+
+                if !found {
+                    return Ok(IOResult::Done(None));
                 }
+                let record_ref = self.reusable_immutable_record.as_ref().ok_or_else(|| {
+                    LimboError::InternalError("immutable record not initialized".to_string())
+                })?;
+                Ok(IOResult::Done(Some(record_ref)))
             }
             CursorPosition::BeforeFirst => {
                 // Before first is not a valid position, so we return none.
@@ -617,7 +810,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.query_btree_version_is_valid(&k) => {
+                        Some(k) if self.btree_row_is_valid_forward(&k) => {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
@@ -651,7 +844,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     if let Some(key) = key {
-                        if self.query_btree_version_is_valid(&key) {
+                        if self.btree_row_is_valid_forward(&key) {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key,
                                 versions: None,
@@ -790,10 +983,10 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     }
                 };
                 Ok(maybe_record.map(|record| {
-                    RowKey::Record(SortableIndexKey {
+                    RowKey::Record(Arc::new(SortableIndexKey {
                         key: record.clone(),
                         metadata: index_info.clone(),
-                    })
+                    }))
                 }))
             }
         }
@@ -808,6 +1001,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     /// Reset dual peek state (called on rewind/last/seek)
     fn reset_dual_peek(&mut self) {
         self.dual_peek = DualCursorPeek::default();
+        // The forward finger is monotonic; a reposition invalidates it.
+        self.index_finger.reset();
     }
 
     /// Seek btree cursor and set btree_peek to the result.
@@ -904,9 +1099,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     /// Initialize MVCC iterator for forward iteration (used when next() is called without rewind())
-    fn init_mvcc_iterator_forward(&mut self) {
+    fn init_mvcc_iterator_forward(&mut self) -> Result<(), TryReserveError> {
         if self.table_iterator.is_some() || self.index_iterator.is_some() {
-            return; // Already initialized
+            return Ok(()); // Already initialized
         }
         match &self.mv_cursor_type {
             MvccCursorType::Table => {
@@ -920,15 +1115,17 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 self.table_iterator = Some(static_iterator_hack!(iter_box, RowID));
             }
             MvccCursorType::Index(_) => {
-                let index_rows = self
-                    .db
-                    .index_rows
-                    .get_or_insert_with(self.table_id, SkipMap::new);
+                let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
                 let index_rows = index_rows.value();
-                let iter_box = Box::new(index_rows.iter());
+                let iter_box: Box<
+                    dyn Iterator<Item = Entry<'_, Arc<SortableIndexKey>, RowVersions>>
+                        + Send
+                        + Sync,
+                > = Box::new(index_rows.iter());
                 self.index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>));
             }
         }
+        Ok(())
     }
 }
 
@@ -994,7 +1191,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 self.table_id,
                 self.tx_id,
                 &mut self.index_iterator,
-            ) {
+            )? {
                 Some(k) => {
                     self.dual_peek.mvcc_peek = CursorPeek::Row {
                         key: k,
@@ -1025,7 +1222,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 let uninitialized = self.dual_peek.both_uninitialized();
                 if uninitialized {
                     // Initialize MVCC iterator and get first peek
-                    self.init_mvcc_iterator_forward();
+                    self.init_mvcc_iterator_forward()?;
                     self.advance_mvcc_iterator();
                     self.state
                         .replace(MvccLazyCursorState::Next(NextState::AdvanceUnitialized));
@@ -1314,6 +1511,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                             let mvcc_rowid = self.db.seek_rowid(
                                 rowid.clone(),
                                 inclusive,
+                                op.eq_only(),
                                 direction,
                                 self.tx_id,
                                 &mut self.table_iterator,
@@ -1350,10 +1548,11 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                                 self.table_id,
                                 sortable_key.clone(),
                                 inclusive,
+                                op.eq_only(),
                                 direction,
                                 self.tx_id,
                                 &mut self.index_iterator,
-                            );
+                            )?;
 
                             // Set MVCC peek
                             {
@@ -1460,29 +1659,38 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
                     panic!("BTreeKey::IndexKey requires Index cursor type");
                 };
-                let sortable_key =
-                    SortableIndexKey::new_from_record((*record).clone(), index_info.clone());
+                let sortable_key = Arc::new(SortableIndexKey::new_from_record(
+                    (*record).clone(),
+                    index_info.clone(),
+                ));
                 RowID::new(self.table_id, RowKey::Record(sortable_key))
             }
         };
-        let record_buf = key
-            .get_record()
-            .ok_or_else(|| LimboError::InternalError("BTreeKey should have a record".to_string()))?
-            .get_payload()
-            .to_vec();
-        let num_columns = match key {
-            BTreeKey::IndexKey(record) => record.column_count(),
-            BTreeKey::TableRowId((_, record)) => record
-                .as_ref()
-                .ok_or_else(|| {
-                    LimboError::InternalError("TableRowId should have a record".to_string())
-                })?
-                .column_count(),
-        };
         let row = match &self.mv_cursor_type {
-            MvccCursorType::Table => Row::new_table_row(row_id, record_buf, num_columns),
-            MvccCursorType::Index(_) => Row::new_index_row(row_id, num_columns),
-        };
+            MvccCursorType::Table => {
+                let BTreeKey::TableRowId((_, record)) = key else {
+                    return Err(LimboError::InternalError(
+                        "Table cursor requires a TableRowId key".to_string(),
+                    ));
+                };
+                let record = record.as_ref().ok_or_else(|| {
+                    LimboError::InternalError("TableRowId should have a record".to_string())
+                })?;
+                let num_columns = record.column_count();
+                crate::with_mv_store_allocation_site!(
+                    RowPayload,
+                    Row::new_table_row(row_id, record.get_payload(), num_columns)
+                )
+            }
+            MvccCursorType::Index(_) => {
+                let BTreeKey::IndexKey(record) = key else {
+                    return Err(LimboError::InternalError(
+                        "Index cursor requires an IndexKey".to_string(),
+                    ));
+                };
+                Ok(Row::new_index_row(row_id, record.column_count()))
+            }
+        }?;
 
         // Check if the cursor is currently positioned at a B-tree row that matches
         // the row we're inserting. This indicates we're updating a B-tree-resident row
@@ -1586,11 +1794,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             let record = record.clone();
             let column_count = record.column_count();
             let row = match &self.mv_cursor_type {
-                MvccCursorType::Table => {
-                    Row::new_table_row(rowid.clone(), record.into_payload(), column_count)
-                }
-                MvccCursorType::Index(_) => Row::new_index_row(rowid.clone(), column_count),
-            };
+                MvccCursorType::Table => crate::with_mv_store_allocation_site!(
+                    RowPayload,
+                    Row::new_table_row(rowid.clone(), record.get_payload(), column_count)
+                ),
+                MvccCursorType::Index(_) => Ok(Row::new_index_row(rowid.clone(), column_count)),
+            }?;
             self.db
                 .insert_tombstone_to_table_or_index(self.tx_id, rowid, row, maybe_index_id)?;
         }
@@ -1615,13 +1824,16 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             };
             let inclusive = true;
 
-            // Check MVCC first
+            // Check MVCC first. This is a point existence probe, so it is
+            // eq-only: bound the skiplist walk to the single rowid instead of
+            // scanning forward over invisible concurrent rows.
             let rowid = self.db.seek_rowid(
                 RowID {
                     table_id: self.table_id,
                     row_id: RowKey::Int(*int_key),
                 },
                 inclusive,
+                true,
                 IterationDirection::Forwards,
                 self.tx_id,
                 &mut self.table_iterator,
@@ -1841,12 +2053,13 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             }
             MvccCursorType::Index(_) => {
                 // For index cursors, initialize the iterator to the beginning
-                let index_rows = self
-                    .db
-                    .index_rows
-                    .get_or_insert_with(self.table_id, SkipMap::new);
+                let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
                 let index_rows = index_rows.value();
-                let iter_box = Box::new(index_rows.iter());
+                let iter_box: Box<
+                    dyn Iterator<Item = Entry<'_, Arc<SortableIndexKey>, RowVersions>>
+                        + Send
+                        + Sync,
+                > = Box::new(index_rows.iter());
                 self.index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>));
             }
         }

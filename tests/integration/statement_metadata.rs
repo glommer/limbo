@@ -403,4 +403,63 @@ mod tests {
         assert_eq!(miss_instr, vec![(0,)]);
         assert_eq!(miss_strpos, vec![(0,)]);
     }
+
+    /// `btrim(X[, chars])` is the PG/Oracle spelling of SQLite's
+    /// `trim(X[, chars])`. Both trim the listed characters (or whitespace by
+    /// default) from both sides of the string with identical semantics.
+    #[test]
+    fn btrim_alias_matches_trim() {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+
+        // Default: trim whitespace.
+        let trim_ws: Vec<(String,)> = conn.exec_rows("SELECT trim('  hello  ')");
+        let btrim_ws: Vec<(String,)> = conn.exec_rows("SELECT btrim('  hello  ')");
+        assert_eq!(trim_ws, vec![("hello".to_string(),)]);
+        assert_eq!(btrim_ws, vec![("hello".to_string(),)]);
+
+        // Explicit character set.
+        let trim_x: Vec<(String,)> = conn.exec_rows("SELECT trim('xxhelloxx', 'x')");
+        let btrim_x: Vec<(String,)> = conn.exec_rows("SELECT btrim('xxhelloxx', 'x')");
+        assert_eq!(trim_x, vec![("hello".to_string(),)]);
+        assert_eq!(btrim_x, vec![("hello".to_string(),)]);
+    }
+
+    /// `char_length(X)` and `character_length(X)` are the SQL standard
+    /// spellings of SQLite's `length(X)`. All three return the character
+    /// count for TEXT input.
+    #[test]
+    fn char_length_aliases_match_length() {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+
+        let via_length: Vec<(i64,)> = conn.exec_rows("SELECT length('hello world')");
+        let via_char_length: Vec<(i64,)> = conn.exec_rows("SELECT char_length('hello world')");
+        let via_character_length: Vec<(i64,)> =
+            conn.exec_rows("SELECT character_length('hello world')");
+
+        assert_eq!(via_length, vec![(11,)]);
+        assert_eq!(via_char_length, vec![(11,)]);
+        assert_eq!(via_character_length, vec![(11,)]);
+
+        // Multi-byte input: SQLite reports character count, not byte count.
+        let via_length_unicode: Vec<(i64,)> = conn.exec_rows("SELECT length('héllo')");
+        let via_char_length_unicode: Vec<(i64,)> = conn.exec_rows("SELECT char_length('héllo')");
+        assert_eq!(via_length_unicode, vec![(5,)]);
+        assert_eq!(via_char_length_unicode, vec![(5,)]);
+    }
+
+    /// `reverse(X)` is the spelling PG, MySQL, and Oracle all use; upstream
+    /// Turso registered the function under the more explicit `string_reverse`
+    /// name. Both must produce identical results.
+    #[test]
+    fn reverse_alias_matches_string_reverse() {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+
+        let via_string_reverse: Vec<(String,)> = conn.exec_rows("SELECT string_reverse('hello')");
+        let via_reverse: Vec<(String,)> = conn.exec_rows("SELECT reverse('hello')");
+        assert_eq!(via_string_reverse, vec![("olleh".to_string(),)]);
+        assert_eq!(via_reverse, vec![("olleh".to_string(),)]);
+    }
 }

@@ -48,10 +48,11 @@ use crate::{
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
-            OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
-            OpIdxInsertState, OpInitCdcVersionState, OpInsertState, OpInsertSubState,
-            OpJournalModeState, OpNewRowidState, OpNoConflictState, OpParseSchemaState,
-            OpProgramState, OpRowIdState, OpSeekState, OpTransactionState, VacuumIntoOpContext,
+            OpAttachState, OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState,
+            OpDestroyState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
+            OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
+            OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
+            VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -166,6 +167,11 @@ pub enum StepResult {
     Row,
     Interrupt,
     Busy,
+    /// The statement explicitly yielded control back to the caller without any pending I/O.
+    /// Stepping again immediately (even in a tight loop) is fine; blocking callers should
+    /// still drive the event loop (`io.step()`) between steps so progress that depends on
+    /// other threads' I/O is not starved.
+    Yield,
 }
 
 #[derive(Debug)]
@@ -410,11 +416,11 @@ impl ProgramExecutionState {
 
 /// Re-entrant state for [Insn::HashBuild].
 /// Allows HashBuild to resume cleanly after async I/O without re-reading the row.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OpHashBuildState {
-    pub key_values: Vec<Value>,
+    pub key_values: crate::alloc::Vec<Value>,
     pub key_idx: usize,
-    pub payload_values: Vec<Value>,
+    pub payload_values: crate::alloc::Vec<Value>,
     pub payload_idx: usize,
     pub rowid: Option<i64>,
     pub cursor_id: CursorID,
@@ -425,10 +431,10 @@ pub struct OpHashBuildState {
 
 /// Re-entrant state for [Insn::HashProbe].
 /// Allows HashProbe to resume cleanly after async probe-row buffering I/O.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OpHashProbeState {
     /// Cached probe key values to avoid re-reading from registers
-    pub probe_keys: Vec<Value>,
+    pub probe_keys: crate::alloc::Vec<Value>,
     /// Hash table register being probed
     pub hash_table_id: usize,
     /// Partition index being loaded (if any)
@@ -453,6 +459,7 @@ enum ActiveOpState {
     Column(OpColumnState),
     RowId(OpRowIdState),
     Transaction(OpTransactionState),
+    Attach(OpAttachState),
     JournalMode(OpJournalModeState),
     ParseSchema(OpParseSchemaState),
     HashBuild(Option<OpHashBuildState>),
@@ -478,6 +485,7 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::Column(_) => "Column",
             ActiveOpState::RowId(_) => "RowId",
             ActiveOpState::Transaction(_) => "Transaction",
+            ActiveOpState::Attach(_) => "Attach",
             ActiveOpState::JournalMode(_) => "JournalMode",
             ActiveOpState::ParseSchema(_) => "ParseSchema",
             ActiveOpState::HashBuild(_) => "HashBuild",
@@ -593,6 +601,7 @@ impl ActiveOpStateSlot {
         OpTransactionState,
         OpTransactionState::Start
     );
+    active_state_accessor!(attach, Attach, OpAttachState, OpAttachState::default());
     active_state_accessor!(
         journal_mode,
         JournalMode,
@@ -1766,7 +1775,7 @@ impl Program {
                         // contended lock). Don't store in io_completions —
                         // yields aren't pending I/O, so the instruction will
                         // simply re-execute on the next step.
-                        return Ok(StepResult::IO);
+                        return Ok(StepResult::Yield);
                     }
                     let finished = io.finished();
                     state.io_completions = Some(io);
